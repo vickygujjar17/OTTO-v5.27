@@ -1,0 +1,91 @@
+5.28: NY 5:00 PM DST-aware daily reset, balance-basis floating loss, order-manager guards
+
+REPOSITORY LAYOUT
+
+The OTTO sources moved from OTTO/ to the repository root. verify_integrity.py
+and check_deploy_drift.py both resolved '<repo>/<basename>' and so reported
+every file as "<not in HEAD>"; the flatten fixes that path assumption and
+removes the extra directory layer. All 34 files are Git renames, so history
+is preserved. .gitattributes / .gitignore patterns are path-relative and
+stay valid at the root -- verified with git check-attr.
+
+DAILY RESET (otto.mq5)
+
+CheckDailyReset() anchored on iTime(_Symbol, PERIOD_D1, 0), i.e. the
+BROKER's daily candle open. That is 17:00 New York only when the server
+stamps D1 in US Eastern time; on a GMT+2/+3 server the anchor landed at
+16:00-17:00 New York on a DIFFERENT DST schedule, so the 3% daily budget
+re-anchored at the wrong instant and shifted by an hour twice a year.
+
+MQL5 has no TimeDaylightSavings(), and TimeGMTOffset() reports the PC's
+zone, not New York's, so the US rule is computed by hand:
+  IsUsEasternDST()          DST = 2nd Sunday March 07:00 UTC .. 1st Sunday
+                            November 06:00 UTC
+  NewYorkUtcOffsetSeconds() -14400 (EDT) / -18000 (EST)
+  UtcToNewYork()            UTC -> New York civil time
+  MostRecentNyRollover()    last 17:00 New York boundary as a UTC instant
+
+MostRecentNyRollover() resolves the offset AT the boundary rather than from
+the current instant and refines twice. This matters: for the 24h after a
+switch the two offsets differ, and using the current one would land the
+anchor an hour off -- the exact class of bug the helper removes.
+
+The D1 basis is deliberately retained for UpdateMarketDay()/g_lastDailyBarTime,
+which mirror Pine's ta.change(time("D")); only the drawdown anchor moved.
+OnInit() seeds from the same boundary, treats any stored anchor naming a
+different session as stale, and logs UTC / New York / offset / minutes to
+the next rollover so the VPS clock can be verified at a glance.
+
+FLOATING-LOSS MATH (otto.mq5)
+
+The 1% rule measured retracement from the peak-equity high-water mark. With
+no losing position open, equity sits below its HWM by closed P&L alone, so
+an ordinary tick read as a breach -- and it set g_totalDD_Halted, a
+PERMANENT latch persisted to a GlobalVariable. One benign tick could
+therefore kill the EA for the life of the account.
+
+floatingLoss is now (balance - equity) / balance, the real basket float. It
+reads 0 whenever nothing is open, regardless of where the HWM sits. The
+breach still cancels pendings and closes the whole basket, then returns for
+THIS tick only; it no longer sets or persists a halt, so scanning resumes
+next tick. The 5% trailing rule keeps its equity-HWM basis and is now the
+ONLY path that can hard-halt, so the persisted "Halted" key is retained.
+
+ORDER MANAGER (COttoOrderManager.mqh)
+
+CancelOpposingConsensusOrders() filtered on magic alone. Every EA instance
+shares MagicNumber, so each of the ~28 charts swept the whole shared pending
+book and deleted other charts' opposing orders -- a cancel storm across the
+portfolio. It is now scoped to this chart's symbol. The consensus TEST stays
+global (IsConsensusOpposed reads the portfolio vector); only the ACTOR is
+local. The v5.26 comment claiming the cross-chart sweep was intentional is
+corrected.
+
+PlaceLimitOrder() gained live-price validation ahead of the duplicate
+shield: BLOCK_SUPPORT->BUY_LIMIT is refused at or above bid-stops and
+BLOCK_RESISTANCE->SELL_LIMIT at or below ask+stops, honouring
+SYMBOL_TRADE_STOPS_LEVEL so the check matches server rules. A refused price
+now returns without setting hasPlacedOrder, leaving the block armed for a
+later tick instead of burning a dispatch on TRADE_RETCODE_INVALID_PRICE.
+
+VERIFICATION
+
+build_check.ps1: 0 errors, 0 warnings (all 9 headers link from the staging
+tree).
+Probe suites: 10/10 pass, 401 checks. test_v528_hotfix.py 74/74 (new) pins
+the DST edges (both transitions, exact UTC instants, 2026-2028 first/second
+Sundays, cross-checked against IANA America/New_York), boundary-offset
+resolution, iTime-independence of the reset anchor, the absence of a Halted
+write on the 1% path, the symbol scope and both price guards.
+test_v527_exit_comment.py 59/59 and test_v526_vector.py 83/83 version
+assertions are now stamp-agnostic so they need no edit per release.
+test_v522_safety.py keeps its v5.22/v5.24 arithmetic but is relabelled as
+superseded history for the 1% rule.
+normalize_eol: bareLF=0 bareCR=0 across all 10 files.
+repair_mojibake: 0 damaged characters.
+Version bumped 5.27 -> 5.28 in all 10 files, including the "Pine Script
+Master Build Port (vX)" banner in otto.mq5 that the previous bump script
+missed. Historical FIX (v5.2x) annotations preserved.
+
+NOTE: #property link still names the OTTO-v5.27 GitHub repo -- that string
+is the repository name, not the release, so it is excluded from the bump.

@@ -1,16 +1,33 @@
 """
 Logic verification for the v5.22 / v5.24 prop-firm safety rules.
 
+MODEL HISTORY -- SUPERSEDED FOR THE 1% RULE (v5.28). The functions below
+pin the v5.22/v5.24 arithmetic so their behaviour stays reproducible and the
+basis change stays documented, but they NO LONGER describe what the EA does:
+
+  * v5.22/v5.24 (this file): 1% floating = TRAILING retracement from peak
+    EQUITY, sharing one basis with the 5% trailing DD, and the breach set a
+    PERMANENT halt latch.
+  * v5.28 (live): 1% floating = (balance - equity)/balance, i.e. the live
+    basket float. It reads 0 whenever nothing is open, and a breach cancels
+    the pendings, closes the basket and resumes on the next tick -- no halt
+    latch is set. See _probe/test_v528_hotfix.py for the live contract.
+
+The 5% trailing DD measured from peak EQUITY is UNCHANGED by v5.28.
+
 Covers the change a compile CANNOT validate: the GFT drawdown arithmetic.
-  * 3% daily DD measured from the 5PM-EST (broker midnight) reset balance
+  * 3% daily DD measured from the 5PM New York reset balance
   * 5% TRAILING total DD measured from the peak EQUITY high-water mark
     (v5.22 used peak CLOSED balance; v5.24 switched it to peak equity)
-  * 1% floating loss as a TRAILING retracement from that same peak EQUITY
+  * 1% floating loss -- v5.22/v5.24 model: trailing retracement from peak
+    EQUITY (v5.28 replaced this with the live balance-vs-equity float)
 
 The floating rule is the important one. A raw (balance - equity)/balance
-ratio trips on any routine dip while equity is below its own peak, which
-would permanently halt the EA on an ordinary tick. The trailing measure
-must NOT fire in that situation -- that difference is pinned below.
+ratio trips on any routine dip while equity is below its own peak. The
+trailing measure must NOT fire in that situation -- that difference is
+pinned below. v5.28 then reinstated the raw float measure as the CORRECT
+reading for a "max floating loss" rule, having removed the permanent halt
+that made the old behaviour destructive.
 
 v5.24 NOTE: because total_dd and floating_trailing now share one equity
 basis, they evaluate the SAME quantity. The 1% threshold is strictly
@@ -239,8 +256,12 @@ def main():
     print("RESULT:", "ALL CHECKS PASSED" if ok else "FAILURES PRESENT")
     print("=" * 78)
     print()
-    print("Threshold implemented: peak-equity give-back >= 1.00% halts the EA.")
-    print("v5.24: 5% trailing DD shares that equity basis and acts as a backstop.")
+    print("Threshold implemented (v5.28): live (balance - equity) float >= 1.00%")
+    print("cancels the pendings, closes the basket, then RESUMES next tick.")
+    print("v5.24 model above: peak-equity give-back >= 1.00% halted the EA; the")
+    print("5% trailing DD (>=", SAFETY_TOTAL, "%) still shares that equity basis and is")
+    print("now the ONLY path that can hard-halt. Superseded 1% semantics live in")
+    print("_probe/test_v528_hotfix.py.")
     return 0 if ok else 1
 
 

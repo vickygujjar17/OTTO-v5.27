@@ -318,18 +318,23 @@ check("exhaustive combo sweep never exceeds 31", worst <= 31, "max=%d" % worst)
 # ----------------------------------------------------------------------
 # 10. Version stamps
 # ----------------------------------------------------------------------
+# The stamp is read from OttoDefines.mqh rather than hard-coded, so this
+# suite keeps guarding "all 10 files agree on ONE current release" without
+# needing an edit at every version bump (same approach as test_v526_vector).
+stamps = set(re.findall(r'#property version\s+"(\d+\.\d+)"', DEFS_T))
+check("OttoDefines.mqh carries exactly one version stamp", len(stamps) == 1,
+      "found: %s" % sorted(stamps))
+RELEASE = sorted(stamps)[0] if stamps else "?"
+
 missing = [f for f in ALL_FILES
-           if '#property version   "5.27"' not in read(os.path.join(ROOT, f))]
-check("all 10 files stamp 5.27", not missing, "missing: %s" % ", ".join(missing))
+           if ('#property version   "%s"' % RELEASE) not in read(os.path.join(ROOT, f))]
+check("all 10 files stamp v%s" % RELEASE, not missing,
+      "missing: %s" % ", ".join(missing))
 
-stale = [f for f in ALL_FILES
-         if '#property version   "5.26"' in read(os.path.join(ROOT, f))]
-check("no 5.26 property stamp survives", not stale, "stale: %s" % ", ".join(stale))
+check("OttoDefines banner names v%s" % RELEASE, ("OTTO EA v%s" % RELEASE) in DEFS_T)
 
-check("OttoDefines banner names v5.27", "OTTO EA v5.27" in DEFS_T)
-
-check("OttoDefines description names v5.27",
-      '#property description "OTTO v5.27' in DEFS_T)
+check("OttoDefines description names v%s" % RELEASE,
+      ('#property description "OTTO v%s' % RELEASE) in DEFS_T)
 
 
 

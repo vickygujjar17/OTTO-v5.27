@@ -1,14 +1,14 @@
 # build_check.ps1 -- OTTO EA strict compilation gate
 #
 # Stages a temporary MQL5 build tree that mirrors the MetaTrader terminal
-# layout so that `#include "../Include/Otto/*.mqh"` resolves, compiles via the
-# MetaEditor CLI, and reports the exact error/warning counts.
+# layout so that the angle-bracket includes (`#include <Otto/*.mqh>`) resolve,
+# compiles via the MetaEditor CLI, and reports the exact error/warning counts.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File build_check.ps1
 
 param(
-    [string]$Source = "C:\Users\vivek\Downloads\OTTO-v5.00 v5.27\OTTO",
+    [string]$Source = "C:\Users\vivek\Downloads\OTTO-v5.00 v5.27",
     [string]$MetaEditor = "C:\Program Files\Five Percent Online MetaTrader 5\MetaEditor64.exe",
     [string]$Entry = "otto.mq5",
     [switch]$NoDeploy

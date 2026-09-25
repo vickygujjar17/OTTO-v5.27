@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.27"
+#property version   "5.28"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -466,6 +466,42 @@ private:
       double atr = m_blockManager.GetATR();
       if(atr <= 0) return false;
       double entryPrice = NormalizeDouble(CalcEntryPrice(block), _Digits);
+
+      // v5.28 — LIVE PRICE VALIDATION, before the duplicate shield so a refused
+      // price never sets hasPlacedOrder (the block stays armed for a later tick).
+      // A limit resting on the wrong side of the market is rejected by the
+      // server with TRADE_RETCODE_INVALID_PRICE, which previously burned a
+      // dispatch attempt and left the block in an ambiguous state. The broker's
+      // SYMBOL_TRADE_STOPS_LEVEL is honoured so the check matches server rules.
+      double stopsLevel = (double)SymbolInfoInteger(m_symbol, SYMBOL_TRADE_STOPS_LEVEL)
+                          * SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+      double liveAsk = GetAsk();
+      double liveBid = GetBid();
+
+      if(block.type == BLOCK_SUPPORT)   // support block -> BUY LIMIT
+        {
+         if(entryPrice >= (liveBid - stopsLevel))
+           {
+            if(EnableLogging)
+               Print("[OrderManager] ABORT BUY_LIMIT: entry ",
+                     DoubleToString(entryPrice, _Digits), " >= bid ",
+                     DoubleToString(liveBid, _Digits),
+                     " (Invalid Price) — block left armed for retry");
+            return false;
+           }
+        }
+      else                              // resistance block -> SELL LIMIT
+        {
+         if(entryPrice <= (liveAsk + stopsLevel))
+           {
+            if(EnableLogging)
+               Print("[OrderManager] ABORT SELL_LIMIT: entry ",
+                     DoubleToString(entryPrice, _Digits), " <= ask ",
+                     DoubleToString(liveAsk, _Digits),
+                     " (Invalid Price) — block left armed for retry");
+            return false;
+           }
+        }
 
       // HARD ANTI-DUPLICATE CHECK against MT5's live pending-order book.
       // If an order of ours already rests at (near) this price, do NOT send
@@ -1572,10 +1608,13 @@ public:
    //| direction fights the portfolio currency-vector consensus beyond    |
    //| InpConsensusVetoThreshold.                                         |
    //|                                                                    |
-   //| Only covers pendings placed by the magic this instance owns — by   |
-   //| design the local magic filter does NOT protect other charts'       |
-   //| orders, because every EA instance shares MagicNumber and thus any  |
-   //| instance may legitimately clean up any stale opposing order.       |
+   //| v5.28: scoped to THIS chart's symbol. The magic filter alone is NOT |
+   //| safe here: every EA instance shares MagicNumber, so a magic-only    |
+   //| sweep made each of the ~28 charts walk the entire shared pending    |
+   //| book and delete every other chart's opposing order -- a cancel      |
+   //| storm across the whole portfolio. The consensus TEST stays global   |
+   //| (IsConsensusOpposed reads the portfolio vector); only the ACTOR is  |
+   //| now local, so each chart prunes only its own resting orders.        |
    //+------------------------------------------------------------------+
    void              CancelOpposingConsensusOrders(void)
      {
@@ -1588,6 +1627,7 @@ public:
          if(ticket <= 0) continue;
          if(!OrderSelect(ticket)) continue;
          if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+         if(OrderGetString(ORDER_SYMBOL) != m_symbol) continue;
 
          ENUM_ORDER_TYPE ot = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
          ENUM_TRADE_DIRECTION dir = DIR_NONE;
@@ -1595,7 +1635,7 @@ public:
          if(ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP) dir = DIR_SHORT;
          if(dir == DIR_NONE) continue;
 
-         string sym = OrderGetString(ORDER_SYMBOL);
+         string sym = m_symbol;
          if(!m_correlationFilter.IsConsensusOpposed(sym, dir)) continue;
 
          if(DeleteOrder(ticket))
