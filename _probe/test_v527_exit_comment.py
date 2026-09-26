@@ -8,7 +8,7 @@ Pins the behaviour that cannot be exercised by the MQL5 compiler gate:
      spaced exactly 1R apart, with BE one further R below the lock target.
   3. The step lock is a ONE-WAY ratchet (guarded comparison on both branches).
   4. The lock is disable-able by zeroing either input.
-  5. The dynamic ATR trail still exists on BOTH branches past InpLock3RRR.
+  5. The dynamic ATR trail still exists on BOTH branches past InpTrailStartRR.
   6. The ATR trail is evaluated AFTER the step lock (tighter of the two wins).
   7. Tranche 2 is decoupled from InpBreakEvenRR onto InpPyramidT2RR.
   8. SyncTradeState() classification follows the new milestones.
@@ -187,8 +187,8 @@ check("SHORT breakeven uses primaryEntry - beOffset",
 # ----------------------------------------------------------------------
 # 5. Tranche 2 decoupled from breakeven
 # ----------------------------------------------------------------------
-check("InpPyramidT2RR input exists and defaults to 2.0",
-      re.search(r"InpPyramidT2RR\s*=\s*2\.0\s*;", DEFS_T) is not None)
+check("InpPyramidT2RR input exists and defaults to 1.0",
+      re.search(r"InpPyramidT2RR\s*=\s*1\.0\s*;", DEFS_T) is not None)
 
 check("Tranche 2 gate reads InpPyramidT2RR",
       re.search(r"currentRR\s*>=\s*InpPyramidT2RR\s*&&\s*m_orderManager\.IsPyramidPending\(2\)",
@@ -238,8 +238,9 @@ check("clamp enforces the 31-char MT5 limit",
 check("PlaceLimitOrder path uses BuildOrderComment(block.serial, 0)",
       "request.comment  = BuildOrderComment(block.serial, 0);" in OM_T)
 
-check("AddPyramidTranche path uses BuildOrderComment(..., tranche)",
-      "req.comment  = BuildOrderComment(m_activeTrade.sourceBlockSerial, tranche);" in OM_T)
+check("AddPyramidTranche path uses BuildOrderComment(..., trancheToAdd)",
+      re.search(r"req\.comment\s*=\s*BuildOrderComment\(m_activeTrade\.sourceBlockSerial,\s*trancheToAdd\)",
+                OM_T) is not None)
 
 check("plain market path no longer sends bare TradeComment",
       "request.comment   = TradeComment;" not in OM_T)

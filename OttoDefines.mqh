@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.28 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.29 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.28"
-#property description "OTTO v5.28 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.29"
+#property description "OTTO v5.29 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -170,7 +170,7 @@ struct SPyramidTranche
    ulong             ticket;          // position ticket
    double            entry;           // tranche entry price
    double            size;            // tranche lot size
-   int               tranche;        // 1 = initial, 2 = +1R add, 3 = +2R add
+   int               tranche;        // 1 = initial, 2 = +1R add, 3 = +2R add, 4 = +3R add
   };
 
 //+------------------------------------------------------------------+
@@ -221,23 +221,48 @@ input group "══════════════════════�
 input ENUM_ENTRY_STYLE InpEntryStyle = ENTRY_MIDPOINT;  // Midpoint or Front Edge
 input double   InpArmATR          = 0.0;      // Arming distance (ATR) — 0 = instant arm
 input double   InpFixedRiskUSD    = 0.0;      // Fixed $ risk/trade (0 = use RiskPercent%)
-input bool     InpPyramidEnable   = true;     // Enable 3-tranche pyramiding (unified group SL)
-input double   InpRiskT1Pct       = 0.25;     // Tranche 1 risk % of equity
-input double   InpRiskT2Pct       = 0.12;     // Tranche 2 risk % of equity (at +2.0R)
-input double   InpRiskT3Pct       = 0.06;     // Tranche 3 risk % of equity (at +3.0R)
+input bool     InpPyramidEnable   = true;     // Enable 4-tranche pyramiding (unified group SL)
+// v5.29: Tranche 1 risk continues to flow through RiskPercent in group [6]
+// (0.25%), so there is NO separate InpRiskT1Pct input. The v5.27 declaration of
+// one was dead -- nothing in the tree ever read it -- and a second knob that
+// silently changes no behaviour is worse than no knob at all.
+// v5.29: the ladder is now a true risk-percent pyramid. Each scale-in risks
+// roughly half the previous rung and the four rungs total 0.6875% of equity,
+// comfortably inside the SafetyMaxRiskPct = 1.5% budget:
+//   T1  0.25%    RiskPercent (group [6])   at market
+//   T2  0.25%    InpRiskT2Pct              at +1.0R  (InpPyramidT2RR)
+//   T3  0.125%   InpRiskT3Pct              at +2.0R  (InpPyramidT3RR)
+//   T4  0.0625%  InpRiskT4Pct              at +3.0R  (InpPyramidT4RR)
+input double   InpRiskT2Pct       = 0.25;     // Tranche 2 risk % of equity (at +1.0R)
+input double   InpRiskT3Pct       = 0.125;    // Tranche 3 risk % of equity (at +2.0R)
+input double   InpRiskT4Pct       = 0.0625;   // Tranche 4 risk % of equity (at +3.0R)
 // v5.27: Tranche 2 is DECOUPLED from InpBreakEvenRR. The two milestones used
 // to share a value (both 2.0), so lowering breakeven to 1.0 would have dragged
 // the T2 scale-in down with it and fired it a full R early. T2 now has its own
-// trigger, defaulted to preserve the historic +2.0R behaviour exactly.
-input double   InpPyramidT2RR     = 2.0;      // Tranche 2 scale-in trigger R:R
+// trigger.
+// v5.29: all three scale-in triggers are independent inputs, so the pyramid
+// ladder, the breakeven milestone and the trail activation can each be retuned
+// without dragging the others. They must stay STRICTLY ASCENDING
+// (T2 < T3 < T4): a rung whose trigger is never reached leaves m_nextTranche
+// parked on it, and every later rung behind it is then unreachable.
+input double   InpPyramidT2RR     = 1.0;      // Tranche 2 scale-in trigger R:R
+input double   InpPyramidT3RR     = 2.0;      // Tranche 3 scale-in trigger R:R
+input double   InpPyramidT4RR     = 3.0;      // Tranche 4 scale-in trigger R:R
 
 input group "══════════════════════════════════════════════════"
 input group "  [5] EXIT & TRAILING (Pine half_risk_rr / be_rr / trail_rr)"
 input group "══════════════════════════════════════════════════"
 input double   InpCutRiskRR   = 1.0;         // Cut Risk in Half at R:R
 input double   InpBreakEvenRR = 1.0;         // Move to Cost-Covering Breakeven at R:R
-input double   InpTrailStartRR = 3.0;        // Tranche 3 / dynamic ATR trail activation R:R
-input double   InpLock3RRR      = 3.0;        // Dynamic ATR trail activation (+3.0R, no fixed lock)
+input double   InpTrailStartRR = 1.0;        // Dynamic ATR trail activation R:R
+// v5.29: InpLock3RRR is SUPERSEDED. Every live read of it in COttoTradeManager
+// (both trail gates, both single-ticket push guards and the SyncTradeState
+// classification) was repointed to InpTrailStartRR, because the trail is now a
+// risk-management tool that must arm at +1.0R rather than waiting for the same
+// +3.0R step at which the pyramid reaches full size. The input is retained so
+// saved .set files keep loading without an "unknown input" mismatch; MQL5
+// emits no warning for an unused input, so it costs nothing.
+input double   InpLock3RRR      = 3.0;        // SUPERSEDED by InpTrailStartRR (retained for .set compatibility)
 // v5.27 STEP PROFIT LOCK. When price reaches InpLockProfitRR, the stop is
 // ratcheted forward to InpLockProfitTargetRR (expressed in R, measured from
 // primaryEntry). This is a ONE-WAY ratchet: the lock can only ever tighten an
@@ -245,14 +270,19 @@ input double   InpLock3RRR      = 3.0;        // Dynamic ATR trail activation (+
 // parallel and wins whenever it computes a tighter stop than the step lock.
 // Set either input to 0.0 to disable the step lock entirely.
 //
-// MILESTONE GAP: breakeven (InpBreakEvenRR = 1.0) sits exactly 1R below the
-// lock target (InpLockProfitTargetRR = 2.0), which sits exactly 1R below the
-// lock trigger (InpLockProfitRR = 3.0). That spacing is deliberate: a lock
-// target that fell at or below the cost-covering breakeven would be a no-op,
-// because the existing breakeven ratchet already demands a stop at
-// primaryEntry +/- beOffset (a few points of pure friction cost). Locking
-// anything tighter than that would only ever LOOSEN the stop, and the
-// ratchet in ApplyUnifiedSL() would silently refuse it.
+// MILESTONE LADDER: the floors now form an evenly-spaced 1R ladder, and each
+// rung is strictly forward of the one below it --
+//   +1.0R  breakeven (InpBreakEvenRR)  -> stop at primaryEntry +/- beOffset
+//   +2.0R  lock rung 2                 -> stop at +1.0R (InpLockProfit2TargetRR)
+//   +3.0R  lock rung 3                 -> stop at +2.0R (InpLockProfitTargetRR)
+// The spacing is deliberate: a rung target that fell at or below the rung
+// beneath it would be a no-op, because the lower ratchet already demands a
+// tighter stop. Locking anything looser than the floor already in place would
+// only ever move the stop BACKWARDS, and the one-way ratchet in
+// ApplyUnifiedSL() would silently refuse it. Keep every trigger strictly above
+// its own target.
+input double   InpLockProfit2RR       = 2.0; // Step profit lock rung 2 trigger (+2.0R)
+input double   InpLockProfit2TargetRR = 1.0; // Step profit lock rung 2 target: lock SL at +1.0R
 input double   InpLockProfitRR       = 3.0;  // Step profit lock trigger (+3.0R)
 input double   InpLockProfitTargetRR = 2.0;  // Step profit lock target: lock SL at +2.0R
 
@@ -288,7 +318,7 @@ input double   SafetyTotalDDLimit  = 5.0;     // Hard breach: close all + halt a
 input double   SafetyMaxFloatingLoss = 1.0;   // Hard breach: close all + halt if floating loss hits %
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.28"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.29"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart

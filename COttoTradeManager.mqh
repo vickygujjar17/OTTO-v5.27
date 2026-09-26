@@ -4,7 +4,7 @@
 //|            OTTO EA - Cut / Cost-BE / ATR Trail / Pyramiding       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.28"
+#property version   "5.29"
 
 #ifndef __OTTO_TRADE_MANAGER__
 #define __OTTO_TRADE_MANAGER__
@@ -117,11 +117,18 @@ public:
       // push below compares against this, so introducing the session SL can never
       // by itself manufacture a difference and trigger a spurious broker write.
       double prevTrailSL = desiredSL;
-      // FIX (v5.20): set when Tranche 3 is added on THIS tick. The ATR-trail
-      // block and the single-ticket broker push are both bypassed for that
-      // one tick so the broker can confirm the protective breakeven stop on
+      // FIX (v5.20): set when a scaling tranche is added on THIS tick. The
+      // ATR-trail block and the single-ticket broker push are both bypassed for
+      // that one tick so the broker can confirm the protective breakeven stop on
       // the new ticket before the dynamic trail takes over.
-      bool t3OpenedThisTick = false;
+      // v5.29: generalised from t3OpenedThisTick. With the trail now arming at
+      // +1.0R, the Tranche 2 fill, the breakeven ratchet AND the trail
+      // activation all land on the SAME tick, so the guard has to cover every
+      // rung. Scoping it to Tranche 3 alone would have let a tight ATR trail be
+      // written over a brand-new T2 ticket whose protective stop the broker had
+      // not yet confirmed -- the v5.14/v5.20 INVALID_STOPS / instant-stopped-out
+      // failure mode, moved one rung earlier.
+      bool trancheOpenedThisTick = false;
       // FIX (v5.15): after a T2/T3 ApplyUnifiedSL moved the BASKET stop, the
       // primary struct field (trade.currentTrailSL) lags behind the real
       // ratcheted value. Re-seed from the authoritative session SL so the
@@ -162,7 +169,22 @@ public:
          // evaluated AFTER the step lock, so the tighter of the two wins on this
          // same tick. When the ATR trail is near market it supersedes the +2.0R
          // floor; in a wide-ATR chop the +2.0R floor holds.
-         if(currentRR >= InpLock3RRR)
+         // v5.29: STEP PROFIT LOCK rung 2 (InpLockProfit2RR -> InpLockProfit2TargetRR).
+         // Evaluated AFTER rung 3 above so the HIGHER milestone always wins: at or
+         // past +3.0R the stop already sits at +2.0R, which is forward of the
+         // +1.0R this rung would set, so its guard is simply false and the rung
+         // is a no-op. Keeping the rungs in descending order makes the ladder
+         // independent of which single trigger happens to be crossed first.
+         if(InpLockProfit2RR > 0.0 && InpLockProfit2TargetRR > 0.0 && currentRR >= InpLockProfit2RR)
+           {
+            double lockedSL2 = primaryEntry + (InpLockProfit2TargetRR * rrUnit);
+            if(lockedSL2 > desiredSL) desiredSL = lockedSL2;
+           }
+         // v5.29: trail gate repointed from InpLock3RRR (3.0) to InpTrailStartRR
+         // (1.0), so the ATR trail arms from +1.0R instead of waiting for the
+         // step at which the pyramid reaches full size. Evaluated AFTER both lock
+         // rungs, so the tighter of the three wins on this same tick.
+         if(currentRR >= InpTrailStartRR)
            {
             double dynamicTrail = high0 - (InpTrailATRMultiplier * atr);
             if(dynamicTrail > desiredSL) desiredSL = dynamicTrail;
@@ -188,8 +210,16 @@ public:
             double lockedSL = primaryEntry - (InpLockProfitTargetRR * rrUnit);
             if(lockedSL < desiredSL) desiredSL = lockedSL;
            }
+         // v5.29: STEP PROFIT LOCK rung 2 -- mirror of the LONG branch. Placed
+         // after rung 3 for the same reason: the higher milestone must win.
+         if(InpLockProfit2RR > 0.0 && InpLockProfit2TargetRR > 0.0 && currentRR >= InpLockProfit2RR)
+           {
+            double lockedSL2 = primaryEntry - (InpLockProfit2TargetRR * rrUnit);
+            if(lockedSL2 < desiredSL) desiredSL = lockedSL2;
+           }
          // v5.27: DYNAMIC ATR TRAIL — mirror of the LONG branch.
-         if(currentRR >= InpLock3RRR)
+         // v5.29: trail gate repointed InpLock3RRR -> InpTrailStartRR (mirror).
+         if(currentRR >= InpTrailStartRR)
            {
             double dynamicTrail = low0 + (InpTrailATRMultiplier * atr);
             if(dynamicTrail < desiredSL) desiredSL = dynamicTrail;
@@ -204,46 +234,74 @@ public:
       // independent: add the InpRiskT2Pct tranche, then move the unified basket
       // stop to exact Cost-Covering Breakeven (entry +/- beOffset, where
       // beOffset already accounts for broker commission + swap friction).
+      // v5.29: this rung now fires at +1.0R (InpPyramidT2RR = 1.0), which is the
+      // tick on which three things coincide -- the T2 fill, the +1.0R breakeven
+      // ratchet and the +1.0R ATR-trail activation -- so the guard below is set
+      // unconditionally on a successful add.
       if(currentRR >= InpPyramidT2RR && m_orderManager.IsPyramidPending(2))
         {
          double beOffset = CalcBasketFriction(dir==DIR_LONG);
          double groupBE = primaryEntry + (dir==DIR_LONG ? beOffset : -beOffset);
-         if(m_orderManager.AddPyramidTranche(2))
+         // v5.29: hand groupBE to AddPyramidTranche as slOverride so the market
+         // fill carries its protective stop in the SAME request. T2 previously
+         // relied solely on the ApplyUnifiedSL() on the next line, so a skipped
+         // or rejected call left the new ticket naked in hedge mode. T3 has
+         // always been opened with the override; T2 now matches.
+         if(m_orderManager.AddPyramidTranche(2, groupBE))
              {
               m_orderManager.ApplyUnifiedSL(groupBE);
-              m_orderManager.LogGroupStop("Tranche 2 (+2.0R) - Cost-Covering Breakeven", groupBE);
+              m_orderManager.LogGroupStop("Tranche 2 (+1.0R) - Cost-Covering Breakeven", groupBE);
+              // v5.29: bypass the trail/push blocks below for THIS tick only.
+              // The broker needs a moment to register the protective breakeven
+              // stop attached to the brand-new ticket; pushing the tight ATR
+              // trail in the same tick can be rejected as INVALID_STOPS or,
+              // worse, land on the fill and stop the whole basket out on entry.
+              // The normal ATR trail takes over on the next tick.
+              trancheOpenedThisTick = true;
              }
         }
-      // Tranche 3 at +3.0R (InpTrailStartRR): add the 0.06% tranche.
+      // Tranche 3 at +2.0R (InpPyramidT3RR): add the InpRiskT3Pct tranche.
       // FIX (v5.14): do NOT hand the tight dynamic 'desiredSL' to T3 upon entry.
       // Two reasons: (1) 'desiredSL' is the ATR trail anchored to high0-1.5*ATR,
-      // which at +3.0R sits very close to market and can be rejected with
+      // which at +2.0R already sits close to market and can be rejected with
       // INVALID_STOPS or instantly stop the whole basket on a spread spike;
       // (2) the new ticket would otherwise be opened with sl=0. Instead we pass
       // the friction-based group breakeven with the fill request, so T3 is
       // protected from the first tick, and the normal ATR-trail block below
-      // (currentRR >= InpLock3RRR) ratchets it forward on the next tick.
-      if(currentRR >= InpTrailStartRR && m_orderManager.IsPyramidPending(3))
+      // (currentRR >= InpTrailStartRR) ratchets it forward on the next tick.
+      if(currentRR >= InpPyramidT3RR && m_orderManager.IsPyramidPending(3))
         {
          double beOffset = CalcBasketFriction(dir==DIR_LONG);
          double safeBE = primaryEntry + (dir==DIR_LONG ? beOffset : -beOffset);
          if(m_orderManager.AddPyramidTranche(3, safeBE))
              {
               m_orderManager.ApplyUnifiedSL(safeBE);
-              m_orderManager.LogGroupStop("Tranche 3 (+3.0R) - Executed (Trail Pending)", safeBE);
-              // FIX (v5.20): bypass the trail/push blocks below for THIS tick
-              // only. The broker needs a moment to register the protective
-              // breakeven stop attached to the brand-new ticket; pushing the
-              // tight ATR trail in the same tick can be rejected as
-              // INVALID_STOPS or, worse, land on the fill and stop the whole
-              // basket out on entry. The normal ATR trail takes over on the
-              // next tick, once the initial stop is confirmed.
-              t3OpenedThisTick = true;
+              m_orderManager.LogGroupStop("Tranche 3 (+2.0R) - Executed (Trail Pending)", safeBE);
+              trancheOpenedThisTick = true;
              }
         }
-      // Dynamic ATR Trail at +3.0R: apply SAME trailing SL to every ticket
-      // Skipped entirely on the tick Tranche 3 was added (see above).
-      if(currentRR >= InpLock3RRR && !t3OpenedThisTick)
+      // Tranche 4 at +3.0R (InpPyramidT4RR): add the final InpRiskT4Pct tranche.
+      // This is the last rung, so a successful add advances m_nextTranche to 0
+      // and IsPyramidPending() is false for every rung from here on. Mirrors the
+      // T3 pattern exactly: the friction-based group breakeven travels WITH the
+      // fill request (never the tight dynamic 'desiredSL', for the INVALID_STOPS
+      // reasons spelled out above), and the trail/push blocks are skipped for
+      // this tick so the broker can confirm the new ticket's protective stop
+      // before anything tightens it further.
+      if(currentRR >= InpPyramidT4RR && m_orderManager.IsPyramidPending(4))
+        {
+         double beOffset4 = CalcBasketFriction(dir==DIR_LONG);
+         double safeBE4 = primaryEntry + (dir==DIR_LONG ? beOffset4 : -beOffset4);
+         if(m_orderManager.AddPyramidTranche(4, safeBE4))
+             {
+              m_orderManager.ApplyUnifiedSL(safeBE4);
+              m_orderManager.LogGroupStop("Tranche 4 (+3.0R) - Executed (Trail Pending)", safeBE4);
+              trancheOpenedThisTick = true;
+             }
+        }
+      // Dynamic ATR Trail: apply the SAME trailing SL to every ticket.
+      // Skipped entirely on the tick a scaling tranche was added (see above).
+      if(currentRR >= InpTrailStartRR && !trancheOpenedThisTick)
         {
          m_orderManager.ApplyUnifiedSL(desiredSL);
          // FIX (v5.15): mirror the AUTHORITATIVE ratcheted value back into the
@@ -258,11 +316,13 @@ public:
       // When a multi-tranche basket is active, ApplyUnifiedSL() above already
       // manages every basket ticket, so the single-ticket ModifySL() below is
       // skipped to avoid a conflicting double-modification of the primary.
-      // FIX (v5.20): also skipped on the tick Tranche 3 opened, for the same
-      // reason as the trail block above -- no stop write races the broker's
-      // confirmation of the new ticket's protective stop.
+      // FIX (v5.20): also skipped on the tick a scaling tranche opened, for the
+      // same reason as the trail block above -- no stop write races the broker's
+      // confirmation of the new ticket's protective stop. v5.29: this now covers
+      // T2 as well as T3/T4, which matters because the T2 fill coincides with
+      // the +1.0R trail activation.
       double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
-      if(m_orderManager.GetBasketCount() <= 1 && !t3OpenedThisTick)
+      if(m_orderManager.GetBasketCount() <= 1 && !trancheOpenedThisTick)
         {
          // FIX (v5.16): compare against prevTrailSL (the value BEFORE the
          // session-SL re-seed) so the push reflects genuine local movement
@@ -272,11 +332,11 @@ public:
             if(m_orderManager.ModifySL(trade.ticket, desiredSL))
               {
                m_orderManager.SetActiveTradeSL(desiredSL);
-               if(currentRR >= InpLock3RRR) m_trailActivations++;
+               if(currentRR >= InpTrailStartRR) m_trailActivations++;
               }
            }
         }
-      else if(currentRR >= InpLock3RRR && !t3OpenedThisTick)
+      else if(currentRR >= InpTrailStartRR && !trancheOpenedThisTick)
          m_trailActivations++;
       m_tradesManaged++;
      }
@@ -290,13 +350,15 @@ public:
       double price = (trade.direction == DIR_LONG) ? SymbolInfoDouble(m_symbol, SYMBOL_BID) : SymbolInfoDouble(m_symbol, SYMBOL_ASK);
       double rr = (trade.rrUnit > 0) ? ((trade.direction == DIR_LONG ? price - trade.entryPrice : trade.entryPrice - price) / trade.rrUnit) : 0.0;
       ENUM_TRAIL_STEP step = STEP_NONE;
-      // v5.27: STEP_TRAILING now keys off InpLockProfitRR (the step-profit-lock
-      // AND ATR-trail trigger) rather than InpLock3RRR. Both default to 3.0, so
-      // behaviour is unchanged out of the box, but the classification now
-      // follows the input that actually governs the locked-floor milestone.
+      // v5.27: STEP_TRAILING keys off InpLockProfitRR (the step-profit-lock
+      // milestone). v5.29: the second branch was repointed from InpLock3RRR to
+      // InpTrailStartRR, so the reported trail step now agrees with the input
+      // that actually arms the trail in Update(). As before, both remain
+      // inputs -- the defaults (3.0 / 1.0) simply put the trail ahead of the
+      // +3.0R lock, which is intentional.
       // Order matters: highest milestone first.
       if(InpLockProfitRR > 0.0 && rr >= InpLockProfitRR)      step = STEP_TRAILING;
-      else if(rr >= InpLock3RRR)                              step = STEP_TRAILING;
+      else if(rr >= InpTrailStartRR)                          step = STEP_TRAILING;
       else if(rr >= InpBreakEvenRR)                           step = STEP_BREAKEVEN;
       else if(rr >= InpCutRiskRR)                             step = STEP_HALF_RISK;
       m_orderManager.SetActiveTradeStep(step);

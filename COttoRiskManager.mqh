@@ -4,7 +4,7 @@
 //|              OTTO EA — Institutional risk manager                |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.28"
+#property version   "5.29"
 
 #ifndef __OTTO_RISK_MANAGER__
 #define __OTTO_RISK_MANAGER__
@@ -76,7 +76,14 @@ private:
      {
       if(m_volumeStep <= 0)
          return rawLot;
-      double steps = MathFloor(rawLot / m_volumeStep);   // strict round-DOWN, never overshoot risk
+      // v5.29: the 1e-8 epsilon absorbs binary floating-point representation
+      // error before flooring. Without it, a rawLot that is mathematically an
+      // exact multiple of the volume step can sit a few ULPs BELOW that
+      // multiple, and MathFloor then drops a whole step -- a silent one-step
+      // UNDER-size. Safe by construction: 1e-8 of a single volume step is far
+      // below the broker's smallest increment, so it can never round a lot UP
+      // past the risk budget, and the strict round-down guarantee is preserved.
+      double steps = MathFloor(rawLot / m_volumeStep + 1e-8);   // strict round-DOWN, never overshoot risk
       double normalized = steps * m_volumeStep;
       normalized = MathMax(m_volumeMin, MathMin(m_volumeMax, normalized));
       return normalized;
@@ -108,7 +115,11 @@ public:
       if(slPoints <= 0.0 || m_tickValue <= 0.0) return 0.0;
 
       double rawLot = riskMoney / (slPoints * m_tickValue);
-      double steps  = MathFloor(rawLot / m_volumeStep);
+      // v5.29: epsilon-safe floor -- mirrors NormalizeLotSize() above. This path
+      // sizes the pyramid rungs, and the smaller a rung gets (T4 = 0.0625%) the
+      // larger the RELATIVE error a single dropped volume step represents, so
+      // the epsilon matters most exactly where the rungs are smallest.
+      double steps  = MathFloor(rawLot / m_volumeStep + 1e-8);
       double lot    = steps * m_volumeStep;
 
       // Hard safety: never exceed target risk even after clamping up

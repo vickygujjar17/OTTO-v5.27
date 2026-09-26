@@ -1,0 +1,108 @@
+5.29: 4-tranche Risk-% pyramid, trail arms at +1.0R, +2.0R floor rung
+
+PYRAMID (OttoDefines.mqh, COttoTradeManager.mqh, COttoOrderManager.mqh)
+
+The ladder was three tranches (T1 at market, T2, T3) sized by a two-way
+ternary, and T2/T3 shared a single trigger value that happened to equal the
+breakeven milestone. It is now a true FOUR-rung risk-percent pyramid with an
+independent trigger and an independent risk budget for every rung:
+
+  T1  0.25%    RiskPercent (group [6])   at market
+  T2  0.25%    InpRiskT2Pct              at +1.0R  InpPyramidT2RR
+  T3  0.125%   InpRiskT3Pct              at +2.0R  InpPyramidT3RR
+  T4  0.0625%  InpRiskT4Pct              at +3.0R  InpPyramidT4RR
+
+Total ladder risk 0.6875% of equity, comfortably inside the SafetyMaxRiskPct
+= 1.5% budget (pinned by the new probe). InpRiskT2Pct 0.12 -> 0.25 and
+InpRiskT3Pct 0.06 -> 0.125 so the rungs step down evenly rather than
+collapsing.
+
+RISK SELECTION. AddPyramidTranche() sized every rung != 2 from InpRiskT3Pct,
+so a fourth rung would silently have inherited the T3 budget. It is now an
+explicit ascending if/else chain that returns false for any tranche it does
+not recognise -- an unknown rung can never fall through onto another rung's
+risk. The ladder advance is likewise explicit and appears at BOTH the skip
+path and the success path: 2 -> 3 -> 4 -> 0, where 0 parks the ladder so
+IsPyramidPending() is false for every rung and no re-arm is possible.
+
+The function parameter is renamed tranche -> trancheToAdd to keep it distinct
+from the m_basket[].tranche struct field it is stored into, so the LHS of
+that assignment can never be captured by a future rename.
+
+Ladder triggers are validated as strictly ascending (T2 < T3 < T4) with a
+comment stating why: a rung whose trigger is never reached leaves
+m_nextTranche parked on it and every later rung becomes unreachable.
+
+PER-TICK GUARD (COttoTradeManager.mqh)
+
+t3OpenedThisTick -> trancheOpenedThisTick. The guard suspends the ATR-trail
+block and the single-ticket broker push for the one tick a scale-in fills, so
+the protective stop that travelled with the market order is confirmed by the
+broker before anything tightens it (the v5.14/v5.20 INVALID_STOPS and
+instant-stopped-out failure mode).
+
+This had to be generalised: T2 now fills at +1.0R, the exact tick on which
+the breakeven ratchet and the ATR-trail activation also land. Scoping the
+guard to T3 alone would have written a tight trail over a brand-new T2 ticket
+one rung earlier than the bug it exists to prevent. All three rungs now raise
+it.
+
+T2 also now passes a friction-based group breakeven to the fill as
+slOverride, exactly as T3 always has. Previously T2 relied solely on the
+ApplyUnifiedSL() on the next line, so a skipped or rejected call left the new
+ticket with no stop at all in hedge mode.
+
+TRAIL REPOINT (OttoDefines.mqh, COttoTradeManager.mqh)
+
+InpLock3RRR gated the trail at +3.0R -- the same step at which the pyramid
+reaches full size, which meant the trail effectively armed only at maximum
+exposure. The trail is a risk-management tool and must arm early, so every
+live read is repointed to the new InpTrailStartRR = 1.0 (both direction
+gates, both single-ticket push counters, and the SyncTradeState()
+classification), putting it in agreement with the input that actually arms it.
+
+InpLock3RRR is retained as a declared-but-unread input so saved .set files
+keep loading without an "unknown input" mismatch; MQL5 emits no warning for
+an unused input, and the new probe fails if any line of live code reads it
+again.
+
+MISSING FLOOR RUNG (OttoDefines.mqh, COttoTradeManager.mqh)
+
+The step lock jumped from breakeven straight to the +3.0R lock. The floors
+are now an evenly-spaced 1R ladder -- +1.0R breakeven, +2.0R lock -> stop at
++1.0R (new InpLockProfit2RR / InpLockProfit2TargetRR), +3.0R lock -> stop at
++2.0R -- evaluated in descending order so the higher milestone always wins.
+The rung-2 block is placed after rung 3 and before the ATR trail in both
+branches, preserving the tighter-of-the-two-wins ordering.
+
+LOT SIZING (COttoRiskManager.mqh)
+
+Both lot-sizing paths floored with MathFloor(rawLot / step) alone. A quotient
+that is mathematically an exact multiple of the volume step can land a few
+ULPs below that integer -- 0.29 / 0.01 evaluates to 28.999999999999996 in
+IEEE-754 -- and the bare floor then drops a WHOLE step, silently
+UNDER-sizing the position. Both sites now add a 1e-8 epsilon before flooring,
+mirroring the existing NormalizeLotSize() guard. The epsilon is far below one
+volume step, so it can only recover an exact multiple and can never round a
+lot up past the risk budget; the strict round-down guarantee is preserved and
+pinned by the probe over the real regression cases.
+
+VERIFICATION
+
+build_check.ps1: 0 errors, 0 warnings (all 10 headers link from the staging
+tree).
+Probe suites: 11/11 pass. test_v52x_pyramid.py 91/91 (new) pins the four
+rungs and their risk inputs, the no-fallthrough risk chain, the strict
+2 -> 3 -> 4 -> 0 ladder advance at both sites, the full ladder walk plus the
+parked/terminal states, the IsPyramidPending() contract, the per-tick guard
+(declared once, raised once per rung, raised inside the T2 block), that no
+rung ever hands the tight dynamic trail to a fill, the three trail gates, that
+no live code reads InpLock3RRR, and the epsilon-safe floor including the
+0.29 / 0.01 regression case and a round-down-never-overshoots sweep.
+test_v527_exit_comment.py 59/59 (updated: the InpPyramidT2RR pin and the
+AddPyramidTranche comment-call pin follow the intended T2 trigger and the
+parameter rename). test_v528_hotfix.py 74/74, test_v526_vector.py 83/83.
+normalize_eol: bareLF=0 bareCR=0 across all 10 files.
+repair_mojibake: 0 damaged characters.
+Version bumped 5.28 -> 5.29 in all 10 files plus the README base line.
+Historical FIX (v5.2x) annotations preserved.

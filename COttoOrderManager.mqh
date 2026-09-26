@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.28"
+#property version   "5.29"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -62,7 +62,7 @@ private:
    int                     m_basketCount;     // number of open tranches
    double                  m_primaryEntry;    // Tranche 1 entry (reference for RR)
    double                  m_basketRRUnit;    // rrUnit shared by basket
-   int                     m_nextTranche;     // next tranche to add (2 or 3)
+   int                     m_nextTranche;     // next tranche to add (2, 3, 4 or 0 = exhausted)
    ENUM_TRADE_DIRECTION    m_basketDir;
    datetime                m_basketOpenTime;
    string                  m_sessionID;       // unique session ID for this trade basket
@@ -1781,13 +1781,25 @@ public:
       return (InpPyramidEnable && m_nextTranche == tranche && m_hasActiveTrade);
      }
 
-   bool              AddPyramidTranche(int tranche, double slOverride = 0.0)
+   // v5.29: the ladder is 2 -> 3 -> 4 -> 0, i.e. FOUR tranches total (one
+   // initial + three scale-ins). trancheToAdd is named distinctly from the
+   // m_basket[].tranche struct field it is stored into, so the LHS of that
+   // assignment can never be captured by a rename of this parameter.
+   bool              AddPyramidTranche(int trancheToAdd, double slOverride = 0.0)
      {
       if(!InpPyramidEnable || m_basketCount == 0) return false;
-      if(tranche != m_nextTranche) return false;
+      if(trancheToAdd != m_nextTranche) return false;
 
-      // Exact descending risk tiers: T2=InpRiskT2Pct, T3=InpRiskT3Pct
-      double riskPct = (tranche == 2) ? InpRiskT2Pct : InpRiskT3Pct;
+      // v5.29: exact descending risk tiers, one per rung:
+      //   T2 = InpRiskT2Pct, T3 = InpRiskT3Pct, T4 = InpRiskT4Pct
+      // Written as an explicit chain rather than a ternary so that adding a
+      // fifth rung is a one-line change, and so an unrecognised tranche can
+      // never silently inherit another rung's risk.
+      double riskPct = 0.0;
+      if(trancheToAdd == 2)      riskPct = InpRiskT2Pct;
+      else if(trancheToAdd == 3) riskPct = InpRiskT3Pct;
+      else if(trancheToAdd == 4) riskPct = InpRiskT4Pct;
+      else                       return false;
       double slDist = m_basketRRUnit;
       if(slDist <= 0.0) return false;
 
@@ -1795,10 +1807,11 @@ public:
       if(lot <= 0.0)   // below broker minimum lot -> skip this tranche
         {
          if(EnableLogging)
-            Print("[Pyramid] Tranche ", tranche, " skipped: risk lot below min.");
+            Print("[Pyramid] Tranche ", trancheToAdd, " skipped: risk lot below min.");
 
          // Advance the tranche counter so we don't spam this every tick
-         m_nextTranche = (tranche == 2) ? 3 : 0;
+         // v5.29: ladder advance 2 -> 3 -> 4 -> 0 (0 = ladder exhausted).
+         m_nextTranche = (trancheToAdd == 2) ? 3 : ((trancheToAdd == 3) ? 4 : 0);
          return false;
         }
       if(!m_riskManager.HasSufficientMargin(lot)) return false;
@@ -1815,7 +1828,7 @@ public:
         {
          reqSL = AdjustSLToMinimum(entryPrice, slOverride, isLong);
          if(EnableLogging && MathAbs(reqSL - slOverride) > SymbolInfoDouble(m_symbol, SYMBOL_POINT))
-            Print("[Pyramid] Tranche ", tranche, " SL widened to broker minimum: ",
+            Print("[Pyramid] Tranche ", trancheToAdd, " SL widened to broker minimum: ",
                   DoubleToString(slOverride, Digits()), " -> ", DoubleToString(reqSL, Digits()));
         }
 
@@ -1830,7 +1843,7 @@ public:
       req.tp       = 0;
       req.deviation = MaxSlippage;
       req.magic    = MagicNumber;
-      req.comment  = BuildOrderComment(m_activeTrade.sourceBlockSerial, tranche);   // v5.27: clamped to 31
+      req.comment  = BuildOrderComment(m_activeTrade.sourceBlockSerial, trancheToAdd);   // v5.27: clamped to 31
       req.type_filling = GetFillingMode();
       if(SendOrderWithRetry(req, res))
         {
@@ -1838,18 +1851,19 @@ public:
          m_basket[m_basketCount].ticket  = res.order;
          m_basket[m_basketCount].entry   = res.price;
          m_basket[m_basketCount].size    = lot;
-         m_basket[m_basketCount].tranche = tranche;
+         m_basket[m_basketCount].tranche = trancheToAdd;
          m_basketCount++;
-         m_nextTranche = (tranche == 2) ? 3 : 0;
+         // v5.29: ladder advance 2 -> 3 -> 4 -> 0 (0 = ladder exhausted).
+         m_nextTranche = (trancheToAdd == 2) ? 3 : ((trancheToAdd == 3) ? 4 : 0);
          if(EnableLogging)
-            Print("[Pyramid] Tranche ", tranche, " added: ticket=", res.order,
+            Print("[Pyramid] Tranche ", trancheToAdd, " added: ticket=", res.order,
                   " lot=", DoubleToString(lot,2), " risk%=", DoubleToString(riskPct,2),
                   " entry=", DoubleToString(res.price,_Digits),
                   " sl=", DoubleToString(reqSL,_Digits));
          if(m_journal != NULL)
             {
              m_journal.SetSessionID(m_sessionID);
-             m_journal.LogPyramid(tranche, res.order, res.price, lot, riskPct, m_sessionSL);
+             m_journal.LogPyramid(trancheToAdd, res.order, res.price, lot, riskPct, m_sessionSL);
             }
          return true;
         }
