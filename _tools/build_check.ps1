@@ -89,7 +89,7 @@ Copy-Item (Join-Path $Source "*.mq5") $experts  -Force
 $ottoNames = @("OttoDefines", "COttoNewsFilter", "COttoRiskManager",
                "COttoMarketStructure", "COttoBlockManager", "COttoOrderManager",
                "COttoCorrelationFilter", "COttoTradeManager", "COttoJournal")
-$skipNames = New-Object System.Collections.Generic.HashSet[string]
+$skipNames = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
 [void]$skipNames.Add("Otto")
 foreach ($n in $ottoNames) { [void]$skipNames.Add("$n.mqh") }
 # Legacy/foreign variants that must never shadow an OTTO module.
@@ -135,6 +135,44 @@ foreach ($m in $expectedOtto) {
 if ($missingStage.Count -gt 0) {
     Write-Host "FATAL: staging incomplete, missing:"
     $missingStage | ForEach-Object { Write-Host "  $_" }
+    exit 2
+}
+
+# --- Staging integrity guard ---------------------------------------------
+# The framework mirror above copies the terminal's Include tree into the SAME
+# staging root. Windows' filesystem is case-INsensitive, so a terminal folder
+# named "OTTO" merges with our "Otto" and can silently OVERWRITE the freshly
+# staged OTTO headers with older copies -- after which the gate compiles and
+# reports on the WRONG code while still printing a green verdict.
+# Reproduced 27-09-2026: terminal Include\OTTO held the v5.27 tree, and
+# HashSet[string] name filtering is case-SENSITIVE, so "OTTO" slipped past the
+# skip list; staged COttoTradeManager.mqh came out 20669 bytes against the
+# repo's 31641 and the compile failed with 7 "undeclared identifier" errors
+# that did not exist in the source. Hash-compare every staged OTTO module
+# against the repo and fail loudly on any mismatch.
+$staleStage = @()
+foreach ($m in $expectedOtto) {
+    $srcFile = Join-Path $Source "$m.mqh"
+    $dstFile = Join-Path $includes "$m.mqh"
+    if ((Test-Path $srcFile) -and (Test-Path $dstFile)) {
+        if ((Get-FileHash $srcFile).Hash -ne (Get-FileHash $dstFile).Hash) {
+            $staleStage += ("{0}.mqh : staged copy OVERWRITTEN (source={1}B staged={2}B)" -f `
+                $m, (Get-Item $srcFile).Length, (Get-Item $dstFile).Length)
+        }
+    }
+}
+$entrySrc = Join-Path $Source $Entry
+if ((Test-Path $entrySrc) -and (Test-Path $entryPath)) {
+    if ((Get-FileHash $entrySrc).Hash -ne (Get-FileHash $entryPath).Hash) {
+        $staleStage += ("{0} : staged copy OVERWRITTEN (source={1}B staged={2}B)" -f `
+            $Entry, (Get-Item $entrySrc).Length, (Get-Item $entryPath).Length)
+    }
+}
+if ($staleStage.Count -gt 0) {
+    Write-Host "FATAL: staging tree was overwritten by the framework mirror:"
+    $staleStage | ForEach-Object { Write-Host "  $_" }
+    Write-Host "FIX: ensure no terminal Include entry collides case-insensitively with the"
+    Write-Host "     staging folders ('Otto') or the OTTO module file names."
     exit 2
 }
 

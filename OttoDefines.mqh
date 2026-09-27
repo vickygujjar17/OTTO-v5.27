@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.29 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.31 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.29"
-#property description "OTTO v5.29 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.31"
+#property description "OTTO v5.31 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -53,7 +53,7 @@ enum ENUM_VETO_REASON
    VETO_MOMENTUM,           // (high-low) > 3.5*ATR in the last 8 bars
    VETO_FVG,                // Fair-value-gap present in the last 8 bars
    VETO_STALE,              // 45 market days from W1 without an entry
-   VETO_FRONTRUN,           // 1:3 target hit before entry
+   VETO_FRONTRUN,           // InpMaxRR target hit before entry
    VETO_NEARMISS,           // 6 market days in the proximity zone without entry
    VETO_BROKEN,             // Broken without flip capability
    VETO_FLIPPED,            // Broken -> block flipped (S<->R)
@@ -135,8 +135,10 @@ struct SSniperBlock
    string            tradeId;          // "OTTO_SUP_n" / "OTTO_RES_n"
    double            localEntry;       // entry price
    double            localSL;          // stop-loss price
-   double            localTP;          // 1:3 projection (used ONLY for Front-Run Veto)
+   double            localTP;          // InpMaxRR projection (used ONLY for Front-Run Veto)
    double            rrUnit;           // = blockHeight + 0.5*ATR (Pine b.rr_unit)
+   bool              priceAbortLogged; // v5.30: one-shot gate for the Invalid-Price abort
+                                       //   (0 from ZeroMemory at every creation site)
 
    // --- v4.30 Near-Miss trackers (Pine: min_prox_dist / anchor_*) ---
    double            minProxDist;      // closest proximity wick distance (0 = unset)
@@ -202,7 +204,13 @@ input bool     InpUseFvgVeto        = false;   // FVG veto (Disabled)
 input bool     InpUseMomVeto        = false;   // Momentum veto (Disabled)
 input bool     InpUseSeparationVeto = true;    // Separation veto (Enabled)
 input bool     InpUseNearMissVeto   = true;    // Near Miss (6D) veto (Enabled)
-input bool     InpUseFrontRunVeto   = true;    // Front-Run (1:3) veto (Enabled)
+input bool     InpUseFrontRunVeto   = true;    // Front-Run veto (Enabled)
+// v5.31: the Front-Run veto's target projection was hardcoded to exactly
+// 3 * slDist across four sites. It is now a single input so the projection
+// that vetoes a trade and the take-profit the trade is actually sent with
+// can never drift apart again -- the veto compares against the live TP once
+// an order is resting, so a mismatch silently retires the veto.
+input double   InpMaxRR             = 4.0;     // Front-Run / TP projection (risk-reward multiple)
 input bool     InpUseStaleVeto      = true;    // Stale (45D) veto (Enabled)
 input int      InpStaleDays         = 45;     // Stale veto market-days (Pine stale_days)
 
@@ -311,14 +319,29 @@ input group "══════════════════════�
 input double   SafetyMaxRiskPct    = 1.5;     // Hard abort if risk > this % of account
 input double   SafetyDailyDDLimit  = 3.0;     // Soft breach: pause new orders at this %
 input double   SafetyTotalDDLimit  = 5.0;     // Hard breach: close all + halt at this % (Trailing)
-// FIX (v5.22): GFT 1% max FLOATING loss. Measured as a TRAILING retracement
-// from the peak-equity high-water mark (not raw balance-vs-equity), so a
-// routine intraday dip while equity is still below its own peak cannot trip
-// a permanent halt. Breach => close all + halt.
-input double   SafetyMaxFloatingLoss = 1.0;   // Hard breach: close all + halt if floating loss hits %
+// v5.31: GFT 0.90% max FLOATING loss. Basis is the raw live float,
+// (balance - equity) / balance -- NOT a retracement from the peak-equity
+// high-water mark. The HWM basis was abandoned in v5.28: it fired whenever
+// equity sat below its own peak even with nothing open, and latched the
+// permanent halt on an ordinary tick. A float measure reads 0 whenever the
+// book is empty. See the FIX (v5.28) note in otto.mq5.
+//
+// The breach response is a SMART TRIM, not a liquidation: tranche 1 (the
+// primary -- the only leg whose stop-loss defines the trade's risk geometry)
+// is preserved, and every NON-PRIMARY leg that has travelled at least
+// InpTrimLoserStopPct of the way to its own stop is closed. The whole basket
+// is still closed wholesale when no trimmable leg survives, so 0.90% remains
+// a hard ceiling on floating loss either way.
+input double   SafetyMaxFloatingLoss = 0.90;  // Hard cap: smart-trim at this % floating loss
+// v5.31: how far a NON-PRIMARY tranche must have moved toward its own SL
+// before the smart trim is willing to close it. At 70% the leg is already
+// most of the way to being stopped out, so closing it early recovers float
+// without surrendering a pyramid leg that is merely breathing. Set to 0 to
+// let every non-primary leg qualify (trim to the primary alone).
+input double   InpTrimLoserStopPct = 70.0;    // Smart trim: non-primary legs >= this % toward SL
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.29"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.31"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart

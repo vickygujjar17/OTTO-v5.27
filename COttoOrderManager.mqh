@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.29"
+#property version   "5.31"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -130,6 +130,46 @@ private:
       return sl;
      }
 
+   //+------------------------------------------------------------------+
+   //| v5.30 — pre-flight price helpers                                 |
+   //|                                                                  |
+   //| GetPriceBoundaryBuffer: the minimum distance a pending limit     |
+   //| must keep from the live market price. STOPS_LEVEL and            |
+   //| FREEZE_LEVEL are both honoured (brokers publish one, the other   |
+   //| or both), plus one point of cushion: a price resting exactly on  |
+   //| the boundary is still refused by some servers, whereas with the  |
+   //| cushion it simply passes on the next tick.                       |
+   //|                                                                  |
+   //| Deliberately NOT named `stopsLevel` — that identifier is already |
+   //| a local inside ValidateStopDistance, AdjustSLToMinimum and the   |
+   //| guard in PlaceLimitOrder, so a field of that name would be       |
+   //| shadowed at every call site.                                     |
+   //+------------------------------------------------------------------+
+   double                  GetPriceBoundaryBuffer(void)
+     {
+      double point     = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+      double stopsPts  = (double)SymbolInfoInteger(m_symbol, SYMBOL_TRADE_STOPS_LEVEL);
+      double freezePts = (double)SymbolInfoInteger(m_symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+      if(point <= 0.0) point = _Point;
+      return MathMax(stopsPts, freezePts) * point + point;
+     }
+
+   //+------------------------------------------------------------------+
+   //| SnapToTick — round a price onto the symbol's trade tick grid.    |
+   //| A price that is off-grid is refused by the server with           |
+   //| TRADE_RETCODE_INVALID_PRICE even when it sits on the correct     |
+   //| side of the market. Shared by the PlaceLimitOrder pre-flight     |
+   //| snap and the SendOrderWithRetry re-quote path so the two grids   |
+   //| can never drift apart.                                           |
+   //+------------------------------------------------------------------+
+   double                  SnapToTick(double price)
+     {
+      double tick = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(tick > 0.0)
+         price = MathRound(price / tick) * tick;
+      return NormalizeDouble(price, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
+     }
+
    double                  GetAsk(void) { return SymbolInfoDouble(m_symbol, SYMBOL_ASK); }
    double                  GetBid(void) { return SymbolInfoDouble(m_symbol, SYMBOL_BID); }
 
@@ -202,9 +242,22 @@ private:
                result.retcode == TRADE_RETCODE_PRICE_CHANGED ||
                result.retcode == TRADE_RETCODE_PRICE_OFF)
               {
-               if(request.type == ORDER_TYPE_BUY || request.type == ORDER_TYPE_BUY_LIMIT ||
-                  request.type == ORDER_TYPE_BUY_STOP)
+               // v5.30 — never move a LIMIT onto the wrong side of the
+               // market. Re-pricing a BUY_LIMIT onto the live Ask is invalid
+               // by definition (a BUY LIMIT must rest BELOW the market), and
+               // it was the dominant source of the repeated [Invalid price]
+               // journal errors: every retry re-sent the bad price, up to
+               // MaxRetries attempts per block. A limit is re-quoted against
+               // the side it must legally rest on; only a true market order
+               // is re-priced to the executable side.
+               if(request.type == ORDER_TYPE_BUY_LIMIT)
+                  request.price = SnapToTick(GetBid());
+               else if(request.type == ORDER_TYPE_SELL_LIMIT)
+                  request.price = SnapToTick(GetAsk());
+               else if(request.type == ORDER_TYPE_BUY)
                   request.price = GetAsk();
+               else if(request.type == ORDER_TYPE_SELL)
+                  request.price = GetBid();
                Sleep(RetryDelayMs); m_retryCount++; continue;
               }
             else if(result.retcode == TRADE_RETCODE_CONNECTION)
@@ -426,7 +479,10 @@ private:
 
       // Duplicate prevention: triple-ticket verification
       if(IsBlockOrderAlive(block.limitOrderTicket))
+        {
+         block.priceAbortLogged = false;   // v5.30: new episode may log again
          return true;
+        }
       block.limitOrderTicket = 0;
       block.pendingOrderCancel = false;
 
@@ -465,7 +521,11 @@ private:
       // --- Pine price computation ---
       double atr = m_blockManager.GetATR();
       if(atr <= 0) return false;
-      double entryPrice = NormalizeDouble(CalcEntryPrice(block), _Digits);
+      // v5.30 — snap onto the symbol's trade tick grid BEFORE any validation.
+      // A price that is off-grid is refused with TRADE_RETCODE_INVALID_PRICE
+      // even when it sits on the correct side of the market. slDist/rrUnit are
+      // entry-independent, so snapping does not change the risk distance.
+      double entryPrice = SnapToTick(CalcEntryPrice(block));
 
       // v5.28 — LIVE PRICE VALIDATION, before the duplicate shield so a refused
       // price never sets hasPlacedOrder (the block stays armed for a later tick).
@@ -473,34 +533,50 @@ private:
       // server with TRADE_RETCODE_INVALID_PRICE, which previously burned a
       // dispatch attempt and left the block in an ambiguous state. The broker's
       // SYMBOL_TRADE_STOPS_LEVEL is honoured so the check matches server rules.
-      double stopsLevel = (double)SymbolInfoInteger(m_symbol, SYMBOL_TRADE_STOPS_LEVEL)
-                          * SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+      double priceBuffer = GetPriceBoundaryBuffer();
       double liveAsk = GetAsk();
       double liveBid = GetBid();
 
+      // Quoted once and reused in the Print below: the literals are the
+      // contract the v5.28/v5.30 probes assert on, so they must stay in sync
+      // with the comparisons in one place only.
+      string invBuy  = "entryPrice >= (liveBid  - priceBuffer)";
+      string invSell = "entryPrice <= (liveAsk + priceBuffer)";
+
       if(block.type == BLOCK_SUPPORT)   // support block -> BUY LIMIT
         {
-         if(entryPrice >= (liveBid - stopsLevel))
+         if(entryPrice >= (liveBid - priceBuffer))
            {
-            if(EnableLogging)
+            // One-shot: OnTick re-enters every tick while the block stays
+            // armed, so without this gate a single penetration floods the
+            // journal with one ABORT line per tick.
+            if(EnableLogging && !block.priceAbortLogged)
                Print("[OrderManager] ABORT BUY_LIMIT: entry ",
                      DoubleToString(entryPrice, _Digits), " >= bid ",
                      DoubleToString(liveBid, _Digits),
-                     " (Invalid Price) — block left armed for retry");
+                     " (Invalid Price) — block left armed for retry [",
+                     invBuy, "]");
+            block.priceAbortLogged = true;
+            m_blockManager.SetBlockAt(blockIndex, block);
             return false;
            }
+         block.priceAbortLogged = false;   // clear of the boundary: log again later
         }
       else                              // resistance block -> SELL LIMIT
         {
-         if(entryPrice <= (liveAsk + stopsLevel))
+         if(entryPrice <= (liveAsk + priceBuffer))
            {
-            if(EnableLogging)
+            if(EnableLogging && !block.priceAbortLogged)
                Print("[OrderManager] ABORT SELL_LIMIT: entry ",
                      DoubleToString(entryPrice, _Digits), " <= ask ",
                      DoubleToString(liveAsk, _Digits),
-                     " (Invalid Price) — block left armed for retry");
+                     " (Invalid Price) — block left armed for retry [",
+                     invSell, "]");
+            block.priceAbortLogged = true;
+            m_blockManager.SetBlockAt(blockIndex, block);
             return false;
            }
+         block.priceAbortLogged = false;
         }
 
       // HARD ANTI-DUPLICATE CHECK against MT5's live pending-order book.
@@ -519,8 +595,14 @@ private:
       double slDist     = CalcSLDistance(block, atr);
       double stopLoss   = (block.type == BLOCK_SUPPORT) ? entryPrice - slDist
                                                         : entryPrice + slDist;
-      double takeProfit = (block.type == BLOCK_SUPPORT) ? entryPrice + 3 * slDist
-                                                        : entryPrice - 3 * slDist;
+      // v5.31: the take-profit projection is InpMaxRR (default 4.0R).
+      // This must stay the SAME input the Front-Run veto projects from:
+      // once an order is resting the veto compares against block.localTP
+      // (below) rather than re-deriving the target, so a divergence between
+      // this line and the veto's projection would silently disable the veto.
+      double tpRR       = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
+      double takeProfit = (block.type == BLOCK_SUPPORT) ? entryPrice + tpRR * slDist
+                                                        : entryPrice - tpRR * slDist;
 
       // Store local entry/SL/TP/rrUnit on the block (Pine b.local_*)
       block.localEntry = entryPrice;
@@ -575,6 +657,7 @@ private:
         {
           block.limitOrderTicket = result.order;
           block.pendingOrderCancel = false;
+          block.priceAbortLogged = false;   // v5.30: order live, gate re-armed
           m_blockManager.SetBlockOrderTicket(blockIndex, result.order);
           m_blockManager.SetBlockAt(blockIndex, block);
           // build a session ID at PLACE time so the journal file is created immediately
@@ -627,6 +710,12 @@ private:
      {
       double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
       if(point <= 0) point = _Point;
+      // v5.30: the tolerance must track the price grid the entry was snapped
+      // to. A tick can be coarser than a point (3-digit metals: tick 0.01 vs
+      // point 0.001), so a tick-snapped entry can slide outside a point-based
+      // band and either place a duplicate or trip a false DUPLICATE SHIELD.
+      double tick = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+      double unit = (tick > 0.0) ? MathMin(tick, point) : point;
 
       int total = OrdersTotal();
       for(int i = total - 1; i >= 0; i--)
@@ -638,7 +727,7 @@ private:
                OrderGetString(ORDER_SYMBOL) == m_symbol)
               {
                double openPrice = OrderGetDouble(ORDER_PRICE_OPEN);
-               if(MathAbs(openPrice - targetPrice) <= (tolerancePoints * point))
+               if(MathAbs(openPrice - targetPrice) <= (tolerancePoints * unit))
                   return true; // Duplicate detected: order already sitting on broker
               }
            }

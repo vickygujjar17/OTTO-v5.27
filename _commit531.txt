@@ -1,0 +1,231 @@
+5.31: InpMaxRR 4.0R projection, 0.90% scoped smart trim, price-guard hardening
+
+This commit folds TWO releases. v5.30 (broker price-guard hardening) was
+never committed on its own, so the tree carries only the final v5.31 stamps;
+the v5.30 work is described in its own section below.
+
+RISK PROJECTION (OttoDefines.mqh, COttoBlockManager.mqh, COttoOrderManager.mqh)
+
+The Front-Run veto's target was hardcoded to exactly 3 * slDist, and so was
+the take-profit the order was sent with. There were four such sites:
+COttoOrderManager's TP projection, TWO front-run passes in
+COttoBlockManager (the new-bar pass and the per-tick re-check), and the
+localTP preference inside each of those passes.
+
+The two halves could not be allowed to drift, and this is the subtle part:
+once an order is resting the veto STOPS re-deriving its target and compares
+against block.localTP instead ("use exact TP parameter once placed"). So if
+the veto's projection and the sent TP ever disagreed, the veto would compare
+the live price against a target its own order could never reach and would
+silently retire -- no error, no log, just a veto that never fires again.
+
+All four sites now read one input:
+
+  input double InpMaxRR = 4.0;   // Front-Run / TP projection (risk-reward)
+
+Each site applies the same defensive fallback, (InpMaxRR > 0.0) ? InpMaxRR :
+1.0, so a .set file carrying 0 cannot project a zero-width target. The
+SniperBlock.localTP comment and the VETO_FRONTRUN enum annotation are
+updated from "1:3" to "InpMaxRR" so the documentation cannot contradict the
+input either.
+
+Net effect on live behaviour: the order is now sent with a 4.0R take-profit
+and the front-run veto projects 4.0R, i.e. the projection widened by one R.
+
+SMART TRIM (OttoDefines.mqh, COttoTradeManager.mqh, otto.mq5)
+
+SafetyMaxFloatingLoss was 1.0 and its breach response was an unconditional
+liquidation of the whole basket. It is now 0.90% and the response is a
+scoped trim: every NON-PRIMARY leg that has travelled at least 70% of the
+way to its OWN stop is closed, the primary is left running, and the full
+basket close remains the fallback when no leg qualifies. 0.90% is therefore
+still a hard ceiling on floating loss either way -- it is never a target to
+sit on.
+
+New input InpTrimLoserStopPct = 70.0 (0 trims every non-primary leg, 100
+disables the trim entirely and restores the previous always-full-close
+behaviour).
+
+WalkTrimLegs(trimPct, dryRun, &outClosed) is the single leg filter, shared
+by the live trim and the read-only CountTrimCandidates() diagnostic so
+"what we counted" and "what we would close" can never diverge:
+
+  * It walks the BROKER's live position book, not m_basket[], so a tranche
+    that opened between the last Update() and this call is still seen and a
+    leg already closed is never counted.
+  * It filters on BOTH POSITION_SYMBOL and POSITION_MAGIC. MagicNumber
+    20240624 is shared by every OTTO chart in the account, so a trim on
+    EURUSD must never touch a GBPUSD tranche.
+  * The primary (m_orderManager.GetActiveTrade().ticket) is excluded, and
+    that ticket is read ONCE before the walk: ForceClose() clears the
+    tracked-basket state on the last leg, so re-reading it inside the loop
+    would change the exclusion set mid-walk.
+  * A leg qualifies once it has moved at least trimPct% of its entry->stop
+    distance in its own direction (BID for a long, ASK for a short), so a
+    leg still in profit scores 0 and is kept.
+  * The effective stop is the TIGHTER of the broker's live SL and
+    m_sessionSL. A rejected ApplyUnifiedSL leaves the leg carrying the wider
+    stop from its fill while m_sessionSL holds the ratcheted basket stop, so
+    taking the wider one would under-report the leg's progress and keep a
+    leg the basket has already moved to breakeven.
+  * Legs with no stop, or whose stop now sits at/beyond their entry, are
+    SKIPPED: their remaining risk is zero and "% of the way to the stop" is
+    no longer meaningful. Trimming them would be taking a breakeven exit,
+    not cutting a loser.
+  * The walk runs DOWNWARD: the apply mode closes as it goes, and a removal
+    shifts every higher index down by one, so an ascending loop would skip
+    the leg that slid into the freed slot.
+  * dryRun=true counts only. In apply mode each qualifying leg is closed via
+    m_orderManager.ForceClose(ticket) and counted ONLY if the close
+    succeeded.
+
+TrimHeavyLosers(trimPct) reports whether the caller must still do the full
+close. It returns TRUE only when it could not act -- no leg was past the bar
+-- which keeps the v5.30 fallback intact. It deliberately returns FALSE both
+when the trim acted and when this breach has already been trimmed: making
+the primary's survival force a full close would turn every trimmed breach
+into a liquidation and make the trim a no-op.
+
+LATCH LIFECYCLE (otto.mq5, COttoTradeManager.mqh)
+
+The 0.90% cap is re-tested on EVERY tick, so without a gate a basket that
+stayed under water would re-scan the position book and re-print its report
+on every tick. m_trimLogged mirrors the v5.30 block.priceAbortLogged gate:
+raised on the first breach, cleared the instant the float is back under the
+cap.
+
+It is raised ONLY when the trim actually closed something. That distinction
+is the whole point of the gate: if the "nothing qualified" path latched too,
+the fallback full close would run once and the 0.90% cap would then be
+unenforced for the rest of the excursion. The nothing-closed path therefore
+escalates every tick until the caller's full close relieves it.
+
+ClearTrimLatch() is a public method with a real body, and otto.mq5 calls it
+from the NON-breach path -- outside the breach branch (which returns) and
+above the daily-drawdown block. Released there, the latch cannot outlive its
+breach and silently skip the trim on the first breach of a LATER basket.
+
+The otto.mq5 breach response is now: cancel pendings -> conditional trim ->
+conditional full close, with needFullClose defaulting to true and the trim
+attempted only while 0.0 < InpTrimLoserStopPct < 100.0. No halt latch is set
+(unchanged from v5.28), and the banner now reads "MAX FLOATING LOSS REACHED
+-- SMART TRIM APPLIED".
+
+RETRIED BREACH. v5.28's comment assumed the branch could only fire once
+because the basket goes flat. A partial trim leaves a live position and a
+non-zero float, so this branch CAN re-enter on a later tick. That is now
+documented in place and is safe: the raised latch makes the re-entry return
+false without re-trimming or re-logging, and the trimmed basket keeps
+running under its own stop.
+
+NOTE: the CloseEntireBasket() reason string is still the historical
+"1% Max Floating Loss Breach". It is left verbatim because the v5.28 probe
+pins that exact literal and it labels the RULE ("max floating loss"), not
+the current threshold (0.90). Renaming it would be cosmetic churn across two
+probes for no behavioural gain.
+
+v5.30 -- BROKER PRICE-GUARD HARDENING (COttoOrderManager.mqh, OttoDefines.mqh)
+
+The journal was dominated by repeated [Invalid price] rejections and a
+"DUPLICATE SHIELD" trip. Five independent defects, each proven at runtime:
+
+1. TICK-SIZE SNAP. Pine computes the entry from zone geometry, so it lands
+   off the symbol's trade tick grid; an off-grid price is refused with
+   TRADE_RETCODE_INVALID_PRICE even when it rests on the correct side of the
+   market. New SnapToTick() rounds onto SYMBOL_TRADE_TICK_SIZE and is applied
+   to the entry BEFORE any validation. slDist/rrUnit are entry-independent,
+   so snapping cannot change the risk distance. Guarded on tick > 0.0
+   (synthetic and some CFD symbols report 0).
+
+2. BOUNDARY BUFFER. The v5.28 check used SYMBOL_TRADE_STOPS_LEVEL alone.
+   GetPriceBoundaryBuffer() now returns
+   max(STOPS_LEVEL, FREEZE_LEVEL) * point + one point: a price exactly ON
+   the boundary is still refused by some servers, whereas with the cushion it
+   simply passes on the next tick. Named priceBuffer rather than stopsLevel
+   on purpose -- stopsLevel is already a local inside ValidateStopDistance,
+   AdjustSLToMinimum and the PlaceLimitOrder guard, so a shared name would be
+   shadowed at every call site.
+
+3. ONE-SHOT LOG GATE. PlaceOrdersForArmedBlocks runs on every OnTick, so one
+   penetration printed an ABORT line per tick per block. New block field
+   priceAbortLogged (0 from ZeroMemory at every creation site) gates the
+   Print and is CLEARED once the price is back inside the boundary, so a
+   later penetration logs again. The block stays ARMED, not vetoed. The
+   order-live path and the IsBlockOrderAlive() short-circuit both re-arm the
+   gate so a fresh episode can log.
+
+4. RETRY RE-QUOTE. The v5.28 retry path re-priced a BUY_LIMIT onto the live
+   Ask -- invalid by definition (a BUY LIMIT must rest BELOW the market) and
+   the dominant spam generator, because every retry re-sent the bad price up
+   to MaxRetries times per block. Limits are now re-quoted against the side
+   they may legally rest on (BUY_LIMIT -> Bid, SELL_LIMIT -> Ask, via
+   SnapToTick); only true market orders re-price to the executable side.
+
+5. DUPLICATE-SHIELD UNITS. IsOrderAlreadyLiveAtPrice() measured its tolerance
+   in POINTS. A tick can be coarser than a point (3-digit metals: tick 0.01
+   vs point 0.001), so a tick-snapped entry could slide outside a point-based
+   band and either place a duplicate or trip a false DUPLICATE SHIELD. The
+   unit is now min(tick, point), tracking the grid the entry was snapped to.
+
+The one-shot log body is duplicated in both branches rather than extracted,
+and the boundary comparison strings are hoisted into invBuy/invSell locals so
+the literals the v5.28/v5.30 probes assert on exist in exactly one place.
+
+BUILD GATE (_tools/build_check.ps1)
+
+The gate mirrors the terminal's Include tree into the SAME staging root it
+stages OTTO into. Windows' filesystem is case-INsensitive, so a terminal
+folder named "OTTO" merges with our "Otto" and can silently OVERWRITE the
+freshly staged headers with older copies -- after which the gate compiles and
+reports on the WRONG code while still printing a green verdict.
+
+Reproduced 27-09-2026: terminal Include\OTTO held the v5.27 tree, and
+HashSet[string] name filtering is case-SENSITIVE, so "OTTO" slipped past the
+skip list. Staged COttoTradeManager.mqh came out 20669 bytes against the
+repo's 31641 and the compile failed with 7 "undeclared identifier" errors
+that did not exist in the source.
+
+Two fixes: the skip HashSet is constructed with
+[StringComparer]::OrdinalIgnoreCase, and a staging integrity guard
+hash-compares every staged OTTO module AND the entry point against the repo
+source, failing loudly (exit 2) with a FIX hint on any mismatch. The gate can
+no longer report green on code it did not stage. It now logs
+"legacy/OTTO entries excluded: 2".
+
+VERIFICATION
+
+build_check.ps1: 0 errors, 0 warnings, binary 179756 bytes, all 10 headers
+verified from the staging tree.
+Probe suites: 13/13 files pass. Counted checks total 426 across the 6 probes
+that print "N / N checks passed" and 185 "[PASS]" markers across the 7
+earliest probes that report per-line, i.e. 611 assertions green.
+  test_v531_smart_trim.py 76/76 (new) pins the single-source InpMaxRR across
+    all four sites, the > 0.0 fallback, the 0.90%/70.0 defaults, the full
+    WalkTrimLegs contract (symbol scope, magic scope, primary exclusion read
+    BEFORE the loop, downward iteration, geometry guards, dryRun-before-close,
+    count-only-if-closed), the TrimHeavyLosers escalation and no-op semantics
+    (latch raised only after a successful close; the nothing-closed path does
+    NOT latch), the latch lifecycle (ClearTrimLatch public with a real body;
+    otto.mq5 clears it outside the breach branch and before the daily-DD
+    block), CountTrimCandidates, the breach response shape, and the version
+    stamps and banners of all 10 files.
+  test_v530_price_guard.py 43/43 (new) pins the tick snap, boundary buffer,
+    one-shot gate, retry re-quote and duplicate-shield units.
+  test_v528_hotfix.py 74/74 (updated) tracks the v5.30 stopsLevel ->
+    priceBuffer rename in its guard and ordering anchors.
+  test_v52x_pyramid.py 91/91, test_v526_vector.py 83/83,
+    test_v527_exit_comment.py 59/59 unchanged.
+Mutation testing: _probe/_mutate_v531.py copies the tree to a temp root,
+applies ONE regression at a time and asserts the probe goes red -- 20/20
+mutations caught, 0 anchors skipped. The first run of this harness found a
+real gap: latching the "nothing closed" path was UNDETECTED, so the
+"the nothing-closed path does not raise the latch" check was added.
+normalize_eol: bareLF=0 bareCR=0 across all 10 files.
+repair_mojibake: 0 damaged characters, 0 runs.
+Version bumped 5.29 -> 5.31 in all 10 files plus the README base line, the
+startup banner in otto.mq5 and the [9] input-group banner. Historical FIX
+(v5.2x) annotations are preserved and excluded from the bump pattern.
+
+NOTE: #property link still names the OTTO-v5.27 GitHub repo -- that string is
+the repository name, not the release, so it is excluded from the bump.
+

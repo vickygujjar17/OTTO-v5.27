@@ -348,9 +348,9 @@ if sweep is not None:
 check("no CancelQuorumOpposingOrders exists (never did)", "CancelQuorum" not in OM_T)
 
 check("PlaceLimitOrder validates BUY_LIMIT against bid",
-      re.search(r"entryPrice\s*>=\s*\(liveBid\s*-\s*stopsLevel\)", OM_T) is not None)
+      re.search(r"entryPrice\s*>=\s*\(liveBid\s*-\s*priceBuffer\)", OM_T) is not None)
 check("PlaceLimitOrder validates SELL_LIMIT against ask",
-      re.search(r"entryPrice\s*<=\s*\(liveAsk\s*\+\s*stopsLevel\)", OM_T) is not None)
+      re.search(r"entryPrice\s*<=\s*\(liveAsk\s*\+\s*priceBuffer\)", OM_T) is not None)
 check("PlaceLimitOrder reads SYMBOL_TRADE_STOPS_LEVEL",
       "SYMBOL_TRADE_STOPS_LEVEL" in OM_T)
 check("PlaceLimitOrder reads live bid/ask",
@@ -358,8 +358,10 @@ check("PlaceLimitOrder reads live bid/ask",
       and re.search(r"double\s+liveBid\s*=\s*GetBid\(\)", OM_T) is not None)
 
 # The guard must precede the duplicate shield, so a refused price can never
-# set hasPlacedOrder and strand the block.
-pos_guard = OM_T.find("entryPrice >= (liveBid - stopsLevel)")
+# set hasPlacedOrder and strand the block. v5.30 renamed the boundary local
+# from `stopsLevel` (shadowed by the helpers of the same name) to the
+# cushioned `priceBuffer`, so this anchor tracks the new identifier.
+pos_guard = OM_T.find("entryPrice >= (liveBid - priceBuffer)")
 pos_shield = OM_T.find("IsOrderAlreadyLiveAtPrice(entryPrice, 5.0)")
 check("price guard precedes the duplicate shield", 0 < pos_guard < pos_shield,
       "guard=%d shield=%d" % (pos_guard, pos_shield))

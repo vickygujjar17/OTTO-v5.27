@@ -4,7 +4,7 @@
 //|              OTTO EA — Institutional risk manager                |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.29"
+#property version   "5.31"
 
 #ifndef __OTTO_RISK_MANAGER__
 #define __OTTO_RISK_MANAGER__

@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.29"
+#property version   "5.31"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -16,7 +16,7 @@
 //| COttoBlockManager class                                         |
 //| Owns the S/R block array and runs the complete v4.70 state      |
 //| machine: W1/W2 formation, Separation & Sizing vetoes, Stale      |
-//| (45D), Front-Run (1:3), Near-Miss (6D), Momentum & FVG vetoes,   |
+//| (45D), Front-Run (InpMaxRR), Near-Miss (6D), Momentum & FVG vetoes,|
 //| arming, break/flip — with robust memory management (blocks are   |
 //| released when vetoed, flipped, broken or expired).              |
 //+------------------------------------------------------------------+
@@ -355,7 +355,7 @@ private:
    //+------------------------------------------------------------------+
    //| BLOCK MANAGEMENT FUNNEL — the exact v4.70 state machine.        |
    //| Runs once per new bar (calc_on_every_tick=false mirror). Order  |
-   //| per Pine: deletion -> hasExited -> Stale(45) -> Front-Run(1:3)  |
+   //| per Pine: deletion -> hasExited -> Stale(45) -> Front-Run(InpMaxRR)|
    //| -> Near-Miss(6D) -> Arming -> Break/Flip -> Momentum/FVG.       |
    //+------------------------------------------------------------------+
    void                    ProcessBlocks(int marketDay)
@@ -401,14 +401,15 @@ private:
               }
            }
 
-         // --- FRONT-RUN VETO (1:3 target hit before entry) ---
+         // --- FRONT-RUN VETO (InpMaxRR target hit before entry) ---
          if(InpUseFrontRunVeto && b.hasExited && !b.isTriggered)
            {
             double calcEntry = (InpEntryStyle == ENTRY_MIDPOINT) ? b.midpoint
                               : ((b.type == BLOCK_SUPPORT) ? b.top : b.bottom);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
-            double target = (b.type == BLOCK_SUPPORT) ? calcEntry + 3 * calcSLDist
-                                                     : calcEntry - 3 * calcSLDist;
+            double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
+            double target = (b.type == BLOCK_SUPPORT) ? calcEntry + tpRR * calcSLDist
+                                                     : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
                target = b.localTP;   // use exact TP parameter once placed
 
@@ -536,7 +537,7 @@ private:
    //+------------------------------------------------------------------+
    //| INTRA-BAR TARGET CHECKS (called inside OnTick).                 |
    //| Mirrors the requirement that trailing stops & target checks run |
-   //| within OnTick. The Front-Run 1:3 target is re-checked against  |
+   //| within OnTick. The Front-Run InpMaxRR target is re-checked      |
    //| the live forming bar so a hit is caught immediately.           |
    //+------------------------------------------------------------------+
    void                    UpdateIntraBar(int marketDay)
@@ -557,8 +558,9 @@ private:
             double calcEntry = (InpEntryStyle == ENTRY_MIDPOINT) ? b.midpoint
                               : ((b.type == BLOCK_SUPPORT) ? b.top : b.bottom);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
-            double target = (b.type == BLOCK_SUPPORT) ? calcEntry + 3 * calcSLDist
-                                                     : calcEntry - 3 * calcSLDist;
+            double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
+            double target = (b.type == BLOCK_SUPPORT) ? calcEntry + tpRR * calcSLDist
+                                                     : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
                target = b.localTP;
 

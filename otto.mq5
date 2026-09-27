@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                       OttoEA.mq5 |
 //|                    OTTO — Goat Funded Trader (GFT) Master Build    |
-//|                    Pine Script Master Build Port (v5.29)            |
+//|                    Pine Script Master Build Port (v5.31)            |
 //|                                    Institutional / Real-Money    |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.29"
+#property version   "5.31"
 #property description "OTTO EA â€” Goat Funded Trader (GFT) Master Build"
 #property description "Separation | Sizing | Front-Run | Near-Miss | Stale vetoes"
 #property description "Modules: News Shield | Risk | Block Manager | Order Mgmt | Trail"
@@ -169,7 +169,7 @@ int OnInit(void)
    g_symbol = _Symbol;
 
    Print("==============================================================");
-   Print("  OTTO EA v5.29 — 28-Pair Institutional Master Build — INITIALIZING");
+   Print("  OTTO EA v5.31 — 28-Pair Institutional Master Build — INITIALIZING");
    Print("  Symbol: ", g_symbol, " | Magic: ", MagicNumber);
    Print("==============================================================");
 
@@ -711,17 +711,35 @@ void OnTick(void)
                             ? 100.0 * (balance - equity) / balance
                             : 0.0;
 
-      // 1% Max Floating Loss Rule (highest priority: protects open risk)
+      // v5.31: SMART TRIM before the full teardown. Closing only the
+      // non-primary tranches that are already >= 70% of the way to their own
+      // stop removes the legs that are nearest to hitting it anyway, without
+      // dumping the whole basket at the worst possible price. The primary is
+      // deliberately spared: it carries the basket's risk geometry and is the
+      // leg the trail manager is tracking.
+      // TrimHeavyLosers() returns true only when it could NOT act (no
+      // non-primary leg was past the threshold), in which case the full sweep
+      // below still runs and the 0.90% cap keeps being enforced every tick.
+      // When a tranche is trimmed the primary is deliberately left running
+      // under its own stop, so no full close follows -- closing everything
+      // anyway would make the trim pointless.
       if(floatingLoss >= SafetyMaxFloatingLoss)
         {
          g_orderManager.CancelAllPendingOrders();
          // Close the WHOLE basket: hedging-mode pyramid tranches are separate
          // positions and must not survive the breach.
          if(g_orderManager.HasActiveTrade() || g_orderManager.CountOpenPositions() > 0)
-            g_orderManager.CloseEntireBasket("1% Max Floating Loss Breach");
+           {
+            bool needFullClose = true;
+            if(InpTrimLoserStopPct > 0.0 && InpTrimLoserStopPct < 100.0)
+               needFullClose = g_tradeManager.TrimHeavyLosers(InpTrimLoserStopPct);
+
+            if(needFullClose)
+               g_orderManager.CloseEntireBasket("1% Max Floating Loss Breach");
+           }
 
          Print("==============================================================");
-         Print("  [Safety] 1% MAX FLOATING LOSS LIMIT REACHED — BASKET CLOSED");
+         Print("  [Safety] MAX FLOATING LOSS REACHED — SMART TRIM APPLIED");
          Print("  Balance: ", DoubleToString(balance, 2),
                " | Equity: ", DoubleToString(equity, 2),
                " | Floating Loss: ", DoubleToString(floatingLoss, 2), "% >= ",
@@ -732,8 +750,21 @@ void OnTick(void)
          // through) prevents the same tick from immediately re-placing the
          // orders just cancelled; by the next tick equity ~= balance once the
          // basket is flat, so floatingLoss reads 0 and normal work continues.
+         // v5.31 NOTE: a partial trim leaves a live position and therefore a
+         // non-zero float, so this branch CAN legitimately re-enter on a later
+         // tick. TrimHeavyLosers() is latched one-shot per breach, so the
+         // re-entry neither re-trims nor re-logs; it returns false and the
+         // trimmed basket keeps running under its own stop. The latch clears
+         // as soon as the float is back under the cap (ClearTrimLatch below),
+         // which re-arms the trim for the NEXT excursion.
          return;
         }
+
+      // v5.31: float is back under the cap (or nothing was open at all), so
+      // release the smart-trim one-shot latch. Without this the latch would
+      // outlive its breach and the first breach of a LATER basket would skip
+      // its trim. Mirrors the v5.30 priceAbortLogged reset on the clear path.
+      g_tradeManager.ClearTrimLatch();
 
       // 3% Max Daily Drawdown (soft breach: pause new orders only)
       if(dailyDD >= SafetyDailyDDLimit)
