@@ -210,6 +210,13 @@ check("SyncTradeState still classifies STEP_BREAKEVEN off InpBreakEvenRR",
 check("SyncTradeState still classifies STEP_HALF_RISK off InpCutRiskRR",
       re.search(r"rr\s*>=\s*InpCutRiskRR\)\s*step\s*=\s*STEP_HALF_RISK", TM_T) is not None)
 
+# v5.32: the reported step is gated on the SAME liveness flag as the rung that
+# applies it, so the state machine can never advertise a stop the ladder never
+# pushes. Without this the two gates could drift apart silently.
+check("SyncTradeState reports STEP_HALF_RISK only while the rung is live",
+      re.search(r"else\s+if\s*\(\s*m_cutRiskRungLive\s*&&\s*rr\s*>=\s*InpCutRiskRR\s*\)"
+                r"\s*step\s*=\s*STEP_HALF_RISK", TM_T) is not None)
+
 # ----------------------------------------------------------------------
 # 7. CalcBasketFriction still accounts for commission + swap + half-spread
 # ----------------------------------------------------------------------

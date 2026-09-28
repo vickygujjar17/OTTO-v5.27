@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.31"
+#property version   "5.32"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -172,6 +172,71 @@ private:
 
    double                  GetAsk(void) { return SymbolInfoDouble(m_symbol, SYMBOL_ASK); }
    double                  GetBid(void) { return SymbolInfoDouble(m_symbol, SYMBOL_BID); }
+
+   //+------------------------------------------------------------------+
+   //| v5.32 -- BASKET 1R PERSISTENCE ACROSS A RESTART                  |
+   //|                                                                  |
+   //| m_basketRRUnit is the divisor for EVERY RR decision the Trade    |
+   //| Manager makes, and it is NOT recoverable from the broker. By the |
+   //| time a restart re-adopts the position the stop may already have  |
+   //| been ratcheted (breakeven alone collapses it to a fraction of a  |
+   //| pip), so |entry - POSITION_SL| understates the true 1R.          |
+   //|                                                                  |
+   //| The consequence is not cosmetic. An understated 1R INFLATES the  |
+   //| live RR, which is precisely the input the +1.0R tranche-2 gate   |
+   //| tests; a grossly inflated RR can jump the rung in a single tick  |
+   //| and the crossing is never observed. Persisting 1R removes that   |
+   //| whole failure class on the restart path.                         |
+   //|                                                                  |
+   //| The stored value is keyed to the PRIMARY POSITION TICKET, which  |
+   //| MT5 keeps stable across restarts. That pairing is what makes the |
+   //| restore safe: a leftover value from some earlier, already-closed  |
+   //| basket can never be applied to a different position, because the  |
+   //| ticket will not match. A mismatch falls back to the broker-derived |
+   //| distance and says so loudly.                                     |
+   //+------------------------------------------------------------------+
+   string                  BasketGvName(const string key)
+     {
+      return "OTTO_" + key + "_" + m_symbol + "_" + IntegerToString(MagicNumber);
+     }
+
+   void                    PersistBasketR(double r, ulong primaryTicket)
+     {
+      if(r <= 0.0 || primaryTicket == 0) return;
+      if(!GlobalVariableSet(BasketGvName("BASKETR"), r) ||
+         !GlobalVariableSet(BasketGvName("BASKETT"), (double)primaryTicket))
+         Print("[OrderManager] WARNING: could not persist basket 1R for ticket ",
+               primaryTicket, " | err=", GetLastError());
+     }
+
+   //| Returns the stored 1R, but ONLY when the stored ticket names the  |
+   //| position being adopted. 0.0 means "no usable record".            |
+   double                  RestoreBasketR(ulong adoptedTicket)
+     {
+      string name = BasketGvName("BASKETR");
+      if(!GlobalVariableCheck(name)) return 0.0;
+      string tName = BasketGvName("BASKETT");
+      if(!GlobalVariableCheck(tName)) return 0.0;
+      ulong storedTicket = (ulong)GlobalVariableGet(tName);
+      if(storedTicket != adoptedTicket)
+        {
+         if(EnableLogging)
+            Print("[OrderManager] Stored basket 1R belongs to ticket ", storedTicket,
+                  ", not ", adoptedTicket, " -> discarded (stale record)");
+         return 0.0;
+        }
+      double r = GlobalVariableGet(name);
+      return (r > 0.0) ? r : 0.0;
+     }
+
+   void                    ClearBasketR(void)
+     {
+      string name  = BasketGvName("BASKETR");
+      string tName = BasketGvName("BASKETT");
+      if(GlobalVariableCheck(name))  GlobalVariableDel(name);
+      if(GlobalVariableCheck(tName)) GlobalVariableDel(tName);
+     }
+
 
    double                  GetCurrentSpread(void)
      {
@@ -1148,7 +1213,63 @@ private:
       m_activeTrade.entryPrice   = PositionGetDouble(POSITION_PRICE_OPEN);
       m_activeTrade.initialSL    = PositionGetDouble(POSITION_SL);
       m_activeTrade.initialSLDistance = MathAbs(m_activeTrade.entryPrice - m_activeTrade.initialSL);
-      m_activeTrade.rrUnit       = m_activeTrade.initialSLDistance;
+      //+----------------------------------------------------------------+
+      //| v5.32 -- RECONSTRUCT THE ORIGINAL 1R, DO NOT TAKE THE LIVE ONE. |
+      //|                                                                |
+      //| This path runs on a COLD START (and on flat adoption), i.e.     |
+      //| after the EA has lost every in-memory field. Deriving rrUnit    |
+      //| from POSITION_SL is only correct while the untouched initial    |
+      //| stop is still in place -- and the whole point of this EA is that |
+      //| the stop ratchets. Once breakeven has fired,                  |
+      //|                                                                |
+      //|     |entry - POSITION_SL|  ~=  friction                       |
+      //|                                                                |
+      //| a few pips, where the true 1R may be hundreds. Dividing by that |
+      //| inflates every subsequent RR by orders of magnitude: a position |
+      //| 5 pips into profit is reported as hundreds of R, which both       |
+      //| mis-reports the trade and makes the +1.0R tranche-2 gate         |
+      //| unsatisfiable in a single tick -- it is jumped, not crossed.     |
+      //|                                                                |
+      //| Preference order:                                              |
+      //|   1. the persisted 1R, but ONLY if it names THIS position       |
+      //|   2. |entry - initial SL| (exact on a genuinely cold restart     |
+      //|      where the stop has not moved)                              |
+      //| and whichever is used is stated in the log, because a silently  |
+      //| degraded R unit is exactly how this bug stayed hidden.          |
+      //+----------------------------------------------------------------+
+      double restoredR = RestoreBasketR(positionTicket);
+      if(restoredR > 0.0)
+        {
+         m_activeTrade.rrUnit = restoredR;
+         if(EnableLogging)
+            Print("[OrderManager] Basket 1R RESTORED from persistent store: ",
+                  DoubleToString(restoredR, _Digits), " (broker SL distance was ",
+                  DoubleToString(m_activeTrade.initialSLDistance, _Digits), ")");
+        }
+      else if(m_activeTrade.initialSLDistance > 0.0)
+        {
+         m_activeTrade.rrUnit = m_activeTrade.initialSLDistance;
+         if(EnableLogging)
+            Print("[OrderManager] Basket 1R REBUILT from broker SL distance: ",
+                  DoubleToString(m_activeTrade.initialSLDistance, _Digits),
+                  " -- no stored record for ticket ", positionTicket,
+                  (MathAbs(m_activeTrade.entryPrice - m_activeTrade.initialSL)
+                   < 2.0 * SymbolInfoDouble(m_symbol, SYMBOL_POINT)
+                   ? " | WARNING: stop sits AT ENTRY, so this 1R is friction-sized"
+                     " and the derived RR will be badly overstated"
+                   : ""));
+        }
+      else
+        {
+         // A zero stop makes every RR in this class zero, which silently
+         // disables the entire milestone ladder. Say so rather than proceeding.
+         m_activeTrade.rrUnit = 0.0;
+         if(EnableLogging)
+            Print("[OrderManager] WARNING: basket 1R UNRESOLVED for ticket ",
+                  positionTicket, " (entry=", DoubleToString(m_activeTrade.entryPrice,_Digits),
+                  " sl=", DoubleToString(m_activeTrade.initialSL,_Digits),
+                  ") -- RR-based milestones will stay inert until the stop is set");
+        }
       m_activeTrade.currentTrailSL = m_activeTrade.initialSL;
       m_activeTrade.lotSize      = PositionGetDouble(POSITION_VOLUME);
       m_activeTrade.openTime     = (datetime)PositionGetInteger(POSITION_TIME);
@@ -1842,6 +1963,9 @@ public:
       m_nextTranche    = 2;
       m_basketOpenTime = TimeCurrent();
       m_sessionSL      = initSL;   // unified ratchet starts at the initial SL
+      // v5.32: remember 1R against the PRIMARY ticket so a restart can rebuild
+      // the basket geometry exactly instead of inferring it from a moved stop.
+      PersistBasketR(rrUnit, ticket);
         // Reuse place-time session ID if already set on the journal (ONE file per setup)
         if(m_journal != NULL && m_journal.GetSessionID() != "")
            m_sessionID = m_journal.GetSessionID();
@@ -1876,8 +2000,28 @@ public:
    // assignment can never be captured by a rename of this parameter.
    bool              AddPyramidTranche(int trancheToAdd, double slOverride = 0.0)
      {
-      if(!InpPyramidEnable || m_basketCount == 0) return false;
-      if(trancheToAdd != m_nextTranche) return false;
+      if(!InpPyramidEnable || m_basketCount == 0)
+        {
+         // v5.32: was a bare 'false'. Silent refusals made "T2 never triggers"
+         // unattributable: the caller could not tell a disabled feature from a
+         // missing basket.
+         if(EnableLogging)
+            Print("[Pyramid] Tranche ", trancheToAdd, " REFUSED: ",
+                  !InpPyramidEnable ? "InpPyramidEnable=false" : "basket empty (m_basketCount=0)",
+                  " | nextTranche=", m_nextTranche, " | err=", GetLastError());
+         return false;
+        }
+      if(trancheToAdd != m_nextTranche)
+        {
+         // v5.32: the ladder cursor is the second-most-likely reason a rung
+         // never fires (a parked/skipped rung leaves the cursor elsewhere), so
+         // an out-of-order request is now loud instead of invisible.
+         if(EnableLogging)
+            Print("[Pyramid] Tranche ", trancheToAdd, " REFUSED: out of order | ",
+                  "nextTranche=", m_nextTranche, " (expected ", trancheToAdd,
+                  ") | basketCount=", m_basketCount, " | err=", GetLastError());
+         return false;
+        }
 
       // v5.29: exact descending risk tiers, one per rung:
       //   T2 = InpRiskT2Pct, T3 = InpRiskT3Pct, T4 = InpRiskT4Pct
@@ -1888,22 +2032,74 @@ public:
       if(trancheToAdd == 2)      riskPct = InpRiskT2Pct;
       else if(trancheToAdd == 3) riskPct = InpRiskT3Pct;
       else if(trancheToAdd == 4) riskPct = InpRiskT4Pct;
-      else                       return false;
+      else
+        {
+         if(EnableLogging)
+            Print("[Pyramid] Tranche ", trancheToAdd,
+                  " REFUSED: unknown rung (ladder is 2/3/4) | err=", GetLastError());
+         return false;
+        }
+      // v5.32: FALLBACK CHAIN. m_basketRRUnit is the basket's true 1R and is
+      // correct on the normal path, but a cold restart can leave it zeroed (see
+      // the original-R reconstruction in SeedActiveTradeFromPosition). Rather
+      // than refuse the scale-in, recover 1R from the active-trade struct and
+      // finally from the live stop distance, logging which source was used so a
+      // degraded R unit is never silent.
       double slDist = m_basketRRUnit;
-      if(slDist <= 0.0) return false;
+      string rSource = "basket";
+      if(slDist <= 0.0 && m_hasActiveTrade && m_activeTrade.rrUnit > 0.0)
+        {
+         slDist = m_activeTrade.rrUnit;
+         rSource = "activeTrade";
+        }
+      if(slDist <= 0.0 && m_hasActiveTrade
+         && m_activeTrade.entryPrice > 0.0 && m_activeTrade.initialSL > 0.0)
+        {
+         slDist = MathAbs(m_activeTrade.entryPrice - m_activeTrade.initialSL);
+         rSource = "initialSLDistance";
+        }
+      if(slDist <= 0.0)
+        {
+         // v5.32: previously an unexplained 'false'. Print every candidate so a
+         // zero R unit can be traced to the field that lost it.
+         if(EnableLogging)
+            Print("[Pyramid] Tranche ", trancheToAdd, " REFUSED: no usable R unit | ",
+                  "m_basketRRUnit=", DoubleToString(m_basketRRUnit,_Digits),
+                  " hasActiveTrade=", (m_hasActiveTrade?"true":"false"),
+                  " activeRRUnit=", DoubleToString(m_hasActiveTrade?m_activeTrade.rrUnit:0.0,_Digits),
+                  " | err=", GetLastError());
+         return false;
+        }
+      if(rSource != "basket" && EnableLogging)
+         Print("[Pyramid] Tranche ", trancheToAdd, " R unit RECOVERED from ", rSource,
+               ": ", DoubleToString(slDist,_Digits), " (m_basketRRUnit was ",
+               DoubleToString(m_basketRRUnit,_Digits), ")");
 
       double lot = m_riskManager.RiskPctLotSize(riskPct, slDist);
       if(lot <= 0.0)   // below broker minimum lot -> skip this tranche
         {
          if(EnableLogging)
-            Print("[Pyramid] Tranche ", trancheToAdd, " skipped: risk lot below min.");
+            Print("[Pyramid] Tranche ", trancheToAdd, " skipped: risk lot below min.",
+                  " risk%=", DoubleToString(riskPct,2),
+                  " slDist=", DoubleToString(slDist,_Digits));
 
          // Advance the tranche counter so we don't spam this every tick
          // v5.29: ladder advance 2 -> 3 -> 4 -> 0 (0 = ladder exhausted).
          m_nextTranche = (trancheToAdd == 2) ? 3 : ((trancheToAdd == 3) ? 4 : 0);
          return false;
         }
-      if(!m_riskManager.HasSufficientMargin(lot)) return false;
+      if(!m_riskManager.HasSufficientMargin(lot))
+        {
+         // v5.32: was a bare 'false'. NOTE the deliberate asymmetry with the
+         // lot-too-small branch above: the cursor is NOT advanced here, because
+         // insufficient margin is transient -- the next tick may be fundable,
+         // whereas a sub-minimum lot never will be.
+         if(EnableLogging)
+            Print("[Pyramid] Tranche ", trancheToAdd, " REFUSED: insufficient margin for lot ",
+                  DoubleToString(lot,2), " | nextTranche stays ", m_nextTranche,
+                  " (retried next tick) | err=", GetLastError());
+         return false;
+        }
       bool isLong = (m_basketDir == DIR_LONG);
       double entryPrice = isLong ? GetAsk() : GetBid();
 
@@ -1956,6 +2152,16 @@ public:
             }
          return true;
         }
+      // v5.32: the ONLY remaining exit, and previously a bare 'false'. A
+      // rejected market order is the failure mode the field could never see:
+      // the rung was reached, the lot was fundable, and the broker said no.
+      // Report the retcode alongside GetLastError() so the reason survives.
+      if(EnableLogging)
+         Print("[Pyramid] Tranche ", trancheToAdd, " REJECTED by broker | lot=",
+               DoubleToString(lot,2), " risk%=", DoubleToString(riskPct,2),
+               " R=", DoubleToString(slDist,_Digits),
+               " retcode=", res.retcode, " (", res.comment, ")",
+               " | nextTranche=", m_nextTranche, " (retried next tick)");
       return false;
      }
 
@@ -2032,6 +2238,11 @@ public:
    int               GetBasketCount(void) const { return m_basketCount; }
    double            GetPrimaryEntry(void) const { return m_primaryEntry; }
    double            GetBasketRRUnit(void) const { return m_basketRRUnit; }
+   // v5.32: exposes the ladder cursor so the Trade Manager's T2 crossing trace
+   // can report WHY a rung was refused. IsPyramidPending() answers "may this
+   // rung fire?" but collapses every cause into one bool; the trace needs the
+   // raw cursor to distinguish "not yet at 2" from "already advanced past 2".
+   int               GetNextTranche(void) const { return m_nextTranche; }
    ENUM_TRADE_DIRECTION GetBasketDir(void) const { return m_basketDir; }
    bool              GetBasketTicket(int index, SPyramidTranche &out) const
      {
@@ -2055,6 +2266,11 @@ public:
       m_nextTranche = 2;
       m_hasActiveTrade = false;
       m_activeDirection = DIR_NONE;
+      // v5.32: the basket is over, so its persisted 1R is dead weight. Dropping
+      // it here means the next cold start finds no record rather than a stale
+      // one -- the ticket check in RestoreBasketR() is the second line of
+      // defence, this is the first.
+      ClearBasketR();
      }
 
    //+------------------------------------------------------------------+

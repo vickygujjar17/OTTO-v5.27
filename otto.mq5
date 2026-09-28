@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                       OttoEA.mq5 |
 //|                    OTTO — Goat Funded Trader (GFT) Master Build    |
-//|                    Pine Script Master Build Port (v5.31)            |
+//|                    Pine Script Master Build Port (v5.32)            |
 //|                                    Institutional / Real-Money    |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.31"
+#property version   "5.32"
 #property description "OTTO EA â€” Goat Funded Trader (GFT) Master Build"
 #property description "Separation | Sizing | Front-Run | Near-Miss | Stale vetoes"
 #property description "Modules: News Shield | Risk | Block Manager | Order Mgmt | Trail"
@@ -169,7 +169,7 @@ int OnInit(void)
    g_symbol = _Symbol;
 
    Print("==============================================================");
-   Print("  OTTO EA v5.31 — 28-Pair Institutional Master Build — INITIALIZING");
+   Print("  OTTO EA v5.32 — 28-Pair Institutional Master Build — INITIALIZING");
    Print("  Symbol: ", g_symbol, " | Magic: ", MagicNumber);
    Print("==============================================================");
 
@@ -275,6 +275,19 @@ int OnInit(void)
       return INIT_FAILED;
      }
    Print("[INIT] Trade Manager OK");
+
+   // v5.32 — belt-and-braces rung-liveness warning.
+   // The Trade Manager's Initialize() already logs whether the half-risk rung
+   // is LIVE or INERT, but that line is gated on EnableLogging. An operator
+   // running with logging OFF would otherwise never learn that InpCutRiskRR is
+   // configured in a way that makes the -0.5R floor unreachable, so this one is
+   // deliberately unconditional: a misconfigured rung is worth one line of
+   // terminal output even in silent mode.
+   if(InpCutRiskRR >= InpBreakEvenRR)
+      Print("[INIT] NOTE: InpCutRiskRR (", DoubleToString(InpCutRiskRR,2),
+            ") is not below InpBreakEvenRR (", DoubleToString(InpBreakEvenRR,2),
+            ") -> the -0.5R half-risk rung is UNREACHABLE and will never be",
+            " applied or journalled. Set InpCutRiskRR below InpBreakEvenRR to arm it.");
 
    // --- Prop firm safety state: PERSISTENT MEMORY (v5.25) ---
    // FIX (v5.25): these baselines are loaded from MT5 GlobalVariables and only
