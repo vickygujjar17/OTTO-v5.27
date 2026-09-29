@@ -4,9 +4,16 @@ A probe that cannot fail is worthless. This copies the OTTO tree to a temp
 dir, applies one targeted regression at a time, runs the v5.31 probe against
 the mutated copy, and asserts the probe goes red. Any mutation that still
 passes means the corresponding check is decorative.
+
+The three release/banner rows are NOT hand-stamped to a version: the current
+stamp is read out of OttoDefines.mqh at startup and the rows are built from it.
+A hardcoded "5.31" becomes a dead anchor the moment the tree moves on (the row
+is then SKIPped, and a skipped anchor fails the run), so resolving it here keeps
+this harness catching a left-behind version on ANY release.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +25,41 @@ FILES = ["otto.mq5", "COttoOrderManager.mqh", "COttoTradeManager.mqh",
          "COttoRiskManager.mqh", "COttoBlockManager.mqh", "COttoJournal.mqh",
          "COttoNewsFilter.mqh", "COttoCorrelationFilter.mqh",
          "COttoMarketStructure.mqh", "OttoDefines.mqh"]
+
+# ---------------------------------------------------------------------------
+# Release resolution -- keeps the version rows from rotting into dead anchors.
+# ---------------------------------------------------------------------------
+_VERSION_RE = re.compile(r'#property version\s+"(\d+)\.(\d+)"')
+
+
+def resolve_release():
+    """Return (release, previous) stamps from the live tree, or None."""
+    try:
+        with open(os.path.join(REAL, "OttoDefines.mqh"),
+                  encoding="utf-8", newline="") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    stamps = set(_VERSION_RE.findall(text))
+    if len(stamps) != 1:
+        return None
+    major, minor = sorted(stamps)[0]
+    return ("%s.%s" % (major, minor), "%s.%d" % (major, int(minor) - 1))
+
+
+RESOLVED = resolve_release()
+RELEASE, PREV = RESOLVED if RESOLVED else (None, None)
+VERSION_MUTATIONS = [] if not RESOLVED else [
+    ("version stamp left behind", "OttoDefines.mqh",
+     '#property version   "%s"' % RELEASE,
+     '#property version   "%s"' % PREV),
+    ("startup banner left behind", "otto.mq5",
+     "OTTO EA v%s \u2014 28-Pair" % RELEASE,
+     "OTTO EA v%s \u2014 28-Pair" % PREV),
+    ("Pine port banner left behind", "otto.mq5",
+     "Master Build Port (v%s)" % RELEASE,
+     "Master Build Port (v%s)" % PREV),
+]
 
 MUTATIONS = [
     ("ascending trim loop (index-shift bug)", "COttoTradeManager.mqh",
@@ -70,11 +112,7 @@ MUTATIONS = [
      "return;\r\n        }\r\n\r\n      // v5.31: float is back under the cap",
      "g_tradeManager.ClearTrimLatch();\r\n         return;\r\n        }\r\n\r\n"
      "      // v5.31: float is back under the cap"),
-    ("version stamp left behind", "OttoDefines.mqh",
-     '#property version   "5.31"', '#property version   "5.30"'),
-    ("startup banner left behind", "otto.mq5",
-     "OTTO EA v5.31 \u2014 28-Pair", "OTTO EA v5.30 \u2014 28-Pair"),
-]
+] + VERSION_MUTATIONS
 
 
 def run_probe(root):
@@ -91,6 +129,12 @@ def main():
     if not os.path.isdir(REAL):
         print("ABORT: tree not found: %s" % REAL)
         return 1
+
+    if RESOLVED is None:
+        print("ABORT: could not resolve a single '#property version' stamp "
+              "from %s" % os.path.join(REAL, "OttoDefines.mqh"))
+        return 1
+    print("  resolved release: v%s (previous v%s)" % (RELEASE, PREV))
 
     rc, out = run_probe(REAL)
     if rc != 0:
