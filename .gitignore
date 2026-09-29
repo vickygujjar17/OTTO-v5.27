@@ -12,6 +12,9 @@ _tools/_pristine_*/
 _tools/commit_msg.txt
 _tools/commit_msg_*.txt
 
+# --- local pre-deploy snapshots of the live terminal tree ---------------
+_backup_otto/
+
 # --- OS / editor cruft ---------------------------------------------------
 Thumbs.db
 desktop.ini
