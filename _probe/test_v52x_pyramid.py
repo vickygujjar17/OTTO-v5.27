@@ -18,6 +18,16 @@ Pins the behaviour that the MQL5 compiler gate CANNOT exercise:
   6. The lot-sizing floor is epsilon-safe, so a raw lot that is mathematically
      an exact multiple of the volume step is not silently dropped one step.
   7. The ladder total sits inside the SafetyMaxRiskPct budget.
+  8. The v5.31 STRICT stop-loss milestone floors, measured from primaryEntry:
+     +1.0R -> breakeven + broker friction, +2.0R -> exactly +1.0R and
+     +3.0R -> exactly +2.0R, evaluated in DESCENDING order behind a one-way
+     ratchet and pushed to the WHOLE basket by ApplyUnifiedSL(). The legacy
+     Pine "cut risk in half" rung (InpCutRiskRR) still ships unchanged, and
+     this probe PINS its arithmetic: one 0.5*rrUnit site per direction and a
+     LOSS-SIDE floor the profit-side milestones dominate from +1.0R onward.
+     v5.32 HOISTED that rung to the END of its branch (it used to run first)
+     and made it count only while live; neither changes which floor survives,
+     which is what section 9's replay model below asserts.
 
 Pure static analysis of the shipped sources plus an independent Python model of
 the ladder/floor arithmetic - no MT5 runtime required.
@@ -120,8 +130,23 @@ check("code selects T3 risk from InpRiskT3Pct",
       re.search(r"trancheToAdd\s*==\s*3\s*\)\s*riskPct\s*=\s*InpRiskT3Pct", OM_T) is not None)
 check("code selects T4 risk from InpRiskT4Pct",
       re.search(r"trancheToAdd\s*==\s*4\s*\)\s*riskPct\s*=\s*InpRiskT4Pct", OM_T) is not None)
+
+# The unknown-rung refusal lives in the else-arm that CLOSES the risk chain, so
+# it is found by locating the last named rung (T4) and taking the else that
+# follows it. Asserting on the arm's body rather than on a global
+# `else\s+return\s+false\s*;` keeps this honest about INTENT: v5.32 gave that
+# arm a log line, which changes its formatting but not its behaviour, and a
+# probe that fails on the reformatting of correct code is a probe that trains
+# its reader to ignore it.
+_unknown_rung_arm = re.search(
+    r"trancheToAdd\s*==\s*4\s*\)\s*riskPct\s*=\s*InpRiskT4Pct\s*;"   # last named rung
+    r".*?else\s*\{(?P<body>[^}]*)\}",                                # ... and its else-arm
+    OM_T, re.S)
+
 check("code refuses an unrecognised tranche instead of falling through",
-      re.search(r"else\s+return\s+false\s*;", OM_T) is not None)
+      _unknown_rung_arm is not None and
+      re.search(r"return\s+false\s*;", _unknown_rung_arm.group("body")) is not None,
+      "else-arm of the risk chain must return false")
 
 check("risk_for(2) == T2", risk_for(2) == T2_RISK, risk_for(2))
 check("risk_for(3) == T3", risk_for(3) == T3_RISK, risk_for(3))
@@ -392,6 +417,279 @@ check("InpLockProfit2RR and InpLockProfit2TargetRR are both declared",
       num_input(DEFS_T, "InpLockProfit2TargetRR") == 1.0)
 
 
+# ----------------------------------------------------------------------
+# 9. STOP-LOSS MILESTONE LADDER (v5.31 floor arithmetic).
+#    Floors, all measured from primaryEntry:
+#      +1.0R -> primaryEntry +/- broker friction   (InpBreakEvenRR)
+#      +2.0R -> primaryEntry +/- 1.0R              (InpLockProfit2TargetRR)
+#      +3.0R -> primaryEntry +/- 2.0R              (InpLockProfitTargetRR)
+#    Evaluated in DESCENDING order (rung 3, rung 2, ATR trail) with every
+#    rung applied forward-only, then handed to ApplyUnifiedSL(), whose own
+#    one-way ratchet is the last line of defence.
+# ----------------------------------------------------------------------
+def _norm(s):
+    """Collapse all whitespace: makes source checks CRLF/indent proof."""
+    return re.sub(r"\s+", " ", s)
+
+
+TM_N = _norm(TM_T)
+OM_N = _norm(OM_T)
+
+L2_TRIG = num_input(DEFS_T, "InpLockProfit2RR")
+L2_TGT = num_input(DEFS_T, "InpLockProfit2TargetRR")
+L3_TRIG = num_input(DEFS_T, "InpLockProfitRR")
+L3_TGT = num_input(DEFS_T, "InpLockProfitTargetRR")
+BE_RR = num_input(DEFS_T, "InpBreakEvenRR")
+CUT_RR = num_input(DEFS_T, "InpCutRiskRR")
+TRAIL_RR = num_input(DEFS_T, "InpTrailStartRR")
+T2_RR = num_input(DEFS_T, "InpPyramidT2RR")
+
+# --- group A: an evenly-spaced 1R ladder ------------------------------
+check("milestone rung 2 locks exactly +1.0R", L2_TGT == 1.0, L2_TGT)
+check("milestone rung 3 locks exactly +2.0R", L3_TGT == 2.0, L3_TGT)
+check("milestone rung triggers are +2.0R and +3.0R",
+      L2_TRIG == 2.0 and L3_TRIG == 3.0, (L2_TRIG, L3_TRIG))
+check("each rung target sits strictly below its own trigger (descending ladder)",
+      None not in (L2_TGT, L3_TGT, L2_TRIG, L3_TRIG) and
+      0.0 < L2_TGT < L3_TGT and L2_TGT < L2_TRIG and L3_TGT < L3_TRIG,
+      (L2_TGT, L3_TGT, L2_TRIG, L3_TRIG))
+check("breakeven / T2 scale-in / trail all arm on the same +1.0R rung",
+      BE_RR == 1.0 and T2_RR == 1.0 and TRAIL_RR == 1.0,
+      (BE_RR, T2_RR, TRAIL_RR))
+
+# --- group B: the floor arithmetic exactly as shipped -----------------
+check("LONG rung 3 floor = primaryEntry + (InpLockProfitTargetRR * rrUnit)",
+      "primaryEntry + (InpLockProfitTargetRR * rrUnit)" in TM_N)
+check("LONG rung 2 floor = primaryEntry + (InpLockProfit2TargetRR * rrUnit)",
+      "primaryEntry + (InpLockProfit2TargetRR * rrUnit)" in TM_N)
+check("SHORT rungs mirror both floors with a minus sign",
+      "primaryEntry - (InpLockProfit2TargetRR * rrUnit)" in TM_N and
+      "primaryEntry - (InpLockProfitTargetRR * rrUnit)" in TM_N)
+check("breakeven floors are primaryEntry +/- the broker-friction offset",
+      "double beOffset = CalcBasketFriction(true); "
+      "double beSL = primaryEntry + beOffset;" in TM_N and
+      "double beOffset = CalcBasketFriction(false); "
+      "double beSL = primaryEntry - beOffset;" in TM_N)
+check("no milestone floor encodes its target as a literal fraction of 1R",
+      re.search(r"(beSL|lockedSL2?)\s*=[^;]*?(0\.5\s*\*|/\s*2\.0)", TM_N) is None)
+
+# --- group C: descending evaluation + forward-only ratchets ------------
+check("both step-lock rungs are guarded on their own trigger AND Both targets",
+      "InpLockProfitRR > 0.0 && InpLockProfitTargetRR > 0.0 && "
+      "currentRR >= InpLockProfitRR" in TM_N and
+      "InpLockProfit2RR > 0.0 && InpLockProfit2TargetRR > 0.0 && "
+      "currentRR >= InpLockProfit2RR" in TM_N)
+check("each in-branch rung only ever moves the stop TOWARD market",
+      "if(lockedSL > desiredSL) desiredSL = lockedSL;" in TM_N and
+      "if(lockedSL2 > desiredSL) desiredSL = lockedSL2;" in TM_N and
+      "if(lockedSL < desiredSL) desiredSL = lockedSL;" in TM_N and
+      "if(lockedSL2 < desiredSL) desiredSL = lockedSL2;" in TM_N)
+
+# --- branch-scoped ordering -------------------------------------------
+# The ladder is duplicated for LONG and SHORT and the two copies contain
+# IDENTICAL guard text, so a bare TM_N.index() comparison silently resolves
+# against the LONG copy whichever branch it was meant to describe. Split the
+# text at the SHORT marker so each ordering claim is made inside the branch it
+# is actually about; otherwise the SHORT mirror could be reordered (or its
+# half-risk rung un-hoisted) with every "both directions" assertion still
+# green. The reorder mutants in _mutate_ms_milestones.py cover exactly this.
+_short_at = TM_N.index("else // SHORT")
+LONG_N = TM_N[:_short_at]
+SHORT_N = TM_N[_short_at:]
+
+
+def _ordered(blk, pairs):
+    """True only if every (a, b) pair appears in blk with a before b.
+
+    Returns False rather than raising when an anchor is absent, so a
+    refactor that renames a guard reads as ONE failed check instead of
+    aborting the suite mid-run and hiding every check after it.
+    """
+    for a, b in pairs:
+        if a not in blk or b not in blk:
+            return False
+        if blk.index(a) >= blk.index(b):
+            return False
+    return True
+
+
+check("the milestone rungs run DESCENDING in BOTH directions (BE, then 3, then 2)",
+      _ordered(LONG_N, [
+          ("currentRR >= InpBreakEvenRR && desiredSL < primaryEntry",
+           "currentRR >= InpLockProfitRR"),
+          ("currentRR >= InpLockProfitRR", "currentRR >= InpLockProfit2RR"),
+      ]) and
+      _ordered(SHORT_N, [
+          ("currentRR >= InpBreakEvenRR && desiredSL > primaryEntry",
+           "currentRR >= InpLockProfitRR"),
+          ("currentRR >= InpLockProfitRR", "currentRR >= InpLockProfit2RR"),
+      ]))
+# The ATR trail is the last rung that may tighten the stop BEFORE the half-risk
+# floor, so it must still follow both step locks in each branch; otherwise a
+# later rung could overwrite its tighter stop. (halfRiskSL is excluded from the
+# no-half-RR-literal check above precisely because it is not a milestone.)
+check("the ATR trail is evaluated after both step locks in BOTH directions",
+      _ordered(LONG_N, [("currentRR >= InpLockProfit2RR",
+                         "double dynamicTrail = high0")]) and
+      _ordered(SHORT_N, [("currentRR >= InpLockProfit2RR",
+                          "double dynamicTrail = low0")]))
+# v5.32 HOIST: the half-risk rung now sits AFTER the ATR trail in each branch,
+# not before the milestone rungs. Its guard therefore tests the FINAL stop, so
+# m_halfRiskTriggers counts APPLICATIONS rather than mere assignments.
+#
+# This is the assertion that motivated the reorder mutants, so it is worth
+# stating why: moving the rung is a pure ORDERING change, and the two branch
+# copies are byte-identical, so a whole-file TM_N.index() comparison -- or even
+# a SHORT_N-scoped one over a block still containing the LONG copy -- keeps
+# answering from the LONG branch. Reorder only the SHORT mirror and a
+# branch-blind version of this check stays green. The "SHORT mirror reordered
+# alone" mutant in _mutate_ms_milestones.py exists solely to keep it honest.
+check("the half-risk rung is HOISTED after the ATR trail in BOTH directions",
+      _ordered(LONG_N, [
+          ("double dynamicTrail = high0",
+           "m_cutRiskRungLive && currentRR >= InpCutRiskRR"),
+      ]) and
+      _ordered(SHORT_N, [
+          ("double dynamicTrail = low0",
+           "m_cutRiskRungLive && currentRR >= InpCutRiskRR"),
+      ]))
+check("the ladder lives in the trade manager only (no second drifted copy)",
+      "InpLockProfit2TargetRR" not in OM_N and
+      "InpLockProfit2RR" not in OM_N)
+check("the trail gate that re-pushes the basket opens no later than the T2 add",
+      None not in (TRAIL_RR, T2_RR) and TRAIL_RR <= T2_RR,
+      (TRAIL_RR, T2_RR))
+
+
+# --- group D: the legacy half-risk rung stays contained ----------------
+check("the legacy half-risk rung is still declared (Pine half_risk_rr parity)",
+      CUT_RR is not None, CUT_RR)
+check("half-risk arithmetic appears exactly once per direction, into halfRiskSL only",
+      TM_N.count("0.5 * rrUnit") == 2 and
+      "halfRiskSL = primaryEntry - (0.5 * rrUnit);" in TM_N and
+      "halfRiskSL = primaryEntry + (0.5 * rrUnit);" in TM_N and
+      "InpLockProfit2TargetRR * rrUnit" in TM_N)
+
+
+def _ladder_sl(entry, rru, friction, rr, is_long):
+    """Replay the shipped rung order with the shipped forward-only guard.
+
+    Each rung is a signed offset measured from entry, positive meaning
+    "toward market". The half-risk rung is the only LOSS-SIDE floor
+    (LONG: entry - 0.5R, SHORT: entry + 0.5R); breakeven and both lock
+    rungs all sit on the profit side.
+
+    The order below is the SHIPPED order as of v5.32, which HOISTED the
+    half-risk rung from the front of the branch to the end of it (the ATR
+    trail sits after rung 2 in the source and is not modelled here, since
+    it needs live price data). The hoist is what makes the half-risk
+    counter mean "the -0.5R floor was APPLIED" rather than "this rung was
+    reached"; it cannot change which floor wins, because every rung
+    resolves with max() / min() and those are order-independent. The
+    assertions below therefore hold on either ordering -- this list is
+    kept in shipped order so a reader comparing it to the source is not
+    misled.
+    """
+    rungs = [(BE_RR, None), (L3_TRIG, L3_TGT), (L2_TRIG, L2_TGT), (CUT_RR, -0.5)]
+    sl = entry - rru if is_long else entry + rru   # poor seed: the raw initial stop
+    for trig, target in rungs:
+        if trig is None or rr < trig:
+            continue
+        cand = friction if target is None else target * rru
+        cand = entry + (cand if is_long else -cand)
+        sl = max(sl, cand) if is_long else min(sl, cand)
+    return sl
+
+
+ENTRY, RRU, FRICTION = 1.1000, 0.0020, 0.0001
+
+check("model +1.0R: the surviving floor is breakeven+friction, so the half-risk "
+      "rung never survives a milestone",
+      abs(_ladder_sl(ENTRY, RRU, FRICTION, 1.0, True) - (ENTRY + FRICTION)) < 1e-9 and
+      _ladder_sl(ENTRY, RRU, FRICTION, 1.0, True) > ENTRY - 0.5 * RRU)
+check("model LONG: +2.0R locks exactly +1.0R, +3.0R locks exactly +2.0R",
+      abs(_ladder_sl(ENTRY, RRU, FRICTION, 2.0, True) - (ENTRY + 1.0 * RRU)) < 1e-9 and
+      abs(_ladder_sl(ENTRY, RRU, FRICTION, 3.0, True) - (ENTRY + 2.0 * RRU)) < 1e-9)
+check("model SHORT mirrors both floors below entry",
+      abs(_ladder_sl(ENTRY, RRU, FRICTION, 2.0, False) - (ENTRY - 1.0 * RRU)) < 1e-9 and
+      abs(_ladder_sl(ENTRY, RRU, FRICTION, 3.0, False) - (ENTRY - 2.0 * RRU)) < 1e-9)
+check("model: a higher milestone can never move the floor backwards",
+      all(_ladder_sl(ENTRY, RRU, FRICTION, rr + 0.1, True) >=
+          _ladder_sl(ENTRY, RRU, FRICTION, rr, True) for rr in (0.5, 1.0, 2.0, 3.0)))
+
+
+# --- group E: the whole basket takes the raised floor -------------------
+check("ApplyUnifiedSL is called on every rung push (breakeven floors included)",
+      TM_N.count("m_orderManager.ApplyUnifiedSL(desiredSL);") >= 1 and
+      TM_N.count("m_orderManager.ApplyUnifiedSL(groupBE);") == 1 and
+      "m_orderManager.ApplyUnifiedSL(safeBE4);" in TM_N)
+check("ApplyUnifiedSL enforces the one-way ratchet for BOTH directions",
+      "if(isLong && newSL <= m_sessionSL) return;" in OM_N and
+      "if(!isLong && newSL >= m_sessionSL) return;" in OM_N)
+check("the T2/T3/T4 scale-in hands its protective floor to the market order",
+      "AddPyramidTranche(2, groupBE)" in TM_N and
+      "AddPyramidTranche(4, safeBE4)" in TM_N)
+check("session SL only advances once a stop is live at the broker",
+      "if(anyApplied) { m_sessionSL = newSL;" in OM_N)
+check("PM note: the ladder push is nested under the trail gate, so keep "
+      "InpTrailStartRR <= InpPyramidT2RR or the +1.0R floor goes dark",
+      None not in (TRAIL_RR, T2_RR) and TRAIL_RR <= T2_RR)
+
+
+# ----------------------------------------------------------------------
+# 10. v5.32 REFUSAL ATTRIBUTION + ORIGINAL-1R PERSISTENCE.
+#     This probe owns the ladder's semantics, so the two v5.32 changes that
+#     touch the ladder live here as well as in test_v532_pyramid.py: a rung
+#     that cannot fire must say so, and the 1R the ladder is measured against
+#     must survive a restart instead of being re-derived from a ratcheted stop.
+# ----------------------------------------------------------------------
+# Every refusal exit in the scale-in must be preceded by a Print(). A bare
+# 'return false' is what made "T2 never triggers" unattributable in the field.
+_pyr_start = OM_T.find("AddPyramidTranche")
+_pyr_end = OM_T.find("void              ApplyUnifiedSL", _pyr_start)
+PYR = OM_T[_pyr_start:_pyr_end] if _pyr_start >= 0 and _pyr_end > _pyr_start else ""
+
+check("the scale-in body was located for the attribution scan", len(PYR) > 2000,
+      len(PYR))
+
+_silent_exits = []
+for _m in re.finditer(r"return\s+false\s*;", PYR):
+    if "Print(" not in PYR[max(0, _m.start() - 600):_m.start()]:
+        _silent_exits.append(_m.start())
+check("no silent refusal survives in the scale-in path", not _silent_exits,
+      "offsets %s" % _silent_exits)
+
+check("the refusal log prefix is stable and greppable",
+      PYR.count("[Pyramid] Tranche ") >= 6 and
+      " REFUSED: " in PYR and " REJECTED by broker" in PYR)
+check("the basket-empty refusal names the pyramid flag and the count",
+      re.search(r"\" REFUSED: \",\s*\n\s*!InpPyramidEnable\s*\?", PYR) is not None or
+      "!InpPyramidEnable ? \"InpPyramidEnable=false\"" in PYR)
+check("the ladder recovers a missing R unit instead of refusing outright",
+      "R unit RECOVERED from" in PYR)
+
+# Persistence: the 1R the whole ladder is measured against must be restored from
+# a GlobalVariable keyed on symbol + magic + primary ticket, and must be
+# REFUSED when the stored ticket is not the position being adopted.
+check("the persistence helpers exist (persist / restore / clear)",
+      "PersistBasketR" in OM_T and "RestoreBasketR" in OM_T and
+      "ClearBasketR" in OM_T)
+check("the stored R is paired to the primary ticket and checked on restore",
+      re.search(r"if\(storedTicket\s*!=\s*adoptedTicket\)", OM_T) is not None)
+check("a mismatched record is discarded rather than trusted",
+      "discarded (stale record)" in OM_T)
+check("InitBasket persists the 1R it was handed",
+      re.search(r"PersistBasketR\(rrUnit\s*,\s*ticket\)", OM_T) is not None)
+check("adopting a position prefers the stored 1R over the broker distance",
+      OM_T.find("RestoreBasketR(positionTicket)") >= 0 and
+      OM_T.find("RestoreBasketR(positionTicket)") <
+      OM_T.find("m_activeTrade.rrUnit = m_activeTrade.initialSLDistance"))
+check("clearing the basket clears the stored 1R",
+      re.search(r"ClearBasketR\(\)", OM_T) is not None)
+
+
+
+
 def main():
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)
@@ -402,7 +700,7 @@ def main():
         mark = "PASS" if ok else "FAIL"
         line = "  [%s] %s" % (mark, name)
         if not ok and detail:
-            line += "  <%s>" % detail
+            line += "  <%s>" % (detail,)
         print(line)
     print("-" * 74)
     print("%d / %d checks passed" % (passed, total))

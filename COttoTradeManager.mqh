@@ -37,6 +37,57 @@ private:
    // the cap, so each sustained breach reports once instead of per tick.
    bool                 m_trimLogged;
 
+   //+------------------------------------------------------------------+
+   //| v5.32 — is the legacy "cut risk in half" rung LIVE?              |
+   //|                                                                   |
+   //| THE BUG THIS FIXES                                                |
+   //| The half-risk rung is a LOSS-SIDE floor: LONG = entry - 0.5R,      |
+   //| SHORT = entry + 0.5R. It was evaluated BEFORE the +1.0R cost-      |
+   //| covering breakeven and could only ever move the stop toward       |
+   //| market, so the two competed for the same value on the same tick.   |
+   //|                                                                   |
+   //| Under the shipped defaults InpCutRiskRR == InpBreakEvenRR == 1.0,  |
+   //| so both rungs fire on the SAME tick and breakeven always wins:     |
+   //| its stop sits at entry +/- friction, a fraction of a pip on the    |
+   //| PROFIT side, while half-risk sits 0.5R on the LOSS side. The       |
+   //| half-risk comparison is therefore provably false the instant it    |
+   //| is reached, its guard never assigns, and the rung is DEAD.        |
+   //|                                                                   |
+   //| The old code nonetheless incremented m_halfRiskTriggers inside     |
+   //| that guard's body only when it assigned -- but the shape of the    |
+   //| guard meant the "reached the trigger" half of the condition was    |
+   //| what the journal acted on, so every +1R winner was reported as     |
+   //| "SL -> HALF-RISK / risk now -0.5R" while the live stop sat at      |
+   //| breakeven. That is a live-money reporting lie: it tells the        |
+   //| operator to risk -0.5R on a trade that cannot lose.               |
+   //|                                                                   |
+   //| THE FIX (two independent halves):                                 |
+   //|  1. A rung whose target can never survive the higher rungs is      |
+   //|     INERT, and an inert rung must not count. m_cutRiskRungLive is  |
+   //|     resolved ONCE at Initialize() from inputs that cannot change   |
+   //|     mid-session, so the gate is a pure read in the hot path.       |
+   //|  2. The rung is HOISTED to the END of its direction's ladder, so   |
+   //|     the halfRiskSL local is computed only after every profit-side   |
+   //|     floor has been applied. Its comparison then tests the FINAL    |
+   //|     stop rather than an intermediate one, which makes the trigger  |
+   //|     counter mean exactly what the journal claims: "this floor was  |
+   //|     actually applied to the live stop".                            |
+   //|                                                                   |
+   //| Behaviour is otherwise identical: every rung still resolves with   |
+   //| max() for LONG / min() for SHORT, and max/min are order-           |
+   //| independent, so hoisting cannot change which floor wins. The       |
+   //| rung's TARGET (a literal fraction of 1R) is deliberately left as   |
+   //| the only such literal in the ladder -- see the v5.31 milestone     |
+   //| probe, which pins this rung's arithmetic to exactly one site per   |
+   //| direction.                                                         |
+   //+------------------------------------------------------------------+
+   bool                 m_cutRiskRungLive;
+
+   // v5.32 -- one-shot trace bookkeeping for the Tranche 2 crossing.
+   // Holds the 5%-wide RR bucket most recently reported so the crossing
+   // is logged once per approach instead of once per tick. -1 = unarmed.
+   int                  m_t2TraceBucket;
+
    double            GetCurrentATR(void)
      { return m_blockManager.GetATR(); }
 
@@ -191,12 +242,58 @@ public:
       m_symbol=""; m_riskManager=NULL; m_orderManager=NULL; m_blockManager=NULL;
       m_tradesManaged=0; m_halfRiskTriggers=0; m_breakevenTriggers=0; m_trailActivations=0; m_stopsHit=0;
       m_trimLogged=false;
+      // v5.32: pessimistic default. Initialize() resolves the real value from
+      // the inputs; until then every half-risk rung is treated as inert, which
+      // is the safe direction -- a rung that cannot assign must not count.
+      m_cutRiskRungLive=false;
+      m_t2TraceBucket=-1;
      }
    ~COttoTradeManager(void) { }
 
    bool            Initialize(string symbol, COttoRiskManager *rm, COttoOrderManager *om, COttoBlockManager *bm)
      {
       m_symbol=symbol; m_riskManager=rm; m_orderManager=om; m_blockManager=bm;
+
+      //+----------------------------------------------------------------+
+      //| v5.32 -- RESOLVE THE HALF-RISK RUNG'S LIVENESS, ONCE.          |
+      //|                                                                |
+      //| The rung is a LOSS-SIDE floor at entry -/+ 0.5R and every      |
+      //| profit-side rung OUTRANKS it: the +1.0R cost-covering          |
+      //| breakeven already sits a fraction of a pip on the PROFIT side, |
+      //| so once it has been applied the half-risk floor can never      |
+      //| assign again. The rung is therefore only reachable at all      |
+      //| while the stop is still worse than -0.5R, i.e. before          |
+      //| breakeven -- which requires InpCutRiskRR to trigger strictly   |
+      //| EARLIER than InpBreakEvenRR.                                   |
+      //|                                                                |
+      //| At the shipped defaults (both 1.0) the rung is inert, and an   |
+      //| inert rung must neither move the stop NOR increment the        |
+      //| counter the journal reports from. Previously it did the        |
+      //| latter, which is how every +1R winner came to be journalled as |
+      //| "risk now -0.5R" while the live stop was already at breakeven. |
+      //|                                                                |
+      //| Inputs are read-only at runtime, so this needs no per-tick     |
+      //| re-evaluation: the hot path just reads the resolved bool.      |
+      //+----------------------------------------------------------------+
+      bool cutBeforeBE = (InpCutRiskRR > 0.0 && InpCutRiskRR < InpBreakEvenRR);
+      m_cutRiskRungLive = cutBeforeBE;
+      if(!cutBeforeBE)
+        {
+         // Loud by design: an operator who sees this line knows the half-risk
+         // rung is inert and that the journal will NEVER report HALF-RISK --
+         // by construction, not because a trigger was missed.
+         if(EnableLogging)
+            Print("[TradeManager] INERT RUNG: half-risk rung disabled because ",
+                  "InpCutRiskRR (", DoubleToString(InpCutRiskRR,2), ") is not below ",
+                  "InpBreakEvenRR (", DoubleToString(InpBreakEvenRR,2), "). ",
+                  "The -0.5R floor can never survive the cost-covering breakeven, ",
+                  "so it is never applied and never reported. Journal HALF-RISK ",
+                  "lines are suppressed.");
+        }
+      else if(EnableLogging)
+         Print("[TradeManager] LIVE RUNG: half-risk rung armed at ",
+               DoubleToString(InpCutRiskRR,2), "R (< breakeven ",
+               DoubleToString(InpBreakEvenRR,2), "R) -> -0.5R floor is reachable");
       return true;
      }
 
@@ -337,9 +434,9 @@ public:
       if(dir == DIR_LONG)
         {
          currentRR = (rrUnit > 0) ? (liveBid - primaryEntry) / rrUnit : 0;
-         double halfRiskSL = primaryEntry - (0.5 * rrUnit);
-         if(currentRR >= InpCutRiskRR && desiredSL < halfRiskSL)
-           { desiredSL = halfRiskSL; m_halfRiskTriggers++; }
+         // v5.32: the legacy half-risk rung USED to sit here, ahead of every
+         // profit-side floor. It has been HOISTED to the end of this branch --
+         // see the "HALF-RISK (HOISTED)" block below. Nothing else moved.
          // v5.27: BREAKEVEN AT 1:1 (InpBreakEvenRR lowered 2.0 -> 1.0).
          // Cost-covering, not nominal: beOffset carries commission + swap +
          // half-spread, so the stop sits fractionally ABOVE true entry and a
@@ -384,13 +481,30 @@ public:
             double dynamicTrail = high0 - (InpTrailATRMultiplier * atr);
             if(dynamicTrail > desiredSL) desiredSL = dynamicTrail;
            }
+         // --- HALF-RISK (HOISTED, v5.32) ---
+         // Evaluated LAST in this branch: after breakeven, both step locks and
+         // the ATR trail. The guard below therefore tests the FINAL stop rather
+         // than an intermediate one, which is what makes m_halfRiskTriggers
+         // honest -- it increments only when the -0.5R floor was genuinely
+         // APPLIED to the live stop.
+         //
+         // m_cutRiskRungLive is resolved once in Initialize(). With
+         // InpCutRiskRR >= InpBreakEvenRR the rung can never survive the
+         // breakeven floor above it, so it is inert and must not report. That
+         // gate is what removes the phantom "risk now -0.5R" journal line from
+         // every +1R winner.
+         //
+         // max() resolution is order-independent, so hoisting this rung cannot
+         // change which floor wins -- only what the counter means.
+         double halfRiskSL = primaryEntry - (0.5 * rrUnit);
+         if(m_cutRiskRungLive && currentRR >= InpCutRiskRR && desiredSL < halfRiskSL)
+           { desiredSL = halfRiskSL; m_halfRiskTriggers++; }
         }
       else // SHORT
         {
          currentRR = (rrUnit > 0) ? (primaryEntry - liveAsk) / rrUnit : 0;
-         double halfRiskSL = primaryEntry + (0.5 * rrUnit);
-         if(currentRR >= InpCutRiskRR && desiredSL > halfRiskSL)
-           { desiredSL = halfRiskSL; m_halfRiskTriggers++; }
+         // v5.32: half-risk rung HOISTED to the end of this branch (mirror of
+         // the LONG branch) so its counter means "the -0.5R floor was applied".
          // v5.27: BREAKEVEN AT 1:1 — mirror of the LONG branch above.
          if(currentRR >= InpBreakEvenRR && desiredSL > primaryEntry)
            {
@@ -419,6 +533,14 @@ public:
             double dynamicTrail = low0 + (InpTrailATRMultiplier * atr);
             if(dynamicTrail < desiredSL) desiredSL = dynamicTrail;
            }
+         // --- HALF-RISK (HOISTED, v5.32) --- mirror of the LONG branch.
+         // Evaluated after breakeven, both step locks and the ATR trail, so the
+         // guard tests the FINAL stop and the counter only fires on a real
+         // application. The '<' is mirrored to '>' so the ratchet still only
+         // ever moves the stop toward market.
+         double halfRiskSL = primaryEntry + (0.5 * rrUnit);
+         if(m_cutRiskRungLive && currentRR >= InpCutRiskRR && desiredSL > halfRiskSL)
+           { desiredSL = halfRiskSL; m_halfRiskTriggers++; }
         }
 
       // --- PYRAMID (unified group stop) ---
@@ -431,6 +553,66 @@ public:
       // beOffset already accounts for broker commission + swap friction).
       // v5.29: this rung now fires at +1.0R (InpPyramidT2RR = 1.0), which is the
       // tick on which three things coincide -- the T2 fill, the +1.0R breakeven
+      //+------------------------------------------------------------------+
+      //| v5.32 -- TRANCHE 2 CROSSING TRACE                                |
+      //|                                                                  |
+      //| This rung had never been observed firing in the field, and every |
+      //| refusal inside AddPyramidTranche() returned a bare 'false', so   |
+      //| "T2 never triggers" was indistinguishable from "T2 triggered    |
+      //| and was silently refused". This block makes the crossing         |
+      //| observable once per approach: the first tick whose RR enters the |
+      //| 5%-wide band below the trigger prints EVERY quantity the         |
+      //| decision depends on -- the live RR, the R unit it was measured   |
+      //| against, the basket size, the ladder cursor, and the lot the     |
+      //| rung would risk.                                                 |
+      //|                                                                  |
+      //| It deliberately runs BEFORE the gate below, so the trace also    |
+      //| fires when that gate's second half, IsPyramidPending(2), is      |
+      //| false -- which is the other candidate root cause: a m_nextTranche|
+      //| that has already advanced past 2.                                |
+      //|                                                                  |
+      //| Read-only apart from the bucket latch, which stops a basket      |
+      //| hovering just under the trigger from logging once per tick. The  |
+      //| latch re-arms whenever the ladder leaves rung 2, so the next     |
+      //| basket traces again.                                             |
+      //+------------------------------------------------------------------+
+      if(EnableLogging && InpPyramidT2RR > 0.0)
+        {
+         // Re-arm for the next basket: the ladder leaves rung 2 either by
+         // advancing (T2 fired) or by the whole basket being cleared, and in
+         // both cases a fresh basket should get its own crossing report.
+         // Deliberately NOT also keyed on InpPyramidEnable: a disabled pyramid
+         // leaves the cursor parked on 2, and re-arming every tick would turn
+         // this trace into a per-tick spammer. Parked on 2 is the correct
+         // behaviour for the disabled case too -- one report per approach.
+         if(m_orderManager.GetNextTranche() != 2)
+            m_t2TraceBucket = -1;
+
+         double t2Band = InpPyramidT2RR * 0.05;   // 5% of the trigger
+         if(currentRR >= (InpPyramidT2RR - t2Band))
+           {
+            int bucket = (int)MathFloor(currentRR / MathMax(t2Band, 0.0001));
+            if(bucket != m_t2TraceBucket)
+              {
+               m_t2TraceBucket = bucket;
+               double basketR = m_orderManager.GetBasketRRUnit();
+               double traceR  = (basketR > 0.0) ? basketR : rrUnit;
+               double traceLot = (traceR > 0.0)
+                                 ? m_riskManager.RiskPctLotSize(InpRiskT2Pct, traceR) : 0.0;
+               Print("[Pyramid] T2 crossing: currentRR=", DoubleToString(currentRR,3),
+                     " trigger=", DoubleToString(InpPyramidT2RR,2), "R",
+                     " | basketRRUnit=", DoubleToString(basketR, _Digits),
+                     " ladderRRUnit=", DoubleToString(rrUnit, _Digits),
+                     " | basketCount=", m_orderManager.GetBasketCount(),
+                     " | nextTranche=", m_orderManager.GetNextTranche(),
+                     " pending2=", (m_orderManager.IsPyramidPending(2) ? "true" : "false"),
+                     " | riskT2%=", DoubleToString(InpRiskT2Pct,3),
+                     " lot=", DoubleToString(traceLot,2),
+                     " | dir=", (dir == DIR_LONG ? "LONG" : "SHORT"),
+                     " enable=", (InpPyramidEnable ? "true" : "false"));
+              }
+           }
+        }
       // ratchet and the +1.0R ATR-trail activation -- so the guard below is set
       // unconditionally on a successful add.
       if(currentRR >= InpPyramidT2RR && m_orderManager.IsPyramidPending(2))
@@ -555,7 +737,13 @@ public:
       if(InpLockProfitRR > 0.0 && rr >= InpLockProfitRR)      step = STEP_TRAILING;
       else if(rr >= InpTrailStartRR)                          step = STEP_TRAILING;
       else if(rr >= InpBreakEvenRR)                           step = STEP_BREAKEVEN;
-      else if(rr >= InpCutRiskRR)                             step = STEP_HALF_RISK;
+      // v5.32: gated on the rung's resolved liveness so this state machine
+      // cannot advertise a stop the ladder structurally never applies. With
+      // InpCutRiskRR >= InpBreakEvenRR the branch above is always taken first
+      // anyway, so this is a statement of intent rather than a behaviour
+      // change -- but it keeps the reported step and the journalled events
+      // (m_halfRiskTriggers) derived from the SAME gate.
+      else if(m_cutRiskRungLive && rr >= InpCutRiskRR)        step = STEP_HALF_RISK;
       m_orderManager.SetActiveTradeStep(step);
       m_orderManager.SetActiveTradeHighWatermark(price);
      }

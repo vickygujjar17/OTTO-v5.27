@@ -6,11 +6,30 @@ header. Historical FIX annotations naming an older release must survive
 untouched, so any line containing 'FIX (' is skipped outright rather than
 pattern-matched.
 
+NOTE ON SCOPING: the v5.32 sources describe their OWN changes in '// v5.32:'
+comment blocks, so OLD ('5.31') only ever matches genuine v5.31 text. The
+reverse hazard is the one to watch -- a bare '5.31' -> '5.32' rewrite would
+corrupt the historical 'v5.31:' annotations that document the previous
+release's behaviour, which is why every pattern below is anchored on a
+specific human-facing prefix rather than on the version number alone.
+
 v5.32 note: this release introduces the "High Table" watchdog
 (CHighTableAuditor.mqh) -- a decoupled, timer-driven auditor that keeps a
 CSV evidence trail and emails one alert per incident via latched
 dispatches. The new module is added to FILES so its #property version
 tracks the release like every other source.
+
+v5.32 note: this release also ships four fixes that share one theme -- making
+the pyramid and milestone machinery ATTRIBUTABLE. (1) The half-risk rung's
+liveness is resolved once from the inputs, so an unreachable rung stops being
+counted and the phantom "risk now -0.5R" journal line disappears. (2) Every
+silent refusal in AddPyramidTranche now names its cause. (3) A bucket-latched
+tranche-2 crossing trace prints the decision inputs. (4) The basket's original
+1R is persisted to a ticket-keyed GlobalVariable so a cold restart no longer
+re-derives it from a ratcheted stop. The 'Pine Script Master Build Port (vX)'
+banner and the 'OTTO EA vX' startup banner are both matched explicitly,
+matching the v5.28-v5.31 bump scripts, so no human-facing release string is
+left one version behind.
 
 The README's 'Current base' line is bumped too -- it is the documented
 release marker the build tree is checked against, and it lives outside the
@@ -41,7 +60,9 @@ PATTERNS = [
 
 # Human-facing banner / description strings that name the live release.
 # 'FIX (vX)' historical annotations are already skipped by the caller, so the
-# v5.31 engine notes in otto.mq5 and COttoTradeManager.mqh are never touched.
+# v5.31 engine notes are never touched. The two v5.32 additions to this list
+# are the INPUT GROUP label and the versioned engine group in OttoDefines,
+# which name the release in the Inputs dialog where an operator reads it.
 PATTERNS += [
     (re.compile(r'(Master Build Port \(v)' + re.escape(OLD) + r'(\))'),
      r'\g<1>' + NEW + r'\g<2>'),
@@ -51,6 +72,10 @@ PATTERNS += [
      r'\g<1>' + NEW + r'\g<2>'),
     (re.compile(r'(#property description "OTTO v)' + re.escape(OLD) + r'( \u2014)'),
      r'\g<1>' + NEW + r'\g<2>'),
+    (re.compile(r'(\[9\] CURRENCY VECTOR & AFFINITY ENGINE \u2014 v)' + re.escape(OLD)),
+     r'\g<1>' + NEW),
+    (re.compile(r'(\[10\] HIGH TABLE AUDITOR \u2014 v)' + re.escape(OLD)),
+     r'\g<1>' + NEW),
 ]
 
 # Docs only: the README pins the live base release in prose.

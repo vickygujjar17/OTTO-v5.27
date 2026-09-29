@@ -341,7 +341,7 @@ input double   SafetyMaxFloatingLoss = 0.90;  // Hard cap: smart-trim at this % 
 input double   InpTrimLoserStopPct = 70.0;    // Smart trim: non-primary legs >= this % toward SL
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.31"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.32"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart

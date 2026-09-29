@@ -304,6 +304,19 @@ int OnInit(void)
    else
       Print("[INIT] High Table DISABLED by input");
 
+   // v5.32 — belt-and-braces rung-liveness warning.
+   // The Trade Manager's Initialize() already logs whether the half-risk rung
+   // is LIVE or INERT, but that line is gated on EnableLogging. An operator
+   // running with logging OFF would otherwise never learn that InpCutRiskRR is
+   // configured in a way that makes the -0.5R floor unreachable, so this one is
+   // deliberately unconditional: a misconfigured rung is worth one line of
+   // terminal output even in silent mode.
+   if(InpCutRiskRR >= InpBreakEvenRR)
+      Print("[INIT] NOTE: InpCutRiskRR (", DoubleToString(InpCutRiskRR,2),
+            ") is not below InpBreakEvenRR (", DoubleToString(InpBreakEvenRR,2),
+            ") -> the -0.5R half-risk rung is UNREACHABLE and will never be",
+            " applied or journalled. Set InpCutRiskRR below InpBreakEvenRR to arm it.");
+
    // --- Prop firm safety state: PERSISTENT MEMORY (v5.25) ---
    // FIX (v5.25): these baselines are loaded from MT5 GlobalVariables and only
    // seeded when absent. Previously every init re-seeded them from the LIVE
