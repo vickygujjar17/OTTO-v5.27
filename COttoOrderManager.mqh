@@ -45,6 +45,13 @@ private:
    int                     m_ordersPlaced;
    int                     m_ordersFilled;
    int                     m_ordersRejected;
+   //| Count of SL-modify requests that the venue refused. Distinct from
+   //| m_ordersRejected (which counts order PLACEMENTS) because a rejected
+   //| stop is a different and more dangerous class of failure: the position
+   //| is already open, so a stop the trail believes is live may not exist.
+   //| Incremented in ModifyStopLoss, surfaced via GetStopModifyFailures()
+   //| and pushed to the High Table auditor, which alerts on the delta.
+   int                     m_stopModifyFailures;
    int                     m_reversalsExecuted;
    int                     m_retryCount;
 
@@ -1010,6 +1017,15 @@ private:
                   " newSL=", DoubleToString(newSL, _Digits));
          return true;
         }
+      // The venue refused the stop. The position is open and the trail
+      // believes this level is live, so count it: the High Table auditor
+      // escalates a delta of these because an unprotected open position is
+      // the exact failure mode the whole safety stack exists to prevent.
+      m_stopModifyFailures++;
+      Print("[OrderManager] SL MODIFY FAILED: ticket=", ticket,
+            " newSL=", DoubleToString(newSL, _Digits),
+            " retcode=", modRes.retcode, " | total=", m_stopModifyFailures);
+
       return false;
      }
 
@@ -1454,7 +1470,9 @@ public:
       m_pendingLimitCount = 0;
       m_ordersPlaced      = 0;
       m_ordersFilled      = 0;
+
       m_ordersRejected    = 0;
+      m_stopModifyFailures = 0;
       m_reversalsExecuted = 0;
       m_retryCount        = 0;
       m_reversalInProgress = false;
@@ -1826,6 +1844,9 @@ public:
    int               GetOrdersPlaced(void) const { return m_ordersPlaced; }
    int               GetOrdersFilled(void) const { return m_ordersFilled; }
    int               GetOrdersRejected(void) const { return m_ordersRejected; }
+   //| Monotonic lifetime total, deliberately NOT cleared per trade: the
+   //| auditor diffs it between audit cycles to isolate new failures.
+   int               GetStopModifyFailures(void) const { return m_stopModifyFailures; }
    int               GetReversalsExecuted(void) const { return m_reversalsExecuted; }
    int               GetRetryCount(void) const { return m_retryCount; }
 

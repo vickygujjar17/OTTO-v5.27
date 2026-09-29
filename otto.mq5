@@ -61,6 +61,17 @@ long     g_lastBE           = 0;   // last-seen GetBreakevenTriggers()
 long     g_lastTrail        = 0;   // last-seen GetTrailActivations()
 bool     g_lastHadTrade     = false;
 
+// --- High Table fact ingress (v5.32) ---
+// The auditor is deliberately decoupled: it holds no COtto* reference and
+// reads terminal state only. Two facts it cannot derive from the terminal
+// are therefore PUSHED to it every audit cycle - the live drawdown anchors
+// (which are this file's private GlobalVariable-backed state) and the trade
+// the order layer believes it is driving. The counters below are the
+// push-side high-water marks used to turn the order manager's monotonic
+// totals into the per-cycle DELTAS the auditor escalates on.
+long     g_htPushedRejects    = 0;   // GetOrdersRejected() at last push
+long     g_htPushedStopFails  = 0;   // GetStopModifyFailures() at last push
+
 // --- Market-day counter (Pine ta.change(time("D")) mirror) ---
 int      g_marketDay        = 0;
 datetime g_lastDailyBarTime = 0;
@@ -1015,6 +1026,63 @@ void OnTimer(void)
   {
    if(!g_initialized) return;
    if(!InpEnableHighTable) return;
+   HighTablePushFacts();       // v5.32: hand over the facts only we can see
    g_highTable.RunAudit();
+  }
+
+//+------------------------------------------------------------------+
+//| High Table fact ingress (v5.32)                                   |
+//|                                                                   |
+//| Called from OnTimer immediately before RunAudit(). It hands the    |
+//| auditor the two facts it cannot read for itself:                  |
+//|                                                                   |
+//|   1. The live drawdown anchors. These are this file's private      |
+//|      GlobalVariable-backed state; re-deriving them inside the      |
+//|      auditor would mean duplicating the OTTO_<key>_<login> key     |
+//|      format, i.e. a second source of truth for the trailing floor. |
+//|                                                                   |
+//|   2. The trade the order layer believes it is driving, so the      |
+//|      auditor can test that belief against the real book.           |
+//|                                                                   |
+//| Both push points are read-only calls on the trade modules: the     |
+//| auditor still holds no reference to them, which is what keeps the  |
+//| decoupling contract intact (see CHighTableAuditor.mqh header).     |
+//|                                                                   |
+//| The counters are pushed as DELTAS because GetOrdersRejected() and  |
+//| GetStopModifyFailures() are monotonic lifetime totals; the push    |
+//| advances its own high-water mark so no failure is counted twice.   |
+//+------------------------------------------------------------------+
+void HighTablePushFacts(void)
+  {
+   // --- Drawdown anchors + permanent halt ---
+   g_highTable.SetSafetyBaseline(g_dailyResetBalance, g_equityHighWaterMark,
+                                 g_totalDD_Halted);
+
+   // --- Order-reject delta since the previous push ---
+   long rejects = g_orderManager.GetOrdersRejected();
+   if(rejects > g_htPushedRejects)
+     {
+      g_highTable.NotifyOrderReject(0, "order placement", (int)(rejects - g_htPushedRejects));
+      g_htPushedRejects = rejects;
+     }
+
+   // --- SL-modify failure delta since the previous push ---
+   long stopFails = g_orderManager.GetStopModifyFailures();
+   if(stopFails > g_htPushedStopFails)
+     {
+      g_highTable.NotifyStopModifyFailure(0, 0, (int)(stopFails - g_htPushedStopFails));
+      g_htPushedStopFails = stopFails;
+     }
+
+   // --- The trade the order layer believes it is driving ---
+   // The ticket is taken from the order layer rather than from the book on
+   // purpose: the point of the check is to compare the manager's BELIEF
+   // against reality, so both halves must come from independent sources.
+   SActiveTrade active;
+   ulong ticket = 0;
+   if(g_orderManager.GetActiveTradeRef(active))
+      ticket = active.ticket;
+   g_highTable.SetTrackedLegs(g_orderManager.CountOpenPositions(),
+                              ticket, g_orderManager.HasActiveTrade());
   }
 

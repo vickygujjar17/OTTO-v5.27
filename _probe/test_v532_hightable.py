@@ -244,9 +244,19 @@ check("ClearLatch re-arms by reference",
 # The latch inventory must be named bool members, not a string-keyed map:
 # a typo in a map key is a silent no-op, a typo in a member name will not
 # compile.
-LATCHES = re.findall(r"bool\s+m_alertSent_(\w+)\s*;", AUD_C)
+LATCHES = re.findall(r"bool\s+m_alertSent_(\w+)\s*;\s*//", AUD_C)
+# The declarations carry trailing comments; also pick up a bare declaration.
+if len(LATCHES) < 6:
+    LATCHES = re.findall(r"bool\s+m_alertSent_(\w+)\s*;", AUD_C)
 check("the auditor declares named latch members", len(LATCHES) >= 6,
       "found %d: %s" % (len(LATCHES), sorted(LATCHES)))
+
+uninit = [l for l in LATCHES
+          if not re.search(r"m_alertSent_%s\s*=\s*false\s*;" % re.escape(l), AUD_C)]
+check("every latch is initialised in the constructor", not uninit,
+      "uninitialised: %s" % uninit)
+check("a second dispatch path exists for one-off events",
+      DISP is not None and DISP1 is not None)
 
 
 # ----------------------------------------------------------------------
@@ -331,6 +341,309 @@ check("the staging-tree expectation counts 11 OTTO sources",
       "all 11 OTTO sources" in BUILD_T)
 
 
+
+
+# ----------------------------------------------------------------------
+# 8. PART 2 - the live audit bodies
+# ----------------------------------------------------------------------
+print("\n-- Part 2 live audit bodies --")
+
+BODIES = ["AuditTrimHealth", "AuditDrawdown", "AuditOrderHealth",
+          "AuditStateConsistency"]
+
+BODY_SRC = {}
+for name in BODIES:
+    BODY_SRC[name] = func_body(AUD_C, r"void\s+%s\s*\(\s*void\s*\)" % name)
+    check("%s is defined" % name, BODY_SRC[name] is not None)
+
+RUN = func_body(AUD_C, r"void\s+RunAudit\s*\(\s*void\s*\)") or ""
+check("RunAudit drives all four Part 2 bodies",
+      all((name + "()") in RUN for name in BODIES))
+
+# Each body must be self-contained: it raises at most one LATCHED alert, and
+# it re-arms that latch once the condition reads healthy. A body that
+# dispatches but never clears latches itself silent forever after the first
+# incident - the mailbox would go quiet exactly when a recurring fault needs
+# reporting.
+# Every dispatched latch must be RE-ARMED on the healthy path, and a latch is
+# only meaningful paired with the dispatch that raises it. Testing merely that
+# the word ClearLatch() appears somewhere in the body is not enough: the
+# reference bug this guards - a latch that is raised but never lowered - is
+# invisible to a text-presence test, because the SAME body usually clears
+# some OTHER latch and satisfies the search.
+def latch_lifecycle_ok(body, latch):
+    disp = [m.start() for m in
+            re.finditer(r"DispatchAlertOnce\(\s*m_alertSent_%s\b" % latch, body)]
+    clr = [m.start() for m in
+           re.finditer(r"ClearLatch\(\s*m_alertSent_%s\b" % latch, body)]
+    if not disp or not clr:
+        return False
+    # else-shape: a re-arm that runs even while the violation is still live.
+    if any(c > disp[-1] for c in clr):
+        return True
+    # guard-shape: the healthy path is an early return taken BEFORE the
+    # dispatch, exactly as AuditStateConsistency does.
+    return any(c < disp[0] and "return" in body[c:disp[0]] for c in clr)
+
+
+# The halt and the trailing-total breach are deliberately never re-armed: the
+# EA only ever sets them, so lowering the latch could only produce a second
+# email for the same permanent condition.
+NEVER_CLEARED = {"Halt", "TotalDDBreach"}
+
+for name in BODIES:
+    b = BODY_SRC[name]
+    if b is None:
+        continue
+    check("%s actually evaluates something" % name, len(b) > 200,
+          "body is %d chars" % len(b))
+    check("%s dispatches through a latch" % name, "DispatchAlertOnce(" in b)
+
+    dispatched = set(re.findall(r"DispatchAlertOnce\(\s*m_alertSent_(\w+)", b))
+    cleared = set(re.findall(r"ClearLatch\(\s*m_alertSent_(\w+)", b))
+    check("%s raises at least one latched alert" % name, bool(dispatched))
+    check("%s never re-arms a latch it does not raise" % name,
+          not (cleared - dispatched),
+          "stray: %s" % sorted(cleared - dispatched))
+
+    for latch in sorted(dispatched - NEVER_CLEARED):
+        check("%s/%s is re-armed on its healthy path" % (name, latch),
+              latch_lifecycle_ok(b, latch))
+    for latch in sorted(dispatched & NEVER_CLEARED):
+        check("%s/%s stays permanently latched" % (name, latch),
+              latch not in cleared)
+
+# The latch must be a CLASS member. This module previously shipped a latch
+# declared at file scope, AFTER the include guard's #endif: the constructor's
+# assignment then initialised a different object from the one the methods
+# read, so the incident was reported once and then silenced for the rest of
+# the session. Nothing of the class may follow the guard.
+TAIL_AFTER_GUARD = AUD_T.split("#endif")[-1] if "#endif" in AUD_T else AUD_T
+check("no latch state is declared outside the include guard",
+      "m_alertSent_" not in TAIL_AFTER_GUARD)
+
+# Every latch a body touches must be a declared member, or the ClearLatch
+# re-arm would bind to nothing.
+for name in BODIES:
+    b = BODY_SRC[name]
+    if b is None:
+        continue
+    used = set(re.findall(r"m_alertSent_(\w+)", b))
+    check("%s only touches declared latches" % name,
+          used and not (used - set(LATCHES)),
+          "undeclared: %s" % sorted(used - set(LATCHES)))
+
+
+# ----------------------------------------------------------------------
+# 9. PART 2 - units, thresholds and the trim mirror
+# ----------------------------------------------------------------------
+print("\n-- Part 2 units and thresholds --")
+
+# The 0.0090 fraction idiom belongs to a DIFFERENT rule shape - it appears in
+# this module ONLY inside the unit-rationale comment block. Comment text is
+# not code, so the prohibition has to be asserted against the comment-stripped
+# source; against raw text it would be satisfied forever by the very comment
+# that warns about it.
+check("the 0.0090 fraction idiom is discussed but never used as code",
+      "0.0090" in AUD_T and "0.0090" not in AUD_C)
+
+FL = func_body(AUD_C, r"double\s+FloatingLossPct\s*\(\s*void\s*\)")
+check("FloatingLossPct returns the percent form",
+      FL is not None and
+      re.search(r"100\.0\s*\*\s*\(\s*balance\s*-\s*equity\s*\)\s*/\s*balance",
+                FL) is not None)
+DAILYD = func_body(AUD_C, r"double\s+DailyDDPct\s*\(\s*void\s*\)")
+check("DailyDDPct measures against the pushed daily anchor",
+      DAILYD is not None and "m_dailyResetBalance" in DAILYD and "100.0" in DAILYD)
+TOTD = func_body(AUD_C, r"double\s+TotalDDPct\s*\(\s*void\s*\)")
+check("TotalDDPct measures against the pushed equity HWM",
+      TOTD is not None and "m_equityHwm" in TOTD and "100.0" in TOTD)
+
+# Every threshold is the LIVE input, never a literal copy of its value. The
+# assertion has to name the COMPARISON, not merely the identifier: each of
+# these names also appears in alert text and in this scaffold, so a
+# file-wide `name in source` test stays green even if a comparison was
+# rewritten to a hardcoded literal - exactly the drift that matters, since
+# the EA's own limit would then no longer be the limit being watched.
+THRESHOLD_SITES = [
+    ("floating-loss cap", r"if\s*\(\s*floatingLoss\s*>=\s*SafetyMaxFloatingLoss\s*\)"),
+    ("daily DD limit",    r"if\s*\(\s*dailyDD\s*>=\s*SafetyDailyDDLimit\s*\)"),
+    ("total DD limit",    r"if\s*\(\s*totalDD\s*>=\s*SafetyTotalDDLimit\s*\)"),
+]
+for label, pat in THRESHOLD_SITES:
+    check("the %s compares against the live input" % label,
+          re.search(pat, AUD_C) is not None)
+
+# ...and no numeric literal may stand in for a safety limit. A bare 0.90/3.0/
+# 5.0 comparison anywhere in the drawdown bodies is the same defect the pair
+# above is watching for, so reject the shape outright.
+check("no drawdown comparison uses a numeric limit literal",
+      re.search(r"(floatingLoss|dailyDD|totalDD)\s*>=\s*\d", AUD_C) is None)
+
+# The trim mirror must reference the live retune input BY NAME, so a change
+# to InpTrimLoserStopPct moves both implementations at once and only a change
+# to the STRUCTURE of the formula could cause drift.
+#
+# The assertion has to name the CALL SITE, not merely the identifier: the
+# input also appears in the alert text, so a bare `identifier in source` test
+# would still pass if the call were changed to a hardcoded 70.0 - which is
+# precisely the drift it is meant to catch.
+check("the trim mirror passes the live trim input to the counter",
+      re.search(r"CountTrimmableLegs\s*\(\s*InpTrimLoserStopPct\s*\)",
+                AUD_C) is not None)
+check("the trim mirror hardcodes no trim threshold",
+      re.search(r"CountTrimmableLegs\s*\(\s*\d", AUD_C) is None)
+check("the trim mirror converts percent to a fraction exactly once",
+      re.search(r"trimPct\s*/\s*100\.0", AUD_C) is not None)
+check("the trim mirror keeps the same guards as WalkTrimLegs",
+      re.search(r"if\s*\(\s*sl\s*<=\s*0\.0\s*\)\s*continue\s*;", AUD_C) is not None and
+      re.search(r"if\s*\(\s*total\s*<=\s*0\.0\s*\)\s*continue\s*;", AUD_C) is not None)
+
+# WalkTrimLegs skips `ticket == m_orderManager.GetActiveTrade().ticket`. The
+# mirror must skip the SAME ticket, pushed verbatim, or the two could disagree
+# about which leg is primary and skew the count in either direction.
+check("the trim mirror excludes the pushed primary ticket",
+      re.search(r"ticket\s*==\s*m_trackedPrimary", AUD_C) is not None)
+
+# "_T<n>" is appended ONLY for tranche > 1, so a bare comment is the primary.
+check("the tranche-suffix parser exists for the pre-push fallback",
+      re.search(r"bool\s+CommentHasTrancheSuffix\s*\(", AUD_C) is not None)
+check("the auditor never hardcodes a _T1 comment suffix", "_T1" not in AUD_C)
+
+
+# ----------------------------------------------------------------------
+# 10. PART 2 - the state-consistency invariant
+# ----------------------------------------------------------------------
+print("\n-- Part 2 state-consistency invariant --")
+
+# The invariant compares the order layer's BELIEF (which ticket it is
+# trailing) against the terminal's book. It must NOT be a basket-length
+# comparison: m_basketCount and the m_basket[] array legitimately lag the
+# book during a normal exit, so that shape would false-positive on every
+# close - an alert nobody would keep trusting.
+check("the book is queried for a specific ticket",
+      re.search(r"bool\s+BookHasTicket\s*\(", AUD_C) is not None)
+
+SC = BODY_SRC["AuditStateConsistency"]
+if SC is not None:
+    check("the consistency check tests the pushed primary against the book",
+          "BookHasTicket(m_trackedPrimary)" in SC)
+    check("the phantom requires the pushed active flag",
+          "m_trackedActive" in SC)
+    check("the consistency check is NOT a basket-length comparison",
+          not re.search(r"book\s*==\s*m_trackedLegs", SC))
+    check("a divergence must persist across two cycles",
+          SC.count("m_stateSkewSeen") >= 3)
+
+
+# MODELLED INPUTS - transcribed from the body's documented behaviour, NOT
+# parsed out of the shipped source. It steps the cycle-by-cycle decision
+# table:
+#   (active, primary>0, primary present in book) -> (alerts, latch, skew-seen)
+# and is checked alongside the source-side predicates above, so a body that
+# stopped implementing this shape would fail those even if the model passed.
+def model_cycles(seq):
+    skew, latch, alerts = False, False, 0
+    for active, has_primary, in_book in seq:
+        phantom = active and has_primary and not in_book
+        if not phantom:
+            latch, skew = False, False
+            continue
+        if not skew:
+            skew = True
+            continue
+        if not latch:
+            alerts += 1
+            latch = True
+    return alerts, latch
+
+
+check("MODELLED: a steady phantom alerts exactly once",
+      model_cycles([(True, True, False)] * 3)[0] == 1)
+check("MODELLED: a one-cycle hand-off blip never alerts",
+      model_cycles([(True, True, False), (True, True, True)])[0] == 0)
+check("MODELLED: a recurring phantom alerts once per incident",
+      model_cycles([(True, True, False), (True, True, False),
+                    (True, True, True),
+                    (True, True, False), (True, True, False)])[0] == 2)
+check("MODELLED: a flat manager is never reported",
+      model_cycles([(False, False, False)] * 4)[0] == 0)
+check("MODELLED: a known primary that IS in the book never alerts",
+      model_cycles([(True, True, True)] * 4)[0] == 0)
+
+if SC is not None:
+    check("the shipped body confirms the skew before it dispatches",
+          SC.find("m_stateSkewSeen") < SC.find("DispatchAlertOnce("))
+
+
+# ----------------------------------------------------------------------
+# 11. PART 2 - pushed-fact ingress and its wiring
+# ----------------------------------------------------------------------
+print("\n-- Part 2 pushed-fact ingress --")
+
+# The push carries the ticket the order layer BELIEVES it is trailing plus
+# the active flag. Before the first push the auditor must not treat ticket 0
+# as a phantom, so the ingress records the flag alongside the ticket.
+check("SetTrackedLegs carries the belief (legs, primary, active)",
+      re.search(r"void\s+SetTrackedLegs\s*\(\s*int\s+\w+\s*,\s*ulong\s+\w+\s*,"
+                r"\s*bool\s+\w+\s*\)", AUD_C) is not None)
+check("SetSafetyBaseline carries the anchors and the halt flag",
+      re.search(r"SetSafetyBaseline\s*\(\s*double\s+\w+\s*,\s*double\s+\w+\s*,"
+                r"\s*bool\s+\w+\s*\)", AUD_C) is not None)
+check("the reject ingress is monotonic (delta-capable)",
+      re.search(r"m_rejectCount\s*\+=", AUD_C) is not None)
+check("the stop-modify ingress is monotonic (delta-capable)",
+      re.search(r"m_stopModifyFailures\s*\+=", AUD_C) is not None)
+
+# The auditor can never poll the order layer, so the ORDER MANAGER must own
+# the stop-modify counter and expose it. Without a counter there is nothing
+# to push and the SL-modify check would silently never fire.
+ORD = read(os.path.join(ROOT, "COttoOrderManager.mqh"))
+ORD_C = strip_comments(ORD)
+MSL = func_body(ORD_C, r"bool\s+ModifyStopLoss\s*\(")
+check("the order manager counts a rejected SL modify",
+      MSL is not None and "m_stopModifyFailures++" in MSL)
+check("the count is incremented exactly once, on the failure path",
+      MSL is not None and MSL.count("m_stopModifyFailures++") == 1 and
+      MSL.find("m_stopModifyFailures++") > MSL.find("SendOrderWithRetry"))
+check("the order manager exposes the stop-modify total",
+      re.search(r"int\s+GetStopModifyFailures\s*\(\s*void\s*\)", ORD_C) is not None)
+check("the stop-modify counter is initialised in the constructor",
+      re.search(r"m_stopModifyFailures\s*=\s*0\s*;", ORD_C) is not None)
+
+# The push must happen on the AUDIT cadence, from the timer path, and before
+# the audit runs - facts arrive, then the audit reads them.
+PUSH = func_body(MAIN_C, r"void\s+HighTablePushFacts\s*\(\s*void\s*\)")
+check("otto.mq5 defines the fact-ingress helper", PUSH is not None)
+check("the ingress is called from OnTimer",
+      "HighTablePushFacts()" in ONTIMER)
+check("the ingress runs BEFORE the audit",
+      0 < ONTIMER.find("HighTablePushFacts()") < ONTIMER.find("RunAudit()"))
+if PUSH is not None:
+    check("the ingress pushes the drawdown anchors",
+          "SetSafetyBaseline(" in PUSH)
+    check("the ingress pushes the tracked trade",
+          "SetTrackedLegs(" in PUSH)
+    check("the ingress takes the ticket from the order layer, not the book",
+          "GetActiveTradeRef(" in PUSH)
+    check("the ingress pushes rejects as a per-cycle delta",
+          "NotifyOrderReject(" in PUSH and "rejects -" in PUSH)
+    check("the ingress pushes stop failures as a per-cycle delta",
+          "NotifyStopModifyFailure(" in PUSH and "stopFails -" in PUSH)
+    # A delta is only correct if the high-water mark advances with it,
+    # otherwise the same failures are re-counted on every cycle and the
+    # burst threshold trips on a single old reject.
+    check("the ingress advances its reject high-water mark",
+          "g_htPushedRejects = rejects;" in PUSH)
+    check("the ingress advances its stop-failure high-water mark",
+          "g_htPushedStopFails = stopFails;" in PUSH)
+
+check("OnTick still does not touch the auditor",
+      ONTICK is None or "g_highTable" not in ONTICK)
+check("RunAudit is still called exactly once",
+      len(re.findall(r"g_highTable\.RunAudit\s*\(", MAIN_C)) == 1)
+
+
 # ----------------------------------------------------------------------
 def main():
     passed = sum(1 for _, ok, _ in RESULTS if ok)
@@ -356,9 +669,3 @@ def main():
 if __name__ == "__main__":
     raise SystemExit(main())
 
-uninit = [l for l in LATCHES
-          if not re.search(r"m_alertSent_%s\s*=\s*false\s*;" % re.escape(l), AUD_C)]
-check("every latch is initialised in the constructor", not uninit,
-      "uninitialised: %s" % uninit)
-check("a second dispatch path exists for one-off events",
-      DISP is not None and DISP1 is not None)

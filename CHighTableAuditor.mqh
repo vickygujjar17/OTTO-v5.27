@@ -24,6 +24,11 @@
 #define HT_SEV_INFO      "INFO"
 #define HT_SEV_WARN      "WARN"
 #define HT_SEV_CRITICAL  "CRITICAL"
+// A reject "burst" is this many refused submissions WITHIN one audit cycle.
+// A single refusal is ordinary broker/fill-mode traffic and is not worth an
+// email; a cluster is the signature of a broken venue and is. Named rather
+// than inlined so the threshold is greppable and tunable in one place.
+#define HT_REJECT_BURST  3
 
 //+------------------------------------------------------------------+
 //| CHighTableAuditor                                                 |
@@ -72,6 +77,60 @@ private:
    bool              m_alertSent_Halt;               // permanent halt latched
    bool              m_alertSent_OrderRejectSpike;   // broker reject burst
    bool              m_alertSent_StopModifyFailure;  // SL modify rejected
+   // v5.32 Part 2: this latch used to be declared OUTSIDE the class, after
+   // the include guard's #endif. At file scope it was an ordinary global,
+   // so the constructor's `m_alertSent_StateInconsistency = false;` was
+   // initialising a different object from the one this class's methods
+   // read -- the latch never re-armed and the incident was reported once
+   // and then silenced for the lifetime of the terminal session. Moved
+   // here, next to its peers, where the constructor assignment binds to
+   // the member it names.
+   bool              m_alertSent_StateInconsistency; // book vs tracked state
+
+   //+------------------------------------------------------------------+
+   //| PART 2 - pushed observation state.                                |
+   //|                                                                   |
+   //| The auditor is forbidden from including any trade module (it is   |
+   //| structurally read-only), so it cannot poll COttoOrderManager's    |
+   //| reject counters. Facts the trade path already knows are therefore |
+   //| PUSHED in through NotifyOrderReject() / NotifyStopModifyFailure() |
+   //| -- the same direction that OnInit pushes the symbol and magic.    |
+   //| Each counter is monotonic; the auditor only ever compares it      |
+   //| against its own last-seen value, so a burst is a DELTA and not a  |
+   //| lifetime total.                                                   |
+   //+------------------------------------------------------------------+
+   long              m_rejectCount;          // current pushed reject total
+   long              m_rejectSeenAtLastAudit;// total at the previous cycle
+   long              m_stopModifyFailures;   // current pushed SL-modify fails
+   long              m_stopModifySeen;       // total at the previous cycle
+
+   //| Drawdown bases. PUSHED from otto.mq5 rather than read out of the    |
+   //| terminal's GlobalVariables: the GV key format ("OTTO_<key>_<login>")|
+   //| is private to otto.mq5, and re-implementing it here would be a      |
+   //| second, silently drift-prone source of truth for the trailing floor.|
+   //| otto.mq5 pushes the same live values it enforces, so the auditor's  |
+   //| reading can never disagree with the EA's.                           |
+   double            m_dailyResetBalance;    // pushed daily anchor
+   double            m_equityHwm;            // pushed all-time equity HWM
+   bool              m_totalHalted;          // pushed g_totalDD_Halted
+   bool              m_haveBaseline;         // false until the first push
+
+   //| The tracked PRIMARY ticket, pushed from the order layer. This is   |
+   //| the one piece of the trade path's belief that the terminal cannot   |
+   //| answer for it: the book says which legs EXIST, this says which      |
+   //| ticket the trail/trim believe they are managing. If that ticket is  |
+   //| gone from the book while the manager still thinks it is active, the |
+   //| EA is driving a phantom -- and a phantom ticket means the risk       |
+   //| geometry is being maintained against nothing.                       |
+   //|                                                                     |
+   //| Note this is NOT tautological with the book (the manager re-derives |
+   //| nothing here; it reports its own state) and it is NOT the basket    |
+   //| array length, which legitimately lags a close until ClearBasket     |
+   //| and would therefore produce false positives during a normal exit.   |
+   int               m_trackedLegs;          // legs the order layer believes are open
+   ulong             m_trackedPrimary;       // ticket the trail believes it manages
+   bool              m_trackedActive;        // m_hasActiveTrade, as pushed
+   bool              m_stateSkewSeen;        // divergence seen once, awaiting confirm
 
    //+------------------------------------------------------------------+
    //| CSV field sanitizer.                                              |
@@ -132,6 +191,200 @@ private:
       FileClose(h);
      }
 
+   //+------------------------------------------------------------------+
+   //| PART 2 - read-only terminal queries.                              |
+   //|                                                                   |
+   //| Everything below reads the terminal directly. No COtto* type, no  |
+   //| CTrade and no CPositionInfo appears anywhere in this file, which  |
+   //| is what makes the auditor structurally incapable of mutating      |
+   //| basket state -- the decoupling contract at the top of this file.  |
+   //| The one thing the terminal cannot tell us (which leg is the       |
+   //| PRIMARY, and what the trailing drawdown anchors are) is PUSHED in |
+   //| via the Notify*/SetSafetyBaseline ingress points instead.         |
+   //+------------------------------------------------------------------+
+   int               CountBookLegs(void) const
+     {
+      int n = 0;
+      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
+        {
+         if(PositionGetTicket(idx) <= 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
+         n++;
+        }
+      return n;
+     }
+
+   //+------------------------------------------------------------------+
+   //| Is a given ticket present in the terminal book, for us?           |
+   //|                                                                   |
+   //| Used to test the order layer's belief against reality. This is    |
+   //| NOT tautological with the push: the order layer reports the       |
+   //| ticket it thinks it is trailing (m_activeTrade.ticket), which it  |
+   //| holds across a close until SyncActiveTrade() reconciles it on the |
+   //| following OnTick -- so the two can and do disagree.               |
+   //+------------------------------------------------------------------+
+   bool              BookHasTicket(const ulong ticket) const
+     {
+      if(ticket == 0) return false;
+      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
+        {
+         if(PositionGetTicket(idx) != ticket) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
+         return true;
+        }
+      return false;
+     }
+
+   //+------------------------------------------------------------------+
+   //| Primary-leg identification (read-only, comment-derived).          |
+   //|                                                                   |
+   //| The auditor cannot ask COttoOrderManager which ticket is the      |
+   //| primary, but it does not need to: BuildOrderComment() appends     |
+   //| "_T<n>" ONLY for n > 1 (COttoOrderManager.mqh:419). The primary   |
+   //| tranche is therefore exactly the leg whose comment carries no     |
+   //| "_T" suffix -- a free, stable, read-only identifier that requires |
+   //| no new state and no new field on SActiveTrade.                    |
+   //|                                                                   |
+   //| FAIL-SAFE DIRECTION: if the format ever changes so that NO leg    |
+   //| looks like a primary, every leg is treated as primary and the     |
+   //| trim check finds nothing to have missed -- it under-reports       |
+   //| rather than inventing a TrimFailure.                              |
+   //+------------------------------------------------------------------+
+   bool              CommentHasTrancheSuffix(const string c) const
+     {
+      int len = StringLen(c);
+      if(len < 3) return false;               // too short to end in "_T<n>"
+      // Scan back over the trailing digits, then require the literal "_T"
+      // immediately before them. "_T" must be a real suffix: a bare 'T' in
+      // the middle of an ID (e.g. "...-BLKT3") must not match.
+      int i = len - 1;
+      int digits = 0;
+      while(i >= 0)
+        {
+         ushort ch = (ushort)StringGetCharacter(c, i);
+         if(ch < '0' || ch > '9') break;
+         digits++;
+         i--;
+        }
+      if(digits < 1) return false;
+      if(i < 1) return false;
+      if(StringGetCharacter(c, i)     != 'T') return false;
+      if(StringGetCharacter(c, i - 1) != '_') return false;
+      return true;
+     }
+
+   bool              IsPrimaryLeg(void) const
+     {
+      string c = PositionGetString(POSITION_COMMENT);
+      return !CommentHasTrancheSuffix(c);
+     }
+
+   //+------------------------------------------------------------------+
+   //| A pure-function mirror of COttoTradeManager's trim filter.        |
+   //|                                                                   |
+   //| This is a DELIBERATE, documented duplication of the qualification |
+   //| maths in WalkTrimLegs() (COttoTradeManager.mqh:134-186). The      |
+   //| auditor cannot call that method -- WalkTrimLegs is private and    |
+   //| taking a COttoTradeManager reference would breach the no-pointer  |
+   //| contract -- so the filter is mirrored here and must be kept in    |
+   //| step by hand. The constant that matters is referenced by NAME     |
+   //| (the live InpTrimLoserStopPct input, not a hardcoded 70.0), so a  |
+   //| retune moves both copies at once and only a change to the         |
+   //| STRUCTURE of the formula could ever cause drift.                  |
+   //|                                                                   |
+   //| Counts legs that are (a) ours, (b) not the primary, (c) have a    |
+   //| usable stop, and (d) have travelled >= trimPct% of the way to     |
+   //| that stop. That count is what tells the auditor whether the       |
+   //| trim had something it COULD have closed.                          |
+   //|                                                                   |
+   //| KNOWN LIMITATION (accepted): the real filter also clamps each     |
+   //| leg's stop against the basket's session SL, which is private to   |
+   //| the order manager and unknown here. An unclamped comparison can   |
+   //| only ever UNDER-count qualified legs -- so this may miss a        |
+   //| TrimFailure after a rejected ApplyUnifiedSL, but it can never     |
+   //| raise a false one. Under-reporting is the safe direction.         |
+   //|                                                                   |
+   //| FALLBACK: the primary leg is identified by the pushed ticket      |
+   //| (the same identifier WalkTrimLegs uses). Only before the first    |
+   //| push arrives does this fall back to the comment-suffix rule,      |
+   //| which is itself fail-safe: an unrecognised comment format makes   |
+   //| every leg look primary, so nothing qualifies and the count is 0.  |
+   //+------------------------------------------------------------------+
+   int               CountTrimmableLegs(double trimPct) const
+     {
+      int qualified = 0;
+      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
+        {
+         if(PositionGetTicket(idx) <= 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
+
+         // Exclude the primary exactly as WalkTrimLegs does: it skips
+         // `ticket == m_orderManager.GetActiveTrade().ticket`, and that
+         // ticket is pushed to us verbatim. Using the SAME identifier is
+         // what keeps this mirror faithful -- a comment-derived primary
+         // could disagree with the manager's belief and quietly skew the
+         // count in either direction.
+         ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+         if(m_trackedPrimary > 0)
+           {
+            if(ticket == 0 || ticket == m_trackedPrimary) continue;
+           }
+         else if(IsPrimaryLeg()) continue;   // no push yet: see fallback note
+
+         bool   isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+         double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
+         double sl     = PositionGetDouble(POSITION_SL);
+         if(sl <= 0.0) continue;
+
+         double total = isLong ? (entry - sl) : (sl - entry);
+         if(total <= 0.0) continue;
+
+         double mark  = isLong ? SymbolInfoDouble(m_symbol, SYMBOL_BID)
+                               : SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+         double moved = isLong ? (entry - mark) : (mark - entry);
+         if(moved < (trimPct / 100.0) * total) continue;
+         qualified++;
+        }
+      return qualified;
+     }
+
+   //+------------------------------------------------------------------+
+   //| Drawdown measures, in PERCENT units, matching otto.mq5 exactly.   |
+   //|                                                                   |
+   //| otto.mq5:734-736 computes 100.0*(balance-equity)/balance against  |
+   //| SafetyMaxFloatingLoss (0.90), and :726-727 compute the daily and  |
+   //| trailing-total measures against SafetyDailyDDLimit (3.0) and      |
+   //| SafetyTotalDDLimit (5.0). All three are PERCENT values. The       |
+   //| 0.0090-fraction idiom belongs to a different rule shape; mixing   |
+   //| the two units here would make the auditor disagree with the EA    |
+   //| about the very breach it is reporting on, so the comparisons      |
+   //| below deliberately use the percent form throughout.               |
+   //+------------------------------------------------------------------+
+   double            FloatingLossPct(void) const
+     {
+      double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      if(balance <= 0.0 || equity >= balance) return 0.0;
+      return 100.0 * (balance - equity) / balance;
+     }
+
+   double            DailyDDPct(void) const
+     {
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(m_dailyResetBalance <= 0.0) return 0.0;
+      return 100.0 * (m_dailyResetBalance - equity) / m_dailyResetBalance;
+     }
+
+   double            TotalDDPct(void) const
+     {
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(m_equityHwm <= 0.0) return 0.0;
+      return 100.0 * (m_equityHwm - equity) / m_equityHwm;
+     }
+
 public:
                      CHighTableAuditor(void)
      {
@@ -141,6 +394,22 @@ public:
       m_dispatched = 0;
       m_suppressed = 0;
       m_lastAudit  = 0;
+      // Part 2 pushed state. Every counter starts at zero so the FIRST
+      // pushed fact is always observed as a delta from a known baseline,
+      // and the "seen" values start AT zero so the very first cycle does
+      // not mistake a pre-existing total for a burst.
+      m_rejectCount            = 0;
+      m_rejectSeenAtLastAudit  = 0;
+      m_stopModifyFailures     = 0;
+      m_stopModifySeen         = 0;
+      m_trackedLegs            = 0;
+      m_trackedPrimary         = 0;
+      m_trackedActive          = false;
+      m_stateSkewSeen          = false;
+      m_dailyResetBalance      = 0.0;
+      m_equityHwm              = 0.0;
+      m_totalHalted            = false;
+      m_haveBaseline           = false;
       m_alertSent_TrimFailure        = false;
       m_alertSent_DailyDDBreach      = false;
       m_alertSent_TotalDDBreach      = false;
@@ -174,6 +443,78 @@ public:
             " | lastAudit=", (m_lastAudit > 0 ? TimeToString(m_lastAudit, TIME_DATE | TIME_SECONDS)
                                               : "never"));
       m_ready = false;
+     }
+
+   //+------------------------------------------------------------------+
+   //| PART 2 - pushed-fact ingress.                                     |
+   //|                                                                   |
+   //| The auditor cannot poll the trade path (it must not include a     |
+   //| trade module), so the two facts the order layer owns are PUSHED   |
+   //| in by otto.mq5 and read back inside AuditOrderHealth(). These are |
+   //| deliberately dumb ingress points: they record a counter and      |
+   //| return. They never dispatch -- escalating a single event is the   |
+   //| audit cycle's job -- and they never call RunAudit(), so the       |
+   //| "RunAudit runs exactly once, from OnTimer" contract still holds.  |
+   //+------------------------------------------------------------------+
+   void              NotifyOrderReject(int retcode, string context, int count = 1)
+     {
+      m_rejectCount += count;
+      if(EnableLogging)
+         Print("[HighTable] observed order reject | retcode=", retcode,
+               " | ", context, " | x", count, " | total=", m_rejectCount);
+     }
+
+   //| The ticket and retcode are both private to COttoOrderManager, so the
+   //| push from otto.mq5 carries its COUNTER DELTA and leaves them 0. The
+   //| count is what AuditOrderHealth escalates on; the identity of the
+   //| individual request is already in the order layer's own log.
+   void              NotifyStopModifyFailure(ulong ticket, int retcode, int count = 1)
+     {
+      m_stopModifyFailures += count;
+      if(EnableLogging)
+         Print("[HighTable] observed stop-modify failure | ticket=", ticket,
+               " | retcode=", retcode, " | x", count, " | total=", m_stopModifyFailures);
+     }
+
+   long              GetRejectsObserved(void)      const { return m_rejectCount; }
+   long              GetStopModifyFailures(void)   const { return m_stopModifyFailures; }
+
+   //+------------------------------------------------------------------+
+   //| Pushes the live drawdown anchors.                                 |
+   //|                                                                   |
+   //| otto.mq5 owns g_dailyResetBalance, g_equityHighWaterMark and      |
+   //| g_totalDD_Halted. Re-deriving them here from GlobalVariables would |
+   //| mean re-implementing otto.mq5's private "OTTO_<key>_<login>" key  |
+   //| format -- a second source of truth for the trailing floor, and    |
+   //| exactly the kind of silent divergence the decoupling contract is  |
+   //| meant to prevent. So the EA pushes the values it is actually      |
+   //| enforcing, and the auditor can never disagree with them.          |
+   //|                                                                   |
+   //| Called every OnTick, so it is intentionally trivial.              |
+   //+------------------------------------------------------------------+
+   void              SetSafetyBaseline(double dailyResetBalance, double equityHwm,
+                                       bool totalHalted)
+     {
+      m_dailyResetBalance = dailyResetBalance;
+      m_equityHwm         = equityHwm;
+      m_totalHalted       = totalHalted;
+      m_haveBaseline      = true;
+     }
+
+   //| Pushes the order layer's belief about the trade it is driving.      |
+   //|                                                                     |
+   //| The terminal's book is the authority on which positions EXIST. This |
+   //| is what the order layer thinks it is managing, and the two may       |
+   //| legitimately disagree for a tick around a fill or a close because    |
+   //| the manager reconciles on the following OnTick. That is why         |
+   //| AuditStateConsistency requires the divergence to repeat across two  |
+   //| consecutive audit cycles before it reports anything.                |
+   //+------------------------------------------------------------------+
+   void              SetTrackedLegs(int legs, ulong primaryTicket, bool active)
+     {
+      m_trackedLegs    = legs;
+      m_trackedPrimary = primaryTicket;
+      m_trackedActive  = active;
      }
 
    //+------------------------------------------------------------------+
@@ -285,39 +626,187 @@ public:
    datetime          GetLastAudit(void)        const { return m_lastAudit; }
 
    //+------------------------------------------------------------------+
-   //| PART 2 - observation slots.                                       |
+   //| PART 2 - the four observation bodies.                             |
    //|                                                                   |
-   //| Deliberately side-effect free stubs so the call graph, the latch  |
-   //| inventory and the dispatcher contract are final in this release.  |
-   //| Part 2 fills these bodies; it does not re-plumb the auditor.      |
+   //| Each body is self-contained, purely observational, and dispatches |
+   //| at most one LATCHED alert. The latch lifecycle is uniform: raise  |
+   //| while the violation is live, ClearLatch() the moment it reads     |
+   //| healthy again, so one incident produces exactly one email and the |
+   //| next incident emails again.                                       |
+   //|                                                                   |
+   //| Every threshold is the LIVE input, never a literal, and all three |
+   //| drawdown comparisons are in PERCENT units to match otto.mq5.      |
    //+------------------------------------------------------------------+
    void              AuditTrimHealth(void)
      {
-      // PART 2: on a 0.90% floating-loss breach, observe whether the smart
-      // trim actually closed a non-primary leg. If the breach is live and no
-      // leg was closed, the trim could not act -> DispatchAlertOnce(
-      // m_alertSent_TrimFailure, ...). Clear the latch when float recovers.
+      // The breach that arms the smart trim, read exactly as otto.mq5
+      // reads it (percent, against the live 0.90% cap).
+      double floatingLoss = FloatingLossPct();
+      if(floatingLoss < SafetyMaxFloatingLoss)
+        {
+         ClearLatch(m_alertSent_TrimFailure);
+         return;
+        }
+
+      // The cap is breached and otto.mq5 has run TrimHeavyLosers() on this
+      // very tick. Any non-primary leg still standing that the trim's own
+      // filter would have qualified is therefore a leg the trim TRIED and
+      // FAILED to close -- the whole point of the 0.90% cap is that those
+      // legs do not survive it.
+      int trimmable = CountTrimmableLegs(InpTrimLoserStopPct);
+      if(trimmable > 0)
+         DispatchAlertOnce(m_alertSent_TrimFailure,
+                           "HighTable: smart trim could not act",
+                           "Floating loss " + DoubleToString(floatingLoss, 2) +
+                           "% >= cap " + DoubleToString(SafetyMaxFloatingLoss, 2) +
+                           "% and " + IntegerToString(trimmable) +
+                           " non-primary leg(s) remain past " +
+                           DoubleToString(InpTrimLoserStopPct, 1) +
+                           "% of the way to their stop. The trim could not close them.");
+      else
+         ClearLatch(m_alertSent_TrimFailure);
      }
 
    void              AuditDrawdown(void)
      {
-      // PART 2: recompute daily / trailing-total / floating drawdown from
-      // ACCOUNT_EQUITY+BALANCE and latch each breach independently, clearing
-      // each latch once the corresponding measure is back inside limits.
+      // --- Floating-loss cap (no baseline needed: it is a balance/equity
+      //     ratio, readable on any tick, exactly as otto.mq5 reads it) ---
+      double floatingLoss = FloatingLossPct();
+      if(floatingLoss >= SafetyMaxFloatingLoss)
+         DispatchAlertOnce(m_alertSent_FloatingLossCap,
+                           "HighTable: floating-loss cap breached",
+                           "Floating loss " + DoubleToString(floatingLoss, 2) +
+                           "% >= " + DoubleToString(SafetyMaxFloatingLoss, 2) + "%");
+      else
+         ClearLatch(m_alertSent_FloatingLossCap);
+
+      // --- Permanent halt. PUSHED, because the halt flag can survive a
+      //     restart in a GlobalVariable and be set before OnTick ever
+      //     reaches the safety block. DELIBERATELY NEVER CLEARED: the halt
+      //     is permanent by design (otto.mq5 only ever sets it), so
+      //     re-arming this latch would be meaningless at best and a
+      //     misreport at worst. ---
+      if(m_totalHalted)
+         DispatchAlertOnce(m_alertSent_Halt,
+                           "HighTable: EA PERMANENTLY HALTED",
+                           "Total trailing drawdown halt is latched. The EA will not "
+                           "place or manage orders until it is manually re-armed.");
+
+      // The remaining two measures are meaningless without the trailing
+      // anchors, so a push that has not arrived yet is reported as nothing
+      // rather than as a breach of zero.
+      if(!m_haveBaseline) return;
+
+      // --- Daily soft breach: pauses new orders, clears at the session
+      //     rollover when otto.mq5 re-anchors g_dailyResetBalance, which
+      //     in turn drops this measure back under the limit and re-arms
+      //     the latch through the ClearLatch below. ---
+      double dailyDD = DailyDDPct();
+      if(dailyDD >= SafetyDailyDDLimit)
+         DispatchAlertOnce(m_alertSent_DailyDDBreach,
+                           "HighTable: daily drawdown limit breached",
+                           "Daily DD " + DoubleToString(dailyDD, 2) +
+                           "% >= " + DoubleToString(SafetyDailyDDLimit, 2) +
+                           "% - new orders paused");
+      else
+         ClearLatch(m_alertSent_DailyDDBreach);
+
+      // --- Total trailing hard breach. Like the halt, this one is NEVER
+      //     cleared: the trailing floor only ratchets down, so once the
+      //     breach is real it is terminal. Re-arming could only produce a
+      //     second email for the same permanent condition. ---
+      double totalDD = TotalDDPct();
+      if(totalDD >= SafetyTotalDDLimit)
+         DispatchAlertOnce(m_alertSent_TotalDDBreach,
+                           "HighTable: total trailing drawdown breached",
+                           "Total DD " + DoubleToString(totalDD, 2) +
+                           "% >= " + DoubleToString(SafetyTotalDDLimit, 2) + "%");
      }
 
    void              AuditOrderHealth(void)
      {
-      // PART 2: watch the broker reject burst and any position whose stop
-      // could not be modified, latching per incident rather than per tick.
+      // --- Broker reject BURST. A delta, not a lifetime total: the total
+      //     is monotonic, so comparing it against the value seen at the
+      //     previous cycle isolates the rejections that happened since.
+      //     One refusal is ordinary venue traffic; HT_REJECT_BURST or more
+      //     within a single cycle is the signature of a broken feed. ---
+      long rejectDelta = m_rejectCount - m_rejectSeenAtLastAudit;
+      m_rejectSeenAtLastAudit = m_rejectCount;
+
+      if(rejectDelta >= HT_REJECT_BURST)
+         DispatchAlertOnce(m_alertSent_OrderRejectSpike,
+                           "HighTable: broker reject burst",
+                           IntegerToString((int)rejectDelta) +
+                           " order(s) rejected since the last audit (threshold " +
+                           IntegerToString(HT_REJECT_BURST) + ").",
+                           HT_SEV_WARN);
+      else if(rejectDelta == 0)
+         ClearLatch(m_alertSent_OrderRejectSpike);
+
+      // --- Stop-modify failures. A stop that cannot be written is unmanaged
+      //     risk: the position is open with no live protection at the level
+      //     the trail believes it has. Same delta treatment as rejects. ---
+      long stopDelta = m_stopModifyFailures - m_stopModifySeen;
+      m_stopModifySeen = m_stopModifyFailures;
+
+      if(stopDelta > 0)
+         DispatchAlertOnce(m_alertSent_StopModifyFailure,
+                           "HighTable: stop-loss modify failed",
+                           IntegerToString((int)stopDelta) +
+                           " SL modify request(s) were rejected since the last audit.",
+                           HT_SEV_WARN);
+      else
+         ClearLatch(m_alertSent_StopModifyFailure);
      }
 
    void              AuditStateConsistency(void)
      {
-      // PART 2: cross-check the live position book against the tracked
-      // basket/active-trade view and alert once on divergence.
+      // The one fact the terminal cannot supply is which ticket the order
+      // layer believes it is trailing. otto.mq5 pushes that belief
+      // (m_activeTrade.ticket, via SetTrackedLegs). The book is the
+      // authority on existence, so a tracked primary that is NOT in the
+      // book means the trail and the trim are maintaining risk geometry
+      // against a ticket that is no longer there -- a phantom.
+      //
+      // The inverse is deliberately NOT alerted on: a book leg the order
+      // layer has not yet adopted is the normal one-tick hand-off while
+      // SyncActiveTrade() reconciles. Only the phantom direction is a real
+      // desync, and alerting on the other would email on every fill.
+      //
+      // Even the phantom is confirmed across TWO cycles, because
+      // CloseEntireBasket() leaves m_hasActiveTrade set until the caller's
+      // next sync (see COttoOrderManager.mqh:2137) -- so a one-cycle sighting
+      // is an artifact of the close path, not a desync.
+      int book = CountBookLegs();
+
+      bool phantom = m_trackedActive && m_trackedPrimary > 0 &&
+                     !BookHasTicket(m_trackedPrimary);
+
+      if(!phantom)
+        {
+         ClearLatch(m_alertSent_StateInconsistency);
+         m_stateSkewSeen = false;
+         return;
+        }
+
+      if(!m_stateSkewSeen)
+        {
+         // First sighting: remember it and wait one cycle to see whether
+         // it resolves on its own before calling it an incident.
+         m_stateSkewSeen = true;
+         return;
+        }
+
+      DispatchAlertOnce(m_alertSent_StateInconsistency,
+                        "HighTable: book/tracked state desync",
+                        "The order layer believes it is trailing ticket " +
+                        (string)m_trackedPrimary + " (basket holds " +
+                        IntegerToString(m_trackedLegs) + " leg(s)) but the terminal " +
+                        "book holds " + IntegerToString(book) + " leg(s) for " +
+                        m_symbol + " magic " + IntegerToString(m_magic) +
+                        " and that ticket is not among them. Divergence " +
+                        "persisted across an audit cycle - the trail and trim " +
+                        "are acting on a phantom position.");
      }
   };
 #endif  // __OTTO_HIGH_TABLE_AUDITOR__
-
-   bool              m_alertSent_StateInconsistency; // book vs tracked state
