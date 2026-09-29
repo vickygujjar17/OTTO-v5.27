@@ -88,7 +88,8 @@ Copy-Item (Join-Path $Source "*.mq5") $experts  -Force
 #    therefore excluded from the framework mirror.
 $ottoNames = @("OttoDefines", "COttoNewsFilter", "COttoRiskManager",
                "COttoMarketStructure", "COttoBlockManager", "COttoOrderManager",
-               "COttoCorrelationFilter", "COttoTradeManager", "COttoJournal")
+               "COttoCorrelationFilter", "COttoTradeManager", "COttoJournal",
+               "CHighTableAuditor")
 $skipNames = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
 [void]$skipNames.Add("Otto")
 foreach ($n in $ottoNames) { [void]$skipNames.Add("$n.mqh") }
@@ -124,10 +125,11 @@ if (-not (Test-Path $entryPath)) {
     exit 2
 }
 
-# Hard guarantee: all 10 OTTO sources must be present in the staging tree.
+# Hard guarantee: all 11 OTTO sources must be present in the staging tree.
 $expectedOtto = @("OttoDefines", "COttoNewsFilter", "COttoRiskManager",
                   "COttoMarketStructure", "COttoBlockManager", "COttoOrderManager",
-                  "COttoCorrelationFilter", "COttoTradeManager", "COttoJournal")
+                  "COttoCorrelationFilter", "COttoTradeManager", "COttoJournal",
+                  "CHighTableAuditor")
 $missingStage = @()
 foreach ($m in $expectedOtto) {
     if (-not (Test-Path (Join-Path $includes "$m.mqh"))) { $missingStage += "$m.mqh" }
@@ -210,7 +212,8 @@ $lines = $text -split "`r?`n" | ForEach-Object { $_.TrimEnd("`r") }
 
 $ottoModules = @("OttoDefines", "COttoNewsFilter", "COttoRiskManager",
                  "COttoMarketStructure", "COttoBlockManager", "COttoOrderManager",
-                 "COttoCorrelationFilter", "COttoTradeManager", "COttoJournal")
+                 "COttoCorrelationFilter", "COttoTradeManager", "COttoJournal",
+                 "CHighTableAuditor")
 $linkedFromStage = @{}
 foreach ($line in $lines) {
     if ($line -match "including\s+(.+\.mqh)\s*$") {

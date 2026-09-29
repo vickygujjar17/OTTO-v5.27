@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                       OttoEA.mq5 |
 //|                    OTTO — Goat Funded Trader (GFT) Master Build    |
-//|                    Pine Script Master Build Port (v5.31)            |
+//|                    Pine Script Master Build Port (v5.32)            |
 //|                                    Institutional / Real-Money    |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.31"
+#property version   "5.32"
 #property description "OTTO EA â€” Goat Funded Trader (GFT) Master Build"
 #property description "Separation | Sizing | Front-Run | Near-Miss | Stale vetoes"
 #property description "Modules: News Shield | Risk | Block Manager | Order Mgmt | Trail"
@@ -24,6 +24,7 @@
 #include <Otto/COttoCorrelationFilter.mqh>
 #include <Otto/COttoTradeManager.mqh>
 #include <Otto/COttoJournal.mqh>
+#include <Otto/CHighTableAuditor.mqh>
 
 //+------------------------------------------------------------------+
 //| Global Module Instances                                           |
@@ -36,6 +37,7 @@ COttoOrderManager      g_orderManager;
 COttoCorrelationFilter g_correlationFilter;
 COttoTradeManager      g_tradeManager;
 COttoJournal           g_journal;
+CHighTableAuditor      g_highTable;
 
 //+------------------------------------------------------------------+
 //| Global State                                                      |
@@ -169,7 +171,7 @@ int OnInit(void)
    g_symbol = _Symbol;
 
    Print("==============================================================");
-   Print("  OTTO EA v5.31 — 28-Pair Institutional Master Build — INITIALIZING");
+   Print("  OTTO EA v5.32 — 28-Pair Institutional Master Build — INITIALIZING");
    Print("  Symbol: ", g_symbol, " | Magic: ", MagicNumber);
    Print("==============================================================");
 
@@ -275,6 +277,21 @@ int OnInit(void)
       return INIT_FAILED;
      }
    Print("[INIT] Trade Manager OK");
+
+   // --- High Table watchdog -----------------------------------------
+   // A separate timer is registered for the audit so the watchdog is not
+   // hostage to OnTick: if the trade loop halts (total-DD halt), pauses
+   // (daily-DD pause) or simply receives no ticks, High Table still runs
+   // and can still report the condition that stopped everything else.
+   if(InpEnableHighTable)
+     {
+      g_highTable.Initialize(g_symbol, MagicNumber);
+      int secs = (InpHighTableAuditSeconds < 1) ? 1 : InpHighTableAuditSeconds;
+      EventSetTimer(secs);
+      Print("[INIT] High Table OK | audit cadence: ", secs, "s");
+     }
+   else
+      Print("[INIT] High Table DISABLED by input");
 
    // --- Prop firm safety state: PERSISTENT MEMORY (v5.25) ---
    // FIX (v5.25): these baselines are loaded from MT5 GlobalVariables and only
@@ -437,6 +454,13 @@ void OnDeinit(const int reason)
       Print("  Cancelling ", pending, " pending orders...");
       g_orderManager.CancelAllPendingOrders();
      }
+
+   // --- High Table watchdog -----------------------------------------
+   // The timer MUST be killed here: OnDeinit runs on every parameter
+   // change, timeframe switch and recompile, and leaving the timer alive
+   // would stack a new cadence on top of the old one each re-init.
+   EventKillTimer();
+   g_highTable.Deinit();
 
    // Close log file
    if(g_fileHandle != INVALID_HANDLE)
@@ -977,3 +1001,20 @@ void OnTrade(void)
    if(g_initialized)
       g_orderManager.SyncActiveTrade();
   }
+
+//+------------------------------------------------------------------+
+//| OnTimer - High Table watchdog cadence                             |
+//|                                                                   |
+//| Deliberately OUTSIDE the OnTick guard chain: OnTick returns early |
+//| when the EA is halted or daily-paused, and those are precisely the |
+//| states that most need to be reported. RunAudit() reads terminal    |
+//| state only and holds no reference to any trade module, so it can   |
+//| run while the trade loop is stopped without touching it.           |
+//+------------------------------------------------------------------+
+void OnTimer(void)
+  {
+   if(!g_initialized) return;
+   if(!InpEnableHighTable) return;
+   g_highTable.RunAudit();
+  }
+

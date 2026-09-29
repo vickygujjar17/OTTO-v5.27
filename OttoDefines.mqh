@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.31 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.32 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.31"
-#property description "OTTO v5.31 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.32"
+#property description "OTTO v5.32 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -351,6 +351,16 @@ input double   InpConsensusVetoThreshold = 50.0; // |consensus| % to veto/cancel
 input bool     InpUseExternalAnchors = true;   // Factor untraded DXY / XAUUSD macro anchors
 input int      InpAnchorTF           = PERIOD_M15; // Anchor candle timeframe (M15 default)
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
+
+input group "══════════════════════════════════════════════════"
+input group "  [10] HIGH TABLE AUDITOR — v5.32"
+input group "══════════════════════════════════════════════════"
+// Decoupled watchdog: audits live state on its OWN timer cadence rather
+// than inside OnTick, so a halted / paused / tick-starved trade loop can
+// never silence it. Evidence goes to Otto_HighTable_Audit.csv and alerts
+// are emailed (outside the Strategy Tester, where SendMail is inert).
+input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
+input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
 
 //+------------------------------------------------------------------+
 //| Global Constants                                                 |

@@ -1,7 +1,7 @@
 # OTTO EA
 
 MetaTrader 5 Expert Advisor — MQL5 port of the Pine Script `prop_guard_tester.pine`
-master build. **Current base: v5.31**
+master build. **Current base: v5.32**
 
 ## Layout
 
@@ -16,6 +16,7 @@ master build. **Current base: v5.31**
 | `COttoCorrelationFilter.mqh` | Cross-symbol correlation veto |
 | `COttoTradeManager.mqh` | Cut / cost-BE / lock3 / ATR trail / pyramiding |
 | `COttoJournal.mqh` | Human-readable trade journal |
+| `CHighTableAuditor.mqh` | "High Table" decoupled watchdog: CSV audit trail + latched email alerts |
 | `otto.mq5` | EA entry point and event handlers |
 
 ## Build (strict gate)
