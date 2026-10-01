@@ -358,7 +358,7 @@ input group "══════════════════════�
 input bool     InpEnableVectorEngine = true;   // Enable currency-vector consensus layer
 input double   InpConsensusVetoThreshold = 50.0; // |consensus| % to veto/cancel opposing orders
 input bool     InpUseExternalAnchors = true;   // Factor untraded DXY / XAUUSD macro anchors
-input int      InpAnchorTF           = PERIOD_M15; // Anchor candle timeframe (M15 default)
+input int      InpAnchorTF           = PERIOD_H1;  // Anchor candle timeframe (H1 default)
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
 
 input group "══════════════════════════════════════════════════"
