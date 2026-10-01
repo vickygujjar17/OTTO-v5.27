@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.32 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.33 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.32"
-#property description "OTTO v5.32 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.33"
+#property description "OTTO v5.33 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -164,6 +164,15 @@ struct SActiveTrade
    datetime          openTime;
    double            lotSize;
    int               sourceBlockSerial;
+   // v5.33: TRUE when this record describes a MAGIC-0 position the operator
+   // opened by hand and the EA adopted. It exists so the adoption path stays
+   // attributable (the journal, the console and the High Table auditor can all
+   // say WHY this basket looks unlike a normal one) and so the auditor's
+   // magic-scoped phantom test can be told to stand down for this ticket. The
+   // field is a plain bool: every EA-originated seed leaves it false, either
+   // because ZeroMemory() cleared it with the rest of the struct or because
+   // SeedActiveTradeFromBlock() sets it explicitly.
+   bool              adoptedManual;
   };
 
 // Pyramid tranche — a single scaling-in market position within a basket
@@ -341,7 +350,7 @@ input double   SafetyMaxFloatingLoss = 0.90;  // Hard cap: smart-trim at this % 
 input double   InpTrimLoserStopPct = 70.0;    // Smart trim: non-primary legs >= this % toward SL
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.32"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.33"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart
@@ -353,7 +362,7 @@ input int      InpAnchorTF           = PERIOD_M15; // Anchor candle timeframe (M
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
 
 input group "══════════════════════════════════════════════════"
-input group "  [10] HIGH TABLE AUDITOR — v5.32"
+input group "  [10] HIGH TABLE AUDITOR — v5.33"
 input group "══════════════════════════════════════════════════"
 // Decoupled watchdog: audits live state on its OWN timer cadence rather
 // than inside OnTick, so a halted / paused / tick-starved trade loop can
@@ -361,6 +370,22 @@ input group "══════════════════════�
 // are emailed (outside the Strategy Tester, where SendMail is inert).
 input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
 input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
+
+input group "══════════════════════════════════════════════════"
+input group "  [11] MANUAL TRADE ADOPTION — v5.33"
+input group "══════════════════════════════════════════════════"
+// Let this EA manage positions opened BY HAND on its own chart symbol.
+// A manual position is identified as a MAGIC-0 position on m_symbol: the
+// operator's terminal is the only source that assigns magic 0, so another
+// EA (which always stamps its own non-zero id) can never be captured.
+// Adoption is REFUSED unless the position already carries a stop-loss --
+// the basket's 1R is derived from the live stop, so inventing one would
+// fabricate the entire risk geometry (and every RR milestone with it).
+// The High Table auditor's book-vs-tracked test is deliberately
+// magic-scoped, so the adopted ticket is handed to it explicitly; see
+// SetTrackedLegs() in CHighTableAuditor.mqh.
+input bool     InpAdoptManualTrades     = true;  // Adopt magic-0 manual positions into the basket
+input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual leg with no SL (minutes)
 
 //+------------------------------------------------------------------+
 //| Global Constants                                                 |

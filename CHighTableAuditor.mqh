@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.32"
+#property version   "5.33"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -130,7 +130,9 @@ private:
    int               m_trackedLegs;          // legs the order layer believes are open
    ulong             m_trackedPrimary;       // ticket the trail believes it manages
    bool              m_trackedActive;        // m_hasActiveTrade, as pushed
+   bool              m_trackedAdopted;       // primary is an ADOPTED magic-0 manual leg (v5.33)
    bool              m_stateSkewSeen;        // divergence seen once, awaiting confirm
+   bool              m_adoptionSeen;         // adoption INFO already dispatched (v5.33)
 
    //+------------------------------------------------------------------+
    //| CSV field sanitizer.                                              |
@@ -232,6 +234,33 @@ private:
          if(PositionGetTicket(idx) != ticket) continue;
          if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
          if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
+         return true;
+        }
+      return false;
+     }
+
+   //+------------------------------------------------------------------+
+   //| Is a given ticket present in the terminal book, IGNORING magic?   |
+   //|                                                                   |
+   //| v5.33: used ONLY for a primary the order layer adopted from a     |
+   //| magic-0 manual position. BookHasTicket() remains the correct test |
+   //| for every EA-originated leg, but it cannot express the adopted    |
+   //| case: it requires POSITION_MAGIC == m_magic, so an adopted leg    |
+   //| would fail it forever and the watchdog would report a desync for  |
+   //| the entire life of a perfectly healthy trade. This variant answers |
+   //| the only question that is meaningful for an adopted ticket -- does |
+   //| the position still EXIST on this symbol? -- and is deliberately    |
+   //| not used anywhere else, because dropping the magic filter globally |
+   //| would let an unrelated manual or foreign-EA leg satisfy the EA's   |
+   //| own book test.                                                    |
+   //+------------------------------------------------------------------+
+   bool              AdoptedTicketInBook(const ulong ticket) const
+     {
+      if(ticket == 0) return false;
+      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
+        {
+         if(PositionGetTicket(idx) != ticket) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
          return true;
         }
       return false;
@@ -405,7 +434,9 @@ public:
       m_trackedLegs            = 0;
       m_trackedPrimary         = 0;
       m_trackedActive          = false;
+      m_trackedAdopted         = false;
       m_stateSkewSeen          = false;
+      m_adoptionSeen           = false;
       m_dailyResetBalance      = 0.0;
       m_equityHwm              = 0.0;
       m_totalHalted            = false;
@@ -509,12 +540,44 @@ public:
    //| the manager reconciles on the following OnTick. That is why         |
    //| AuditStateConsistency requires the divergence to repeat across two  |
    //| consecutive audit cycles before it reports anything.                |
+   //|                                                                     |
+   //| v5.33 adoptsManual: TRUE when the primary is a magic-0 position the  |
+   //| operator opened by hand and the order layer adopted. This matters    |
+   //| because EVERY book read in this class is magic-scoped -- see         |
+   //| CountBookLegs(), BookHasTicket() and CountTrimmableLegs(), each of   |
+   //| which requires POSITION_MAGIC == m_magic. An adopted leg carries     |
+   //| magic 0, so it is invisible to all three by construction. The flag   |
+   //| is therefore the ONLY way the phantom test can distinguish "the      |
+   //| trail is managing a ticket that no longer exists" from "the trail is |
+   //| managing a live manual leg the book is not allowed to count".        |
+   //| Suppressing the alert when adopted is strictly the safe direction:   |
+   //| the manager's own IsTrackedTicketOpen() still sees the leg every     |
+   //| tick (it accepts an adopted ticket explicitly), so a genuinely        |
+   //| phantom adopted ticket is caught by the order layer and logged       |
+   //| there, while this watchdog stays silent on a healthy adoption.       |
+   //| The magic-scoped counts are deliberately NOT widened: their alert   |
+   //| text names m_magic, and folding foreign magic-0 legs into them would |
+   //| be a silent redefinition of what the message claims to measure.      |
    //+------------------------------------------------------------------+
-   void              SetTrackedLegs(int legs, ulong primaryTicket, bool active)
+   void              SetTrackedLegs(int legs, ulong primaryTicket, bool active,
+                                    bool adoptedManual = false)
      {
       m_trackedLegs    = legs;
       m_trackedPrimary = primaryTicket;
       m_trackedActive  = active;
+      m_trackedAdopted = adoptedManual;
+      // One INFO per adoption, so the audit trail states WHY the book count
+      // and the tracked count are allowed to disagree -- but latched, so a
+      // long-lived adopted position does not email on every cycle.
+      if(adoptedManual && !m_adoptionSeen)
+        {
+         m_adoptionSeen = true;
+         Print("[HighTable] note: tracked primary ", primaryTicket,
+               " is an ADOPTED manual (magic-0) leg -- book/tracked",
+               " divergence class suppressed for this ticket");
+        }
+      else if(!adoptedManual)
+         m_adoptionSeen = false;
      }
 
    //+------------------------------------------------------------------+
@@ -779,8 +842,23 @@ public:
       // is an artifact of the close path, not a desync.
       int book = CountBookLegs();
 
+      // ---- v5.33: the ADOPTED (magic-0) primary ------------------------
+      // BookHasTicket() demands POSITION_MAGIC == m_magic, so for a primary
+      // the order layer adopted from a manual position it can only ever
+      // answer false: it is not evidence of anything. An adopted leg is
+      // alive exactly when a position carrying that ticket is present on
+      // this symbol, whatever its magic. So the presence TEST is swapped
+      // rather than the alert suppressed -- a vanished adopted ticket still
+      // escalates through the same two-cycle confirmation and the same
+      // latch. Note this state is only reachable through a one-tick race
+      // (SyncActiveTrade clears m_hasActiveTrade on the following tick),
+      // which is precisely the window the magic-scoped test also guards.
+      bool adopted = m_trackedAdopted;
+      bool present = adopted ? AdoptedTicketInBook(m_trackedPrimary)
+                             : BookHasTicket(m_trackedPrimary);
+
       bool phantom = m_trackedActive && m_trackedPrimary > 0 &&
-                     !BookHasTicket(m_trackedPrimary);
+                     !present;
 
       if(!phantom)
         {
@@ -806,7 +884,19 @@ public:
                         m_symbol + " magic " + IntegerToString(m_magic) +
                         " and that ticket is not among them. Divergence " +
                         "persisted across an audit cycle - the trail and trim " +
-                        "are acting on a phantom position.");
+                        "are acting on a phantom position." +
+                        // v5.33: an adopted primary is absent from the
+                        // magic-scoped count above BY CONSTRUCTION, so the
+                        // evidence line names that reason explicitly. Without
+                        // it the two numbers in this alert read as a bug in
+                        // the adoption path when they are in fact the expected
+                        // shape of one.
+                        (adopted ? " NOTE: the tracked primary was ADOPTED from a"
+                                   " magic-0 manual position (-MAN basket), so it"
+                                   " is not counted in the magic-scoped book"
+                                   " total above; the ticket itself is gone from"
+                                   " the symbol book."
+                                 : ""));
      }
   };
 #endif  // __OTTO_HIGH_TABLE_AUDITOR__

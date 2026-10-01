@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.32"
+#property version   "5.33"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -200,6 +200,38 @@ public:
       if(!OpenAppend()) return;
       W("  [PYRAMID] Tranche " + IntegerToString(tranche) + " | T#" + IntegerToString((int)ticket) + " | Price=" + FmtPrice(entry) + " | Lots=" + DoubleToString(size,2) + " | Risk=" + DoubleToString(riskPct,2) + "%");
       W("  Unified Group SL  : " + FmtPrice(groupSL));
+      CloseHandle();
+     }
+
+   // v5.33 -- MANUAL TRADE ADOPTION record.
+   // Self-contained by design: the generic logging entry point takes an
+   // SSniperBlock&, and an adopted hand-opened position has no Pine block
+   // behind it -- there is no block to pass and no block fields to print.
+   // This mirrors LogPyramid()'s shape instead: append to the session file.
+   void              LogManualAdoption(ulong ticket, ENUM_TRADE_DIRECTION dir,
+                                       double entry, double sl, double lot, double slDistance)
+     {
+      if(!m_ready) return;
+      if(!OpenAppend())
+        {
+         if(!OpenWrite()) return;   // no file yet -> create it
+        }
+      double pt     = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+      double slPips = (pt > 0.0) ? (slDistance / (pt * 10.0)) : 0.0;
+      W("================================================================");
+      W("[MANUAL ADOPTION] Session " + m_sessionID + " | " + m_symbol +
+        " | " + TimeToString(TimeCurrent()));
+      W("  Origin            : Hand-opened position (magic 0) taken over by the EA");
+      W("  Ticket            : #" + IntegerToString((int)ticket));
+      W("  Direction         : " + (dir == DIR_LONG ? "BUY / LONG" : "SELL / SHORT"));
+      W("  Entry Price       : " + FmtPrice(entry));
+      W("  Working Stop      : " + FmtPrice(sl));
+      W("  Initial Risk (1R) : " + FmtPrice(slDistance) +
+        "  (" + DoubleToString(slPips, 1) + " pips)");
+      W("  Volume            : " + DoubleToString(lot, 2) + " lots");
+      W("  NOTE              : trail, ladder, trim, DD halt and the basket");
+      W("                      close all now apply to this ticket.");
+      W("================================================================");
       CloseHandle();
      }
 

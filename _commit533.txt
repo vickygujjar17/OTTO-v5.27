@@ -1,0 +1,206 @@
+v5.33: adopt hand-opened magic-0 positions into the basket (InpAdoptManualTrades)
+
+New feature: the EA can take over a position the OPERATOR opened by hand on
+its OWN chart symbol and manage it with the whole basket machinery - the
+unified trail, the milestone ladder, the pyramid rungs, the smart trim, the
+drawdown halt, the close-all and the journal. No new module: the feature is
+a new public entry point in COttoOrderManager, one widened presence
+predicate, one boolean on SActiveTrade and one flag through the auditor.
+
+THE IDENTIFIER: magic 0 AND this symbol
+
+MT5 assigns magic 0 only to positions submitted from the terminal's own
+New Order dialog; every EA stamps its own id. So "magic 0 on m_symbol" is
+the operator's hand and nothing else's - the same discriminator
+COttoCorrelationFilter already uses to recognise external gold. Both halves
+are load-bearing and both are asserted: dropping the magic test would adopt
+a SECOND EA's leg on this chart, dropping the symbol test would adopt a
+hand trade on an unrelated pair.
+
+Oldest-wins with POSITION_TIME as the tie-break, so a second hand-opened leg
+is not adopted into a basket that already has a primary.
+
+THE STOP IS MANDATORY
+
+The basket's 1R is |entry - SL|: the milestone ladder, the pyramid rung
+sizing and the smart trim are ALL expressed as multiples of it. A stopless
+manual position has no 1R to inherit, and inventing one (an ATR guess, say)
+would fabricate the risk geometry and every RR derived from it. So a
+position with POSITION_SL <= 0.0, or a zero-width stop, is REFUSED - and
+EVERY refusal is logged. A silent non-adoption is indistinguishable from
+"no manual trade present", which is the one state the operator does not need
+help believing.
+
+A stopless leg is re-tested every tick, so the refusal notice is THROTTLED
+by InpManualNoSLWarnMinutes rather than printed once per tick: an
+unthrottled Print here is thousands of identical lines an hour. A
+non-positive cadence falls back to 5 minutes via a ternary rather than
+silencing the notice, so a bad input degrades to noisy-but-visible instead
+of silent.
+
+THE ONE-BASKET GATE
+
+Adoption is refused while the EA already owns an open position, a live
+basket or a resting limit order. Adopting a hand-opened leg on top of a
+running trade would give the unified stop TWO primaries, and the unified
+ratchet is one-way, so the damage could not be undone by a later tick. The
+news shield and the macro veto are consulted for a manual leg exactly as for
+an EA one - adopting around them would make the adoption path the hole in
+the risk envelope - and a reversal in flight is refused outright, because
+the basket is being torn down and rebuilt around an opposing fill.
+
+THE BLIND SPOTS: three sites, and NO more
+
+Every magic-scoped site in the order layer answers "is this leg still
+mine?". An adopted leg carries magic 0, so every one of them answers NO,
+and each is a place the adoption would silently un-happen on the next tick.
+Exactly THREE sites are widened, each to its own local answer, and the flag
+that authorises the widening is set only inside AdoptManualPosition():
+
+  1. IsTrackedTicketOpen(). The original "magic == MagicNumber" test can
+     never pass for an adopted leg, so SyncActiveTrade() would read the
+     adoption as CLOSED on the very next tick, log the trade out and wipe
+     the basket. It now accepts magic 0 IF AND ONLY IF the primary is an
+     adopted manual leg. This is safe where a blanket relaxation would not
+     be: the predicate is only ever applied to the ticket the EA has
+     ALREADY decided to manage (m_activeTrade.ticket) and it still demands
+     this symbol.
+
+  2. The ghost-remnant branch of SyncActiveTrade(), via a new
+     TrackedBasketStillOpen(). The branch asks "the primary is gone - are
+     its tranches still alive?" using CountMyPositions(), which is
+     magic-scoped and therefore cannot see an adopted survivor. Without the
+     new test the branch is skipped, branch 3 finds no magic-numbered
+     position either, and a still-open adopted leg is declared a FLAT EXIT
+     with its basket wiped. TrackedBasketStillOpen() is deliberately not
+     IsBasketFullyClosed(): that predicate returns false for an EMPTY
+     basket (the opposite of what is needed here) and reads
+     PositionSelectByTicket() without re-checking the symbol, so a recycled
+     ticket number could satisfy it.
+
+  3. The adoption path itself.
+
+DELIBERATELY NOT WIDENED: FindActivePosition, CountMyPositions,
+CountMyPendingOrders, CountBookLegs and BookHasTicket. These answer "any of
+OUR legs", and teaching them magic 0 turns that into "any of the operator's
+hand trades": FindActivePosition would hand the basket machinery a stranger's
+position on the very next restart, and CountBookLegs would silently redefine
+what the auditor's alert text claims to measure. The probe asserts all five
+stay flag-blind.
+
+CloseEntireBasket needs NO widening, and that is the point of the design:
+the basket array IS the ownership proof. Step 1 closes m_basket[] tickets
+with NO magic filter at all - so an adopted leg is already closable - and
+step 2's orphan sweep STAYS magic-scoped, or a force-close would start
+sweeping the operator's unrelated hand trades off the symbol.
+
+OWNERSHIP IS IMPLICIT, so no request is ever sent TO the magic-0 ticket to
+CLAIM it. The only requests that touch it are SLTP and close, both of which
+address the position by ticket; request.magic is documented as an
+"Expert Advisor ID ... it allows organizing analytical processing of trade
+orders" and is not a match key for TRADE_ACTION_SLTP or position close
+(it is not in either action's required-field list). The one live-venue check
+this reasoning rests on is recorded in the release notes for the operator.
+
+THE AUDITOR FIX IS A SWAP, NOT A MUTE
+
+The High Table watchdog compares the manager's BELIEF against the terminal
+book, and both halves of that test are deliberately magic-scoped:
+CountBookLegs() and BookHasTicket() look only at positions carrying m_magic,
+so an adopted primary is invisible to the phantom test BY CONSTRUCTION. Left
+alone, the auditor would latch its two-cycle "book/tracked state desync"
+alert for the ENTIRE LIFE of the adopted trade: a false CRITICAL in the
+loudest channel the EA owns, which in turn trains the operator to ignore it.
+
+The fix is a SWAP, not a muting:
+
+    present = adopted ? AdoptedTicketInBook(m_trackedPrimary)
+                      : BookHasTicket(m_trackedPrimary);
+
+AdoptedTicketInBook() answers the only question that is meaningful for an
+adopted ticket - does the position still EXIST on this symbol? - and is used
+in exactly ONE place. BookHasTicket() keeps its magic filter and keeps
+guarding every EA-originated leg; CountBookLegs() keeps its magic filter, so
+the count in the alert text still means what it says. Muting the alert
+instead would have thrown away the watchdog for the normal case it exists
+for, and widening BookHasTicket() would have replaced the magic-scoped test
+for every leg.
+
+The flag is read off the manager's record (active.adoptedManual) rather than
+re-derived from POSITION_MAGIC in otto.mq5, so the book is still read in
+exactly one place. The admitted deviation is a LOUD ONE-SHOT INFO, latched
+with m_adoptionSeen and RE-ARMED when the tracked trade stops being an
+adoption, so a second adoption is announced rather than swallowed by the
+first one's latch.
+
+THE LIFECYCLE
+
+The flag has to die with the basket. ClearBasket() clears it, Initialize()
+resets it (and the warn throttle), and an EA-originated seed clears it
+explicitly in SeedActiveTradeFromBlock() rather than relying on ZeroMemory(),
+because SActiveTrade is REUSED across baskets on one instance and a leftover
+true would make the auditor stand down its phantom test for a normal trade.
+
+ORDERING
+
+AdoptManualPosition() runs LAST in Update(), after the pending-fill sweep
+and after CompleteReversal(). That ordering is an invariant, not a style
+choice: an EA fill detected in the same tick must become the primary FIRST,
+so the one-basket gate then refuses the manual leg rather than the adoption
+winning the race and the fill then overwriting the basket geometry. Risk is
+recomputed before the record is published, and m_adoptedManual is set AFTER
+InitBasket() so the seed path's own reset cannot clear the flag it was just
+handed.
+
+JOURNAL
+
+LogManualAdoption() is self-contained by design: the generic logging entry
+point takes an SSniperBlock&, and a hand-opened position has no Pine block
+behind it - there is no block to pass and no block fields to print. It
+mirrors LogPyramid()'s shape instead. The 1R it prints is the SAME
+slDistance the manager seeded (the pip figure beside it is derived FROM that
+distance, behind a positive point-size guard), because an adoption record
+that states a different risk from the one the basket is running on is worse
+than no record at all. It names the magic-0 origin and states in the record
+that the whole basket machinery now applies to the ticket.
+
+INPUTS (new group [11])
+
+  InpAdoptManualTrades     = true   // Adopt magic-0 manual positions into the basket
+  InpManualNoSLWarnMinutes = 5      // Re-warn cadence for a manual leg with no SL
+
+Group headers [9] and [10] keep their historical stamps only if untouched;
+both are bumped here because both are release-stamped banners in this
+release's family, which the probe pins.
+
+VALIDATION
+
+  * build_check.ps1 - 0 errors / 0 warnings, headers verified from the
+    staging tree, 11 sources staged.
+  * _probe/test_v533_adoptmanual.py - new static probe, 230 checks: the
+    identifier (both halves), the mandatory stop and its throttle, every
+    gate refusal, the three widened sites AND the five that must stay blind,
+    the auditor swap/latch/re-arm semantics, the journal 1R provenance, the
+    lifecycle resets, the Update() ordering invariant and the release stamps.
+  * _probe/_mutate_v533_adoptmanual.py - mutation harness. Each
+    load-bearing assertion is attacked with a targeted regression of the
+    SHIPPED sources and the probe must go RED: 54 mutations, 54 caught, 0
+    anchors skipped, tree restored in a finally block. Ordering mutants
+    (moving a call rewrites callee and caller in one edit) are expressed as
+    tuple mutations - one anchor list, one matching replacement list,
+    applied in sequence to the same working copy.
+  * verify_integrity.py - strict CRLF, bareLF=0 bareCR=0, no new mojibake.
+  * check_deploy_drift.py - deployed terminal headers in sync with the repo.
+
+OPERATOR NOTE: the adopted ticket is driven by requests addressed to it BY
+TICKET (TRADE_ACTION_SLTP and a position close), which do not match on
+magic. Before the first live adoption on a new venue, confirm on DEMO that
+the venue accepts a stop modification for a magic-0 position - some brokers
+apply their own policy to manually-opened tickets independent of the EA.
+
+Version bumped 5.32 -> 5.33 in all 10 sources plus the README base line, the
+#property version / description pair in OttoDefines.mqh, the startup banner
+in otto.mq5, the Pine port banner and BOTH versioned input-group banners
+([9] and [10]). Historical FIX (v5.2x) annotations are preserved and
+excluded from the bump pattern by _tools/_bump533.py, which skips any line
+containing "FIX (".

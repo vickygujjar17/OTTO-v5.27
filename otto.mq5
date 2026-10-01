@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                       OttoEA.mq5 |
 //|                    OTTO — Goat Funded Trader (GFT) Master Build    |
-//|                    Pine Script Master Build Port (v5.32)            |
+//|                    Pine Script Master Build Port (v5.33)            |
 //|                                    Institutional / Real-Money    |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.32"
+#property version   "5.33"
 #property description "OTTO EA â€” Goat Funded Trader (GFT) Master Build"
 #property description "Separation | Sizing | Front-Run | Near-Miss | Stale vetoes"
 #property description "Modules: News Shield | Risk | Block Manager | Order Mgmt | Trail"
@@ -182,7 +182,7 @@ int OnInit(void)
    g_symbol = _Symbol;
 
    Print("==============================================================");
-   Print("  OTTO EA v5.32 — 28-Pair Institutional Master Build — INITIALIZING");
+   Print("  OTTO EA v5.33 — 28-Pair Institutional Master Build — INITIALIZING");
    Print("  Symbol: ", g_symbol, " | Magic: ", MagicNumber);
    Print("==============================================================");
 
@@ -1092,10 +1092,26 @@ void HighTablePushFacts(void)
    // purpose: the point of the check is to compare the manager's BELIEF
    // against reality, so both halves must come from independent sources.
    SActiveTrade active;
-   ulong ticket = 0;
+   ulong ticket  = 0;
+   bool  adopted = false;
    if(g_orderManager.GetActiveTradeRef(active))
+     {
       ticket = active.ticket;
+      // v5.33: tell the auditor when the tracked primary is an ADOPTED
+      // manual (magic-0) leg. The auditor's book-vs-tracked test is
+      // intentionally magic-scoped -- CountBookLegs() and BookHasTicket()
+      // both look only at positions carrying m_magic -- so an adopted
+      // primary is invisible to it BY CONSTRUCTION. Without this flag the
+      // auditor would latch its two-cycle "book/tracked state desync"
+      // alert for the entire life of the adopted trade: a false CRITICAL
+      // in the loudest channel the EA owns, which would in turn train the
+      // operator to ignore it. The flag is read from the manager rather
+      // than re-derived from POSITION_MAGIC here so the book is still read
+      // in exactly one place.
+      adopted = active.adoptedManual;
+     }
    g_highTable.SetTrackedLegs(g_orderManager.CountOpenPositions(),
-                              ticket, g_orderManager.HasActiveTrade());
+                              ticket, g_orderManager.HasActiveTrade(),
+                              adopted);
   }
 

@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.32"
+#property version   "5.33"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -36,6 +36,15 @@ private:
    SActiveTrade            m_activeTrade;
    bool                    m_hasActiveTrade;
    ENUM_TRADE_DIRECTION    m_activeDirection;
+   //| v5.33 adoption state. m_adoptedManual marks the tracked primary as a
+   //| MAGIC-0 position the operator opened by hand; it is mirrored onto
+   //| m_activeTrade.adoptedManual for the journal and pushed to the High Table
+   //| auditor through otto.mq5. m_manualNoSLWarnTick throttles the "manual leg
+   //| has no stop" notice: a position without an SL is refused every tick, and
+   //| an unthrottled Print would flood the log with the same refusal thousands
+   //| of times an hour.
+   bool                    m_adoptedManual;
+   datetime                m_manualNoSLWarnTick;
 
    // --- Pending limit order tracking ---
    ulong                   m_pendingLimitTickets[];
@@ -1318,6 +1327,12 @@ private:
       m_activeTrade.openTime     = (datetime)PositionGetInteger(POSITION_TIME);
       m_activeTrade.trailStep    = STEP_NONE;
       m_activeTrade.sourceBlockSerial = block.serial;
+      // v5.33: an EA-originated seed is never an adopted manual leg. Set
+      // explicitly rather than relying on ZeroMemory(), because this struct is
+      // reused across baskets on this instance and a leftover true would make
+      // the High Table auditor stand down its phantom test for a normal trade.
+      m_activeTrade.adoptedManual = false;
+      m_adoptedManual             = false;
       m_activeTrade.highestPriceSinceEntry = (m_activeTrade.direction == DIR_LONG) ? GetBid() : GetAsk();
       ComputeRiskAmount(m_activeTrade);
       m_hasActiveTrade  = true;
@@ -1610,6 +1625,8 @@ public:
       m_basketOpenTime = 0;
       m_sessionID      = "";
       m_sessionSL      = 0.0;
+      m_adoptedManual  = false;
+      m_manualNoSLWarnTick = 0;
 
      }
 
@@ -1627,6 +1644,12 @@ public:
       m_riskManager       = riskManager;
       m_blockManager      = blockManager;
       m_correlationFilter = correlationFilter;
+      // v5.33: adoption state starts cold on every Initialize(). SyncActiveTrade()
+      // below re-derives it from the book (a magic-0 leg already open across a
+      // re-init is re-adopted there), but the throttle timestamp must not survive
+      // a re-init or a fresh no-SL refusal would be swallowed by a stale stamp.
+      m_adoptedManual      = false;
+      m_manualNoSLWarnTick = 0;
       SyncActiveTrade();
       if(EnableLogging)
          Print("[OrderManager] Initialized for ", m_symbol, " | Magic: ", MagicNumber);
@@ -1663,14 +1686,64 @@ public:
    //| adopted as the primary and re-seed entry/SL/lot from the wrong   |
    //| leg — corrupting the basket's geometry mid-trade.                |
    //+------------------------------------------------------------------+
+   //+------------------------------------------------------------------+
+   //| Is the tracked primary still open?                               |
+   //|                                                                  |
+   //| v5.33: the magic test is CONDITIONAL on the primary being an EA-  |
+   //| originated leg. An adopted manual leg carries magic 0 by          |
+   //| definition, so the original "magic == MagicNumber" test could     |
+   //| never pass for it -- SyncActiveTrade() would read the adoption as  |
+   //| closed on the very next tick, log the trade out, and wipe the      |
+   //| basket. Accepting magic 0 here is safe in a way it would NOT be    |
+   //| elsewhere: this predicate is only ever applied to the ticket the   |
+   //| EA has ALREADY decided to manage (m_activeTrade.ticket), it still  |
+   //| demands this symbol, and the flag that authorises it is set only   |
+   //| by AdoptManualPosition(). The blanket magic filter is deliberately |
+   //| NOT relaxed in FindActivePosition/CountMyPositions, where "any     |
+   //| magic-0 position" would mean "any of the operator's hand trades".  |
+   //+------------------------------------------------------------------+
    bool              IsTrackedTicketOpen(void)
      {
       if(!m_hasActiveTrade || m_activeTrade.ticket <= 0)
          return false;
       if(!PositionSelectByTicket(m_activeTrade.ticket))
          return false;
-      return (PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
-              PositionGetString(POSITION_SYMBOL) == m_symbol);
+      if(PositionGetString(POSITION_SYMBOL) != m_symbol)
+         return false;
+      // Adopted leg: magic is 0 and must be, so it is not tested.
+      if(m_adoptedManual || m_activeTrade.adoptedManual)
+         return true;
+      return (PositionGetInteger(POSITION_MAGIC) == MagicNumber);
+     }
+
+   //+------------------------------------------------------------------+
+   //| Is any ticket in m_basket[] still present in the terminal book?  |
+   //|                                                                  |
+   //| v5.33: the positional twin of IsBasketFullyClosed(), with the two |
+   //| guards that predicate lacks. IsBasketFullyClosed() returns FALSE  |
+   //| for an empty basket, which in the ghost-remnant test below means  |
+   //| "nothing to sweep" -- the opposite of what is needed here. It     |
+   //| also reads PositionSelectByTicket() alone, without re-checking    |
+   //| the symbol, so a recycled ticket number could satisfy it.         |
+   //|                                                                  |
+   //| This is what makes an ADOPTED primary survivable across a restart |
+   //| or an Initialize(): the leg carries magic 0, so CountMyPositions() |
+   //| cannot see it, and without this test SyncActiveTrade() would call |
+   //| a restart with the leg still open a flat transition -- logging    |
+   //| the trade out and stranding an open position with no basket       |
+   //| driving it. For a normal EA basket this changes nothing, because  |
+   //| CountMyPositions() already answers the same question.             |
+   //+------------------------------------------------------------------+
+   bool              TrackedBasketStillOpen(void)
+     {
+      for(int i = 0; i < m_basketCount; i++)
+        {
+         if(m_basket[i].ticket <= 0) continue;
+         if(!PositionSelectByTicket(m_basket[i].ticket)) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         return true;
+        }
+      return false;
      }
 
    void              SyncActiveTrade(void)
@@ -1696,7 +1769,14 @@ public:
       // (primary and a tranche both already closed, m_basket[] still len>1)
       // must fall through to branch 3 so the exit is logged under its real
       // reason rather than mislabelled as a remnant cleanup.
-      if(m_hasActiveTrade && CountMyPositions() > 0)
+      //
+      // v5.33: TrackedBasketStillOpen() is the second half of the test so an
+      // ADOPTED primary is covered. It has magic 0, so CountMyPositions()
+      // cannot count it and the primary would otherwise look like it had
+      // vanished into thin air -- the branch would be skipped, branch 3 would
+      // find no magic-numbered position either, and the still-open adopted
+      // leg would be declared a flat exit with its basket wiped.
+      if(m_hasActiveTrade && (CountMyPositions() > 0 || TrackedBasketStillOpen()))
         {
          if(EnableLogging)
             Print("[OrderManager] Primary ticket ", m_activeTrade.ticket,
@@ -1732,12 +1812,175 @@ public:
      }
 
    //+------------------------------------------------------------------+
+   //| MANUAL TRADE ADOPTION (v5.33)                                    |
+   //|                                                                  |
+   //| Brings a position the OPERATOR opened by hand on this chart's     |
+   //| symbol into the basket machinery, so the trail, the milestone     |
+   //| ladder, the smart trim, the drawdown halt and the journal all     |
+   //| manage it exactly as they manage an EA-originated leg.           |
+   //|                                                                  |
+   //| WHY magic == 0 IS THE IDENTIFIER. MT5 assigns magic 0 only to     |
+   //| positions submitted from the terminal's own New Order dialog;     |
+   //| every EA stamps its own id. So "magic 0 AND this symbol" is the   |
+   //| operator's own hand and nothing else's -- the same discriminator  |
+   //| COttoCorrelationFilter already uses to recognise external gold.   |
+   //|                                                                  |
+   //| WHY THE STOP IS MANDATORY. The basket's 1R is |entry - SL|: the   |
+   //| milestone ladder, the pyramid rung sizing and the smart trim are  |
+   //| all expressed as multiples of it. A stopless manual position has  |
+   //| no 1R to inherit, and inventing one (an ATR guess, say) would     |
+   //| fabricate the risk geometry and every RR derived from it. So a    |
+   //| stopless leg is REFUSED, on a throttle rather than once per tick. |
+   //|                                                                  |
+   //| OWNERSHIP IS IMPLICIT. The adopted ticket living in m_basket[] is |
+   //| what makes it ours: CloseEntireBasket() step 1 closes m_basket[]  |
+   //| tickets with NO magic filter at all, so an adopted leg is already |
+   //| closable. No request ever has to be sent TO the magic-0 ticket to |
+   //| CLAIM it, and the only requests that carry a magic are SLTP and   |
+   //| close, both of which address the position by ticket and are       |
+   //| magic-agnostic on every hedging venue.                            |
+   //|                                                                  |
+   //| Returns the adopted ticket, or 0. Every refusal is logged: a      |
+   //| silent non-adoption is indistinguishable from "no manual trade    |
+   //| present", which is the one state the operator does not need help  |
+   //| believing.                                                        |
+   //+------------------------------------------------------------------+
+   ulong                   AdoptManualPosition(void)
+     {
+      // ---- Gate 0: opt-in, and never while reversing -------------------
+      // A stop-and-reverse is mid-flight: basket state is being torn down
+      // and rebuilt around an opposing fill, so adopting into it would
+      // seed a basket that the reversal is about to overwrite.
+      if(!InpAdoptManualTrades) return 0;
+      if(m_reversalInProgress)  return 0;
+
+      // ---- Gate 1: one basket at a time --------------------------------
+      // Refuse while the EA already owns an open position or a live basket.
+      // Adopting a hand-opened leg on top of a running trade would give the
+      // unified stop two primaries, and the unified ratchet is one-way, so
+      // the damage could not be undone by a later tick. This is the single
+      // most important refusal here.
+      if(m_hasActiveTrade) return 0;
+      if(m_basketCount > 0) return 0;
+      if(CountMyPositions() > 0) return 0;
+      // A resting EA limit order is a FUTURE primary: CheckPendingOrderFills()
+      // seeds it, and SeedActiveTradeFromBlock() -> InitBasket() rebuilds the
+      // basket around it, dropping an adopted leg out of m_basket[] as an
+      // unmanaged orphan while the position itself stays open. Adoption is a
+      // convenience, so refusing it here is the safe direction.
+      if(CountMyPendingOrders() > 0) return 0;
+
+      // ---- Gate 2: Pine's absolute lockdowns ---------------------------
+      // Mirrors PlaceOrdersForArmedBlocks(). The shield/veto are the
+      // operator saying "do not take risk right now", and that intent
+      // cannot depend on whether the leg was opened by a limit fill or by
+      // hand. Both are plain inputs, so this file takes no new dependency.
+      if(InpSimNewsShield) return 0;
+      if(InpSimMacroVeto)  return 0;
+
+      // ---- Gate 3: locate the OLDEST magic-0 position on this symbol ----
+      // Oldest-wins with POSITION_TIME as the tie-break, matching
+      // FindActivePosition(): the operator's first manual entry is the one
+      // whose stop defines the trade, not whichever the book lists first.
+      // Foreign-EA magic is excluded by the ==0 test, so another EA's leg
+      // can never be adopted.
+      ulong    adoptedTicket = 0;
+      datetime oldest        = 0;
+      for(int i = 0; i < PositionsTotal(); i++)
+        {
+         if(!PositionSelectByTicket(PositionGetTicket(i))) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != 0)        continue;
+
+         ulong pt = (ulong)PositionGetInteger(POSITION_TICKET);
+         if(pt <= 0) continue;
+         datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
+         if(adoptedTicket == 0 || opened < oldest)
+           {
+            oldest = opened;
+            adoptedTicket = pt;
+           }
+        }
+      if(adoptedTicket == 0) return 0;
+
+      // ---- Gate 4: the leg must carry a usable stop --------------------
+      if(!PositionSelectByTicket(adoptedTicket)) return 0;
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl    = PositionGetDouble(POSITION_SL);
+      if(sl <= 0.0 || entry <= 0.0 || MathAbs(entry - sl) <= 0.0)
+        {
+         // Throttled: the condition is stable for as long as the operator
+         // leaves the leg unprotected, so an unthrottled Print would emit
+         // the same line on every tick until they set a stop.
+         int warnMins = (InpManualNoSLWarnMinutes > 0) ? InpManualNoSLWarnMinutes : 5;
+         if(TimeCurrent() - m_manualNoSLWarnTick >= warnMins * 60)
+           {
+            m_manualNoSLWarnTick = TimeCurrent();
+            Print("[OrderManager] Manual position ", adoptedTicket, " on ",
+                  m_symbol, " NOT adopted: no stop-loss (need SL>0 to derive 1R).",
+                  " Set a stop and it will be picked up automatically.");
+           }
+         return 0;
+        }
+
+      // ---- Adopt -------------------------------------------------------
+      ENUM_TRADE_DIRECTION dir =
+         (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? DIR_LONG : DIR_SHORT;
+
+      m_activeTrade.ticket            = adoptedTicket;
+      m_activeTrade.direction         = dir;
+      m_activeTrade.entryPrice        = entry;
+      m_activeTrade.initialSL         = sl;
+      m_activeTrade.initialSLDistance = MathAbs(entry - sl);
+      m_activeTrade.rrUnit            = MathAbs(entry - sl);  // 1R == initial stop distance
+      m_activeTrade.currentTrailSL    = sl;
+      m_activeTrade.lotSize           = PositionGetDouble(POSITION_VOLUME);
+      m_activeTrade.openTime          = (datetime)PositionGetInteger(POSITION_TIME);
+      m_activeTrade.trailStep         = STEP_NONE;
+      m_activeTrade.sourceBlockSerial = 0;   // no Pine block produced this leg
+      m_activeTrade.highestPriceSinceEntry = (dir == DIR_LONG) ? GetBid() : GetAsk();
+      m_activeTrade.adoptedManual     = true;
+      ComputeRiskAmount(m_activeTrade);
+      m_hasActiveTrade  = true;
+      m_activeDirection = dir;
+      m_adoptedManual   = true;
+
+      // "MAN" names the origin in the session ID so an adopted basket's
+      // journal file is identifiable at a glance. Only the FINAL token
+      // changes, and SessionFileName() splits on '-', so the timestamp
+      // indices the journal relies on are untouched.
+      InitBasket(entry, m_activeTrade.rrUnit, dir, adoptedTicket,
+                 m_activeTrade.lotSize, sl, 0, "MAN");
+
+      if(m_journal != NULL)
+        {
+         m_journal.SetSessionID(m_sessionID);
+         m_journal.LogManualAdoption(adoptedTicket, dir, entry, sl,
+                                     m_activeTrade.lotSize, m_activeTrade.initialSLDistance);
+        }
+      if(EnableLogging)
+         Print("[OrderManager] ADOPTED manual position ", adoptedTicket, " on ",
+               m_symbol, " | dir=", (dir == DIR_LONG ? "LONG" : "SHORT"),
+               " | entry=", DoubleToString(entry, _Digits),
+               " | sl=", DoubleToString(sl, _Digits),
+               " | lots=", DoubleToString(m_activeTrade.lotSize, 2),
+               " | 1R=", DoubleToString(m_activeTrade.rrUnit, _Digits),
+               " | session=", m_sessionID);
+      return adoptedTicket;
+     }
+
+   //+------------------------------------------------------------------+
    //| Main update — reversal completion + pending-fill detection      |
    //+------------------------------------------------------------------+
    void              Update(void)
      {
       CompleteReversal();
       CheckPendingOrderFills();
+      // v5.33: LAST, so an EA fill detected in this same tick becomes the
+      // primary first and AdoptManualPosition()'s one-basket-at-a-time gate
+      // then refuses. Called every tick; the gates above are pure reads and
+      // the sweep is O(PositionsTotal), so this is cheap on a flat book.
+      AdoptManualPosition();
      }
 
    //+------------------------------------------------------------------+
@@ -1974,7 +2217,15 @@ public:
    //+------------------------------------------------------------------+
    //| PYRAMID BASKET methods (unified group stop)                      |
    //+------------------------------------------------------------------+
-   void              InitBasket(double entry, double rrUnit, ENUM_TRADE_DIRECTION dir, ulong ticket, double lot, double initSL, int blockSerial)
+   // idSuffix: v5.33. When empty (every EA-originated basket) the session ID
+   // keeps its historical "#OTTO-<sym>-<date>-<time>-BLK<n>" tail. An ADOPTED
+   // basket passes "MAN" instead, minting "#OTTO-<sym>-<date>-<time>-MAN".
+   // The token COUNT is unchanged and only the final token's text differs, so
+   // the '-' split indices in COttoJournal::SubjectLine() (p[1..3]) and
+   // SessionFileName() (parts[1..4]) are untouched, and filenames stay as
+   // safe as they were: "MAN" survives the character filter as-is.
+   void              InitBasket(double entry, double rrUnit, ENUM_TRADE_DIRECTION dir, ulong ticket, double lot, double initSL, int blockSerial,
+                                string idSuffix = "")
      {
       ArrayResize(m_basket, 0, 3);
       m_basketCount    = 0;
@@ -1988,13 +2239,23 @@ public:
       // the basket geometry exactly instead of inferring it from a moved stop.
       PersistBasketR(rrUnit, ticket);
         // Reuse place-time session ID if already set on the journal (ONE file per setup)
-        if(m_journal != NULL && m_journal.GetSessionID() != "")
+        // v5.33: an ADOPTED basket must NOT inherit the journal's current ID.
+        // m_sessionID has just been wiped by ClearBasket(), PATH 2 of
+        // InitBasket() overwrites the journal ID on every basket it seeds, and
+        // LogCancellation() sets one for a cancelled block's own setup -- so
+        // the inherited value can easily name a setup that never opened this
+        // position. Only the EA block path (idSuffix=="") may reuse it.
+        if(idSuffix == "" && m_journal != NULL && m_journal.GetSessionID() != "")
            m_sessionID = m_journal.GetSessionID();
         else
           {
            MqlDateTime utm2; TimeToStruct(TimeCurrent(), utm2);
            string tsF = StringFormat("%04d%02d%02d-%02d%02d%02d", utm2.year, utm2.mon, utm2.day, utm2.hour, utm2.min, utm2.sec);
-           m_sessionID = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, tsF, blockSerial);
+           // blockSerial is deliberately unused when idSuffix is supplied: an
+           // adopted manual leg has no Pine block, so there is no serial to
+           // name and "MAN" names its origin instead.
+           string tail = (idSuffix != "") ? idSuffix : StringFormat("BLK%d", blockSerial);
+           m_sessionID = StringFormat("#OTTO-%s-%s-%s", m_symbol, tsF, tail);
           }
       // FIX (v5.19): ArrayResize(m_basket, 0, 3) above leaves the array at
       // ZERO length, and m_basketCount was reset to 0 - so the write below
@@ -2287,6 +2548,12 @@ public:
       m_nextTranche = 2;
       m_hasActiveTrade = false;
       m_activeDirection = DIR_NONE;
+      // v5.33: the adoption flag must die with the basket. Left set, the
+      // High Table auditor would keep standing down its magic-scoped phantom
+      // test for a ticket that no longer exists, and IsTrackedTicketOpen()
+      // would exempt a future EA leg from the magic check.
+      m_adoptedManual = false;
+      m_activeTrade.adoptedManual = false;
       // v5.32: the basket is over, so its persisted 1R is dead weight. Dropping
       // it here means the next cold start finds no record rather than a stale
       // one -- the ticket check in RestoreBasketR() is the second line of
