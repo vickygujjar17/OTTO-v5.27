@@ -478,6 +478,11 @@ void OnDeinit(const int reason)
       Print("  Cancelling ", pending, " pending orders...");
       g_orderManager.CancelAllPendingOrders();
      }
+   // EXPERIMENT (experiment/reverse-sr): the virtual store has no broker
+   // artifact, so it must be emptied explicitly on teardown. Without this a
+   // stored trigger would survive a recompile and fire on a book the new
+   // binary no longer tracks.
+   g_orderManager.ClearVirtualStore();
 
    // --- High Table watchdog -----------------------------------------
    // The timer MUST be killed here: OnDeinit runs on every parameter
@@ -667,6 +672,32 @@ void UpdateMarketDay(void)
   }
 
 //+------------------------------------------------------------------+
+//| MAPPED direction of a zone for the portfolio bias vote.         |
+//|                                                                 |
+//| EXPERIMENT (experiment/reverse-sr): a Support / Resistance zone  |
+//| is DISCOVERED polarity, NOT trade direction. HiveMind publishes  |
+//| a LONG / SHORT consensus into the correlation matrix, and the    |
+//| conflict tie-breaker does not merely prefer one of two opposing  |
+//| zones -- it DELETES the losing polarity and vetoes its live      |
+//| orders. Reading the raw zone here would therefore publish the    |
+//| EXACT OPPOSITE bias under InpReverseSR while every entry is      |
+//| mapped the other way, so the hive mind would systematically      |
+//| veto exactly the setups this build now takes.                    |
+//|                                                                 |
+//| Byte-identical twin of COttoOrderManager::GetDirectionForBlock() |
+//| and COttoBlockManager::BlockDirection() (both private) for the   |
+//| support<->resistance mapping: with InpReverseSR = false a        |
+//| Support zone maps to DIR_LONG and a Resistance zone to DIR_SHORT,|
+//| so every branch below reduces to the original literal zone.      |
+//+------------------------------------------------------------------+
+ENUM_TRADE_DIRECTION MappedZoneDirection(const ENUM_BLOCK_TYPE type)
+  {
+   if(InpReverseSR)
+      return (type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;
+   return (type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;
+  }
+
+//+------------------------------------------------------------------+
 //| Hive Mind â€” broadcast bias and resolve bidirectional conflicts   |
 //+------------------------------------------------------------------+
 void HiveMind(void)
@@ -675,31 +706,52 @@ void HiveMind(void)
 
    SSniperBlock allBlocks[];
    int total = g_blockManager.GetAllBlocks(allBlocks);
-   bool hasSupport = false, hasResistance = false;
+   int supportVote = 0, resistanceVote = 0;   // raw zone polarity (diagnostics)
+   int mappedVote  = 0;                       // EXPERIMENT: MAPPED direction digest
    for(int b = 0; b < total; b++)
      {
       if(allBlocks[b].isVetoed) continue;
-      if(allBlocks[b].type == BLOCK_SUPPORT) hasSupport = true;
-      if(allBlocks[b].type == BLOCK_RESISTANCE) hasResistance = true;
+      if(allBlocks[b].type == BLOCK_SUPPORT)
+         supportVote++;
+      else if(allBlocks[b].type == BLOCK_RESISTANCE)
+         resistanceVote++;
+      // EXPERIMENT (experiment/reverse-sr): each live zone votes with the
+      // direction it would actually TRADE, not with the polarity it was
+      // discovered as. With InpReverseSR = false this is the identity
+      // mapping from block.type, so mappedVote == supportVote - resistanceVote
+      // and the tree below reduces to the original tree exactly.
+      mappedVote += (MappedZoneDirection(allBlocks[b].type) == DIR_LONG) ? 1 : -1;
      }
 
    int myBias = 0;
-   if(hasSupport && !hasResistance)
+   // EXPERIMENT (experiment/reverse-sr): the tie-breaker DELETES the zone whose
+   // MAPPED direction LOST the vote. Both DeleteBlockType arguments below carry
+   // an identical "supportVote > 0 ? Long : Short" discriminator:
+   //   in a two-polarity conflict (supportVote > 0) it picks polarity-vs-polarity,
+   //   the SAME argument the original tree used;
+   //   with only a resistance zone live (supportVote == 0) it picks the polled
+   //   winner as a zone, so a resistance-only field cannot be deleted.
+   // Log lines and myBias are unchanged:
+   //   resolution == +1 -> peers Long  -> the SHORT-mapped zone is deleted
+   //   resolution == -1 -> peers Short -> the LONG-mapped  zone is deleted
+   // With InpReverseSR = false supportVote > 0 => support->DIR_LONG, so both
+   // arguments reduce to the originals -- main behaviour unchanged.
+   if(mappedVote > 0 && resistanceVote == 0)
       myBias = 1;
-   else if(hasResistance && !hasSupport)
+   else if(mappedVote < 0 && supportVote == 0)
       myBias = -1;
-   else if(hasSupport && hasResistance)
+   else if(mappedVote != 0)
      {
       int resolution = g_correlationFilter.ResolveBidirectionalConflict();
       if(resolution == 1)
         {
-         g_blockManager.DeleteBlockType(BLOCK_RESISTANCE);
+         g_blockManager.DeleteBlockType(supportVote > 0 ? BLOCK_SUPPORT : BLOCK_RESISTANCE);
          myBias = 1;
          if(EnableLogging) Print("[HiveMind] CONFLICT: peers Long â†’ kept Support");
         }
       else if(resolution == -1)
         {
-         g_blockManager.DeleteBlockType(BLOCK_SUPPORT);
+         g_blockManager.DeleteBlockType(supportVote > 0 ? BLOCK_RESISTANCE : BLOCK_SUPPORT);
          myBias = -1;
          if(EnableLogging) Print("[HiveMind] CONFLICT: peers Short â†’ kept Resistance");
         }
@@ -842,6 +894,12 @@ void OnTick(void)
                " | Equity: ", DoubleToString(equity, 2));
          Print("  DD: ", DoubleToString(totalDD, 2), "% >= ", SafetyTotalDDLimit, "%");
          Print("==============================================================");
+         // EXPERIMENT (experiment/reverse-sr): the halt must also disarm every
+         // stored virtual trigger. The pending path is neutralised by the
+         // delete above (and by the iTime<=haltTime guard); the virtual store
+         // is protected only by this call, because a halt leaves the block
+         // array untouched and MarkVirtualOrdersToMarket() is state-free.
+         g_orderManager.ClearVirtualStore();
          return;
         }
      }
@@ -949,6 +1007,14 @@ void LogStatus(void)
                      " | ATR: ", DoubleToString(g_blockManager.GetATR(), _Digits),
                      " | DailyDD: ", g_dailyDD_Paused ? "PAUSED" : "OK",
                      " | TotalDD: ", g_totalDD_Halted ? "HALTED" : "OK");
+   // EXPERIMENT (experiment/reverse-sr): appended only when the virtual path is
+   // active, so a default deployment (InpVirtualOrders = false) logs exactly
+   // the same line as before this branch existed.
+   if(InpVirtualOrders)
+     {
+      string virtualSuffix = StringFormat(" | Virtual: %d", g_orderManager.GetVirtualCount());
+      statusLine = statusLine + virtualSuffix;
+     }
    Print(statusLine);
    if(g_fileHandle != INVALID_HANDLE)
      {

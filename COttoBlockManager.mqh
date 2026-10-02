@@ -95,6 +95,48 @@ private:
 
 
    //+------------------------------------------------------------------+
+   //| EXPERIMENT (experiment/reverse-sr) — DIRECTION CHOKEPOINT.        |
+   //|                                                                  |
+   //| A block's ZONE type is not its TRADE direction: that mapping is   |
+   //| owned by COttoOrderManager::GetDirectionForBlock() and inverts     |
+   //| under InpReverseSR. This file needs the direction in two places   |
+   //| the OrderManager cannot reach (both veto funnel projections), so   |
+   //| the same mapping is mirrored here rather than guessed.            |
+   //|                                                                  |
+   //| The two implementations deliberately sit side by side in review:   |
+   //| they must stay IDENTICAL or the Front-Run veto would project its   |
+   //| target off the un-inverted direction while the order was priced    |
+   //| from the inverted one -- vetoing live entries or missing real      |
+   //| front-runs, and doing it silently.                                |
+   //|                                                                  |
+   //| With InpReverseSR = false this is the identity mapping from        |
+   //| block.type, so every expression below reduces to the original      |
+   //| support->LONG / resistance->SHORT arithmetic (main unchanged).     |
+   //+------------------------------------------------------------------+
+   ENUM_TRADE_DIRECTION    BlockDirection(const SSniperBlock &b) const
+     {
+      if(InpReverseSR)
+         return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;
+      return (b.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;
+     }
+
+   //+------------------------------------------------------------------+
+   //| BlockEntryPrice — Pine entry price for a block, honouring         |
+   //| InpEntryStyle. The front edge is the edge price APPROACHES FROM,  |
+   //| which flips with the mapped direction: for a LONG it is             |
+   //| support.top / resistance.bottom, mirrored for a SHORT.            |
+   //|                                                                  |
+   //| This is the exact twin of COttoOrderManager::CalcEntryPrice() and  |
+   //| reduces to the original (b.type == BLOCK_SUPPORT) ? top : bottom   |
+   //| when InpReverseSR = false.                                        |
+   //+------------------------------------------------------------------+
+   double                  BlockEntryPrice(const SSniperBlock &b) const
+     {
+      if(InpEntryStyle == ENTRY_MIDPOINT) return b.midpoint;
+      return (BlockDirection(b) == DIR_LONG) ? b.top : b.bottom;
+     }
+
+   //+------------------------------------------------------------------+
    //| Human-readable veto reason (diagnostics)                         |
    //+------------------------------------------------------------------+
    string                  VetoReasonString(ENUM_VETO_REASON r)
@@ -404,16 +446,23 @@ private:
          // --- FRONT-RUN VETO (InpMaxRR target hit before entry) ---
          if(InpUseFrontRunVeto && b.hasExited && !b.isTriggered)
            {
-            double calcEntry = (InpEntryStyle == ENTRY_MIDPOINT) ? b.midpoint
-                              : ((b.type == BLOCK_SUPPORT) ? b.top : b.bottom);
+            double calcEntry = BlockEntryPrice(b);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-            double target = (b.type == BLOCK_SUPPORT) ? calcEntry + tpRR * calcSLDist
-                                                     : calcEntry - tpRR * calcSLDist;
+            // EXPERIMENT (experiment/reverse-sr): projected TP keys off the
+            // MAPPED direction (was: b.type == BLOCK_SUPPORT), mirroring the
+            // identical change in COttoOrderManager::ComputeSetupGeometry.
+            // Both must agree or b.localTP -- which supersedes this projection
+            // once the order is placed -- would sit on the wrong side of price.
+            bool   isLong = (BlockDirection(b) == DIR_LONG);
+            double target = isLong ? calcEntry + tpRR * calcSLDist
+                                   : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
                target = b.localTP;   // use exact TP parameter once placed
 
-            bool hit = (b.type == BLOCK_SUPPORT) ? (high1 >= target) : (low1 <= target);
+            // TP above entry is hit by the HIGH, TP below by the LOW; both are
+            // independent of how the trade direction was mapped.
+            bool hit = isLong ? (high1 >= target) : (low1 <= target);
             if(hit)
               {
                m_blocks[i] = b;   // persist hasExited before veto
@@ -555,16 +604,18 @@ private:
 
          if(InpUseFrontRunVeto)
            {
-            double calcEntry = (InpEntryStyle == ENTRY_MIDPOINT) ? b.midpoint
-                              : ((b.type == BLOCK_SUPPORT) ? b.top : b.bottom);
+            double calcEntry = BlockEntryPrice(b);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-            double target = (b.type == BLOCK_SUPPORT) ? calcEntry + tpRR * calcSLDist
-                                                     : calcEntry - tpRR * calcSLDist;
+            // EXPERIMENT (experiment/reverse-sr): intra-bar twin of the
+            // Update() projection above — same mapped-direction change.
+            bool   isLong = (BlockDirection(b) == DIR_LONG);
+            double target = isLong ? calcEntry + tpRR * calcSLDist
+                                   : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
                target = b.localTP;
 
-            bool hit = (b.type == BLOCK_SUPPORT) ? (high0 >= target) : (low0 <= target);
+            bool hit = isLong ? (high0 >= target) : (low0 <= target);
             if(hit)
               {
                SetVeto(i, VETO_FRONTRUN);

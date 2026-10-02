@@ -15,11 +15,15 @@
 //| Enumerations                                                     |
 //+------------------------------------------------------------------+
 
-// Block polarity. Support => Long, Resistance => Short (mirrors Pine is_support)
+// Block polarity as DISCOVERED by the pattern engine. Support/Resistance here
+// describe the ZONE, NOT the trade direction: with InpReverseSR=false a Support
+// zone maps to a BUY (main-branch behaviour); with InpReverseSR=true the mapping
+// is inverted and a Support zone maps to a SELL. Enum VALUES are persisted and
+// compared, so they must never be renumbered by the experiment.
 enum ENUM_BLOCK_TYPE
   {
-   BLOCK_RESISTANCE = 0,  // Resistance block -> SELL LIMIT
-   BLOCK_SUPPORT    = 1   // Support block    -> BUY  LIMIT
+   BLOCK_RESISTANCE = 0,  // Resistance zone -> SELL LIMIT (BUY when InpReverseSR)
+   BLOCK_SUPPORT    = 1   // Support zone    -> BUY  LIMIT (SELL when InpReverseSR)
   };
 
 enum ENUM_TRADE_DIRECTION
@@ -388,6 +392,28 @@ input bool     InpAdoptManualTrades     = true;  // Adopt magic-0 manual positio
 input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual leg with no SL (minutes)
 
 //+------------------------------------------------------------------+
+input group "══════════════════════════════════════════════════"
+input group "  [12] EXPERIMENT — INVERTED S/R + VIRTUAL ORDERS"
+input group "══════════════════════════════════════════════════"
+// EXPERIMENT BRANCH (experiment/reverse-sr) ONLY. Both flags default to FALSE, so a
+// deployment that never sets them behaves exactly like the main branch.
+//
+//   InpReverseSR    = true -> polarity mapping inverted: a SUPPORT zone now
+//                            produces a SELL (SL above the zone, TP below) and a
+//                            RESISTANCE zone a BUY (SL below the zone, TP above).
+//   InpVirtualOrders = true -> NO TRADE_ACTION_PENDING is ever sent for these
+//                            setups: EntryPrice/SL/TP/direction are held in
+//                            memory and a MARKET (TRADE_ACTION_DEAL) order fires
+//                            once the live price reaches the stored entry.
+//
+// WHY virtual orders are MANDATORY here, not a convenience: MT5 refuses a limit
+// resting on the wrong side of the market (TRADE_RETCODE_INVALID_PRICE). A
+// reversed SUPPORT setup is a SELL whose entry lies BELOW the live price, so a
+// SELL_LIMIT is illegal there by definition -- and likewise a reversed
+// RESISTANCE BUY above the market. There is no legal pending equivalent.
+input bool     InpReverseSR                = false;  // EXPERIMENT: invert S/R polarity mapping
+input bool     InpVirtualOrders            = false;  // EXPERIMENT: mark-and-monitor instead of pending orders
+input int      InpVirtualTriggerThrottleMs = 1000;   // EXPERIMENT: min ms between virtual market fires
 //| Global Constants                                                 |
 //+------------------------------------------------------------------+
 #define MAX_BLOCKS        50        // Max concurrent S/R blocks (memory safety)
