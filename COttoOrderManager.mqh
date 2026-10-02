@@ -894,16 +894,20 @@ private:
    //+------------------------------------------------------------------+
    //| VirtualEntryReached — has price touched a stored entry yet?      |
    //|                                                                  |
-   //| Direction-correct by construction: a BUY setup triggers when the |
-   //| BID falls to the entry, a SELL when the ASK rises to it. This is |
-   //| exactly why the experiment cannot use the pending path -- the    |
-   //| trigger side is the side the inverted entry now rests on.        |
+   //| CORRECTNESS: an inverted entry rests on the FAR side of          |
+   //| the market for its direction, so the trigger is the side         |
+   //| price travels INTO. A reversed Resistance BUY sits ABOVE         |
+   //| the market: fires when the ASK rises to it. A reversed           |
+   //| Support SELL sits BELOW the market: fires when the BID           |
+   //| falls to it. Assumes the inverted geometry (InpReverseSR         |
+   //| + InpVirtualOrders). The old operators read bid<=entry           |
+   //| for BUY -- true on arming, so every setup fired at once.         |
    //+------------------------------------------------------------------+
    bool                    VirtualEntryReached(int v, double bid, double ask)
      {
       if(v < 0 || v >= m_virtualCount) return false;
-      if(m_virtualOrderType[v] == ORDER_TYPE_BUY)  return (bid <= m_virtualEntry[v]);
-      if(m_virtualOrderType[v] == ORDER_TYPE_SELL) return (ask >= m_virtualEntry[v]);
+      if(m_virtualOrderType[v] == ORDER_TYPE_BUY)  return (ask >= m_virtualEntry[v]);
+      if(m_virtualOrderType[v] == ORDER_TYPE_SELL) return (bid <= m_virtualEntry[v]);
       return false;
      }
 
