@@ -1116,9 +1116,9 @@ public:
          if(m_blocks[j].isVetoed)              continue;
          if(m_blocks[j].deleteOnBarTime > 0)   continue;   // already leaving
 
-         // Same-territory test: ranges must intersect (either containment).
-         bool overlaps = (origin.top >= m_blocks[j].bottom && origin.bottom <= m_blocks[j].top) ||
-                         (m_blocks[j].top >= origin.bottom && m_blocks[j].bottom <= origin.top);
+         // Same-territory test: ranges must intersect. This is the standard
+         // t1 >= b2 && b1 <= t2 test and is identical to HasTerritoryOverlap().
+         bool overlaps = (origin.top >= m_blocks[j].bottom && origin.bottom <= m_blocks[j].top);
          if(!overlaps) continue;
 
          SSniperBlock sib = m_blocks[j];   // copy — persist before the cancel request
