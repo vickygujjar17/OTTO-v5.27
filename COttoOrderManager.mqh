@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.33"
+#property version   "5.34"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -45,29 +45,6 @@ private:
    //| of times an hour.
    bool                    m_adoptedManual;
    datetime                m_manualNoSLWarnTick;
-
-   // --- EXPERIMENT (experiment/reverse-sr): virtual market orders --------
-   //| InpReverseSR inverts the polarity mapping, which places a setup's
-   //| entry on the WRONG side of the market for any resting limit: a
-   //| reversed SUPPORT setup is a SELL whose entry lies BELOW the live
-   //| price, so a SELL_LIMIT there is refused by the server with
-   //| TRADE_RETCODE_INVALID_PRICE -- and symmetrically for a reversed
-   //| RESISTANCE BUY. No legal pending equivalent exists, so the setup's
-   //| geometry is held HERE and fired as a MARKET order once price reaches
-   //| the stored entry. Every field below is the exact mirror of what the
-   //| pending path would have placed; a default deployment (InpVirtualOrders
-   //| = false) never touches any of it.
-   int                     m_virtualBlockSerial[];   // block serial (stable across array compaction)
-   int                     m_virtualBlockIndex[];    // block index at mark time (diagnostics only)
-   ENUM_TRADE_DIRECTION    m_virtualDirection[];     // mapped direction (via GetDirectionForBlock)
-   ENUM_ORDER_TYPE         m_virtualOrderType[];     // BUY/SELL MARKET that matches the direction
-   double                  m_virtualEntry[];         // stored trigger price (block.localEntry)
-   double                  m_virtualSL[];            // stored stop-loss
-   double                  m_virtualTP[];            // InpMaxRR projection (mirrors localTP)
-   double                  m_virtualRRUnit[];        // b_height + 0.5*ATR at mark time
-   double                  m_virtualLot[];           // lot size resolved at mark time
-   int                     m_virtualCount;           // live virtual setups
-   ulong                   m_lastVirtualTriggerMs;   // GetTickCount() of the last market fire
 
    // --- Pending limit order tracking ---
    ulong                   m_pendingLimitTickets[];
@@ -428,25 +405,36 @@ private:
    //+------------------------------------------------------------------+
    ENUM_ORDER_TYPE         GetOrderTypeForBlock(const SSniperBlock &block)
      {
-      // EXPERIMENT (experiment/reverse-sr): the order type must FOLLOW the
-      // mapped direction, not the zone. Deriving it independently from
-      // block.type is precisely what made the reversal illegal with pending
-      // orders -- it would emit a BUY_LIMIT while the direction said SHORT.
-      // Kept coherent here even when InpVirtualOrders bypasses OrderSend.
+      // The order type must FOLLOW the mapped direction, not the zone.
+      // Deriving it independently from block.type would emit a BUY_LIMIT
+      // while the direction said SHORT. Kept coherent here for every caller.
       return (GetDirectionForBlock(block) == DIR_LONG) ? ORDER_TYPE_BUY_LIMIT
                                                        : ORDER_TYPE_SELL_LIMIT;
      }
    ENUM_TRADE_DIRECTION    GetDirectionForBlock(const SSniperBlock &block)
      {
-      // EXPERIMENT (experiment/reverse-sr): a Support/Resistance zone is
-      // DISCOVERED polarity, NOT trade direction. With InpReverseSR the
-      // mapping inverts: support -> SHORT (SL above the zone, TP below) and
-      // resistance -> LONG (SL below, TP above). This is the single
-      // chokepoint every consumer reads (front edge, SL, TP, basket seed,
-      // correlation gate), so flipping it here flips them all coherently.
-      if(InpReverseSR)
-         return (block.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;
-      return (block.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;
+      // A Support/Resistance zone is DISCOVERED polarity, NOT trade direction.
+      // On the experiment/reverse-sr line the mapping is permanently INVERTED
+      // (the InpReverseSR toggle was retired in v5.34): support -> SHORT (SL
+      // above the zone, TP below) and resistance -> LONG (SL below, TP above).
+      // This is the single chokepoint every consumer reads (front edge, SL,
+      // TP, basket seed, correlation gate), so the inversion is coherent.
+      //
+      // v5.34 Part 3 — TWO-PHASE LIFECYCLE. The counter in block.touches
+      // carries the phase, so the mapping itself is no longer constant:
+      //   touches == 0  -> PHASE 1, the ORIGINAL inverted fade (support ->
+      //                    SHORT, resistance -> LONG) as documented above.
+      //   touches == 1  -> PHASE 2, the REVERSAL. Reclaiming the zone is a
+      //                    genuine polarity flip, so the direction flips back
+      //                    (support -> LONG, resistance -> SHORT). The block
+      //                    geometry and shifted entry are unchanged; only the
+      //                    side of the trade changes.
+      //   touches == 2  -> terminal (the reversal fill), Phase-2 mapping kept.
+      // Keeping this decision in ONE place is what makes the reversal coherent
+      // for the front edge, SL, TP, basket seed and correlation gate at once.
+      if(block.touches >= 1)
+         return (block.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;   // Phase 2
+      return (block.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;      // Phase 1
      }
 
 
@@ -542,11 +530,10 @@ private:
    //+------------------------------------------------------------------+
    bool                    CanPlaceForDirection(const SSniperBlock &block)
      {
-      // EXPERIMENT (experiment/reverse-sr): keyed on the MAPPED direction, not
-      // the raw zone. With InpReverseSR a Support block is a SHORT, so a
-      // Support block arriving while a SHORT is open is the same-direction
-      // case and must be blocked -- the old zone comparison would have let it
-      // through as an "opposing" setup.
+      // Keyed on the MAPPED direction, not the raw zone. Under the permanent
+      // inversion a Support block is a SHORT, so a Support block arriving while
+      // a SHORT is open is the same-direction case and must be blocked -- a raw
+      // zone comparison would let it through as an "opposing" setup.
       ENUM_TRADE_DIRECTION mappedDir = GetDirectionForBlock(block);
       if(!m_hasActiveTrade)
          return true;
@@ -564,13 +551,10 @@ private:
      {
       if(InpSimSentiment == SENT_IGNORE)
          return true;
-      // EXPERIMENT (experiment/reverse-sr): sentiment is a statement about
-      // DIRECTION, so it must be tested against the MAPPED direction. Keyed on
-      // the raw zone (as it was) an inverted Support block -- now a SHORT --
-      // would pass a BULLISH filter and be refused by a BEARISH one, which is
-      // exactly backwards. With InpReverseSR = false GetDirectionForBlock()
-      // is the identity mapping from block.type, so both expressions below
-      // reduce to the original comparisons and main behaviour is unchanged.
+      // Sentiment is a statement about DIRECTION, so it must be tested against
+      // the MAPPED direction. Keyed on the raw zone, an inverted Support block
+      // -- now a SHORT -- would pass a BULLISH filter and be refused by a
+      // BEARISH one, which is exactly backwards.
       ENUM_TRADE_DIRECTION dir = GetDirectionForBlock(block);
       if(InpSimSentiment == SENT_BULLISH && dir == DIR_LONG)  return true;
       if(InpSimSentiment == SENT_BEARISH && dir == DIR_SHORT) return true;
@@ -599,630 +583,6 @@ private:
       return block.blockHeight + (0.5 * atr);
      }
 
-   //+------------------------------------------------------------------+
-   //| ComputeSetupGeometry — ONE source of truth for a setup's prices. |
-   //|                                                                  |
-   //| EXPERIMENT (experiment/reverse-sr) EXTRACTION, not a rewrite.    |
-   //| The body below is the EXACT arithmetic that used to live inline  |
-   //| in PlaceLimitOrder (entry snap, MAPPED isLong, stopLoss, the     |
-   //| InpMaxRR takeProfit projection, rrUnit and the b.local_* store). |
-   //| It was lifted out for ONE reason: ArmVirtualEntry() must store   |
-   //| byte-identical geometry to what the pending path would have      |
-   //| placed, and two hand-copied formulas would drift the moment      |
-   //| either side was touched -- silently re-pricing the experiment's   |
-   //| triggers against the very Setup/SL the rest of the EA believes.  |
-   //|                                                                  |
-   //| Writes back through block.localEntry/localSL/localTP/rrUnit so    |
-   //| every existing consumer (Front-Run Veto reads localTP; the        |
-   //| reversal path reads localSL; SeedActiveTradeFromBlock reads       |
-   //| localEntry/localSL/rrUnit) keeps working untouched. The caller    |
-   //| is responsible for persisting `block` (SetBlockAt).              |
-   //|                                                                  |
-   //| InpReverseSR=false reduces every expression to the main-branch    |
-   //| original, so this refactor is behaviour-preserving on main.       |
-   //+------------------------------------------------------------------+
-   void                    ComputeSetupGeometry(SSniperBlock &block, double atr,
-                                               double &entryOut, bool &isLongOut,
-                                               double &slOut, double &tpOut,
-                                               double &rrOut)
-     {
-      // v5.30 — snap onto the symbol's trade tick grid. A price that is
-      // off-grid is refused with TRADE_RETCODE_INVALID_PRICE even when it
-      // sits on the correct side of the market. slDist/rrUnit are
-      // entry-independent, so snapping does not change the risk distance.
-      double entryPrice = SnapToTick(CalcEntryPrice(block));
-
-      double slDist     = CalcSLDistance(block, atr);
-      // EXPERIMENT (experiment/reverse-sr): SL/TP/isLong all key off the
-      // MAPPED direction so an inverted setup stops and targets on the
-      // correct side. With InpReverseSR=false and a Support block the
-      // expressions reduce exactly to the original (entry - slDist /
-      // entry + tpRR*slDist), so main-branch behaviour is bit-identical.
-      bool   isLong     = (GetDirectionForBlock(block) == DIR_LONG);
-      double stopLoss   = isLong ? entryPrice - slDist : entryPrice + slDist;
-      // v5.31: the take-profit projection is InpMaxRR (default 4.0R).
-      // This must stay the SAME input the Front-Run veto projects from:
-      // once an order is resting the veto compares against block.localTP
-      // rather than re-deriving the target, so a divergence between this
-      // line and the veto's projection would silently disable the veto.
-      double tpRR       = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-      double takeProfit = isLong ? entryPrice + tpRR * slDist
-                                 : entryPrice - tpRR * slDist;
-
-      // Store local entry/SL/TP/rrUnit on the block (Pine b.local_*)
-      block.localEntry = entryPrice;
-      block.localSL    = stopLoss;
-      block.localTP    = takeProfit;
-      block.rrUnit     = slDist;
-
-      entryOut  = entryPrice;
-      isLongOut = isLong;
-      slOut     = stopLoss;
-      tpOut     = takeProfit;
-      rrOut     = slDist;
-     }
-
-   //+==================================================================+
-   //| EXPERIMENT (experiment/reverse-sr) — VIRTUAL ENTRY ENGINE        |
-   //|                                                                  |
-   //| WHY THIS EXISTS: InpReverseSR moves a setup's entry to the       |
-   //| opposite side of the market from where a resting limit may       |
-   //| legally sit. A reversed SUPPORT is a SHORT whose entry lies      |
-   //| BELOW the live price, so the SELL_LIMIT the Pine port would send |
-   //| is refused by the server with TRADE_RETCODE_INVALID_PRICE -- and |
-   //| symmetrically for a reversed RESISTANCE BUY. There is no legal   |
-   //| pending equivalent, so the geometry is held HERE and fired as a  |
-   //| MARKET order the moment price reaches the stored entry.          |
-   //|                                                                  |
-   //| Every field stored is what the pending path would have placed:   |
-   //| the prices come from ComputeSetupGeometry() (the SAME routine    |
-   //| PlaceLimitOrder uses), the lot from the same RiskManager call,   |
-   //| and the block is left in exactly the has_placed_order state the  |
-   //| pending path sets -- so the Front-Run Veto, the arm/re-arm logic |
-   //| and the block reaper keep seeing a "placed" setup.               |
-   //|                                                                  |
-   //| Each array is index-paired by position and ALWAYS resized in     |
-   //| lockstep by PushVirtual/RemoveVirtualAt, so no index can drift   |
-   //| out of range. ArrayRemove is compiled because this is an .mqh     |
-   //| included by otto.mq5 (only .mq5 entry points are scanned for the |
-   //| MQL5 restriction).                                               |
-   //+==================================================================+
-
-   //+------------------------------------------------------------------+
-   //| PushVirtual — append one armed setup. Returns its store index.   |
-   //+------------------------------------------------------------------+
-   int                     PushVirtual(int blockSerial, int blockIndex,
-                                       ENUM_TRADE_DIRECTION dir, ENUM_ORDER_TYPE otype,
-                                       double entry, double sl, double tp,
-                                       double rrUnit, double lot)
-     {
-      int at = m_virtualCount;
-      ArrayResize(m_virtualBlockSerial, at + 1, 8);
-      ArrayResize(m_virtualBlockIndex,  at + 1, 8);
-      ArrayResize(m_virtualDirection,  at + 1, 8);
-      ArrayResize(m_virtualOrderType,  at + 1, 8);
-      ArrayResize(m_virtualEntry,      at + 1, 8);
-      ArrayResize(m_virtualSL,         at + 1, 8);
-      ArrayResize(m_virtualTP,         at + 1, 8);
-      ArrayResize(m_virtualRRUnit,     at + 1, 8);
-      ArrayResize(m_virtualLot,        at + 1, 8);
-
-      m_virtualBlockSerial[at] = blockSerial;
-      m_virtualBlockIndex[at]  = blockIndex;
-      m_virtualDirection[at]   = dir;
-      m_virtualOrderType[at]   = otype;
-      m_virtualEntry[at]       = entry;
-      m_virtualSL[at]          = sl;
-      m_virtualTP[at]          = tp;
-      m_virtualRRUnit[at]      = rrUnit;
-      m_virtualLot[at]         = lot;
-      m_virtualCount           = at + 1;
-      return at;
-     }
-
-   //+------------------------------------------------------------------+
-   //| FindVirtualBySerial — index of a stored setup by block serial.   |
-   //| Keyed on the SERIAL, never the array index: block indices shift  |
-   //| when the reaper compacts m_blocks[], the serial does not.        |
-   //+------------------------------------------------------------------+
-   int                     FindVirtualBySerial(int blockSerial)
-     {
-      for(int v = 0; v < m_virtualCount; v++)
-         if(m_virtualBlockSerial[v] == blockSerial)
-            return v;
-      return -1;
-     }
-
-   //+------------------------------------------------------------------+
-   //| RemoveVirtualAt — delete one entry, keeping every array paired.  |
-   //+------------------------------------------------------------------+
-   void                    RemoveVirtualAt(int v)
-     {
-      if(v < 0 || v >= m_virtualCount) return;
-      ArrayRemove(m_virtualBlockSerial, v, 1);
-      ArrayRemove(m_virtualBlockIndex,  v, 1);
-      ArrayRemove(m_virtualDirection,   v, 1);
-      ArrayRemove(m_virtualOrderType,   v, 1);
-      ArrayRemove(m_virtualEntry,       v, 1);
-      ArrayRemove(m_virtualSL,          v, 1);
-      ArrayRemove(m_virtualTP,          v, 1);
-      ArrayRemove(m_virtualRRUnit,      v, 1);
-      ArrayRemove(m_virtualLot,         v, 1);
-      m_virtualCount = ArraySize(m_virtualBlockSerial);
-     }
-
-   //+------------------------------------------------------------------+
-   //| ArmVirtualEntry — the InpVirtualOrders replacement for           |
-   //| PlaceLimitOrder. Applies the SAME Pine gates in the SAME order,  |
-   //| stores the identical geometry, and fires nothing until price     |
-   //| reaches the entry. On success the block is left hasPlacedOrder   |
-   //| = true / limitOrderTicket = 0, which is precisely how the        |
-   //| pending path looks to every downstream consumer once its order   |
-   //| has been ACCEPTED but not yet filled.                            |
-   //|                                                                  |
-   //| Return value mirrors PlaceLimitOrder: true = this block is now   |
-   //| committed (armed here or already live); false = refused this     |
-   //| tick, leaving the block free to be re-evaluated next tick.       |
-   //+------------------------------------------------------------------+
-   bool                    ArmVirtualEntry(int blockIndex, SSniperBlock &block)
-     {
-      // Same head guard as the pending path, minus the ticket branch: a
-      // virtual setup never owns a broker ticket, so isTriggered is the
-      // only "already done" flag that can be set here.
-      if(block.isVetoed || block.isTriggered) return false;
-
-      // Idempotence. hasPlacedOrder is set the moment a setup is armed and
-      // is the ONLY duplicate gate the virtual path needs, because there is
-      // no broker book to race against -- but here it CANNOT be trusted on
-      // its own: the adopted-trade teardown and the block reaper both clear
-      // hasPlacedOrder while the setup is still stored, and a re-arm would
-      // then stack a second live trigger on one serial. The serial lookup is
-      // therefore the authoritative duplicate check.
-      if(FindVirtualBySerial(block.serial) >= 0)
-        {
-         block.hasPlacedOrder = true;
-         if(m_blockManager != NULL) m_blockManager.SetBlockAt(blockIndex, block);
-         return true;
-        }
-
-      if(!IsSpreadAcceptable()) return false;
-
-      // Pine can_place + correlation veto (institutional) — identical gates.
-      if(!CanPlaceForDirection(block)) return false;
-      ENUM_TRADE_DIRECTION dir = GetDirectionForBlock(block);
-      if(m_correlationFilter != NULL && m_correlationFilter.IsTradeVetoed(dir))
-        {
-         if(EnableLogging)
-            Print("[Correlation] VETO on ", m_symbol,
-                  (dir == DIR_LONG ? " LONG" : " SHORT"), " (virtual)");
-         return false;
-        }
-      if(m_correlationFilter != NULL &&
-         m_correlationFilter.IsConsensusOpposed(m_symbol, dir))
-        {
-         block.isVetoed   = true;
-         block.vetoReason = VETO_CORRELATION;
-         if(m_blockManager != NULL) m_blockManager.SetBlockAt(blockIndex, block);
-         if(EnableLogging)
-            Print("[Correlation] VECTOR VETO on ", m_symbol,
-                  (dir == DIR_LONG ? " LONG" : " SHORT"), " (virtual)");
-         return false;
-        }
-      if(!SentimentPasses(block)) return false;
-
-      double atr = (m_blockManager != NULL) ? m_blockManager.GetATR() : 0.0;
-      if(atr <= 0) return false;
-
-      // ONE source of truth: identical entry/SL/TP/rrUnit to the pending path.
-      double entryPrice, stopLoss, takeProfit, rrUnit;
-      bool   isLong;
-      ComputeSetupGeometry(block, atr, entryPrice, isLong, stopLoss, takeProfit, rrUnit);
-
-      // Broker-level stop validation, exactly as PlaceLimitOrder does it.
-      double adjustedSL = stopLoss;
-      if(!ValidateStopDistance(entryPrice, adjustedSL, isLong))
-         adjustedSL = AdjustSLToMinimum(entryPrice, adjustedSL, isLong);
-
-      double lotSize = m_riskManager.CalculateLotSize(entryPrice, adjustedSL);
-      if(lotSize <= 0)
-        {
-         if(EnableLogging)
-            Print("[OrderManager] SAFETY ABORT (virtual): lot size zero — suppressed");
-         return false;
-        }
-      if(!m_riskManager.HasSufficientMargin(lotSize)) return false;
-      if(lotSize < m_riskManager.GetVolumeMin() || lotSize > m_riskManager.GetVolumeMax())
-        {
-         Print("[OrderManager] Invalid volume (virtual)");
-         return false;
-        }
-
-      // Direction must match the geometry: isLong came from the same mapped
-      // direction, so this can only fail if that mapping ever splits.
-      ENUM_ORDER_TYPE otype = isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-
-      PushVirtual(block.serial, blockIndex, dir, otype,
-                  entryPrice, adjustedSL, takeProfit, rrUnit, lotSize);
-
-      // ARM == PLACEMENT, for accounting purposes. In the pending path
-      // SendOrderWithRetry() books m_ordersPlaced the moment the broker
-      // accepts the order; a virtual setup is committed here and there is no
-      // send, so the counter is incremented by hand. Without this the
-      // "ORDER PLACED" journal line and the OnDeinit/status totals would
-      // silently under-report every setup this experiment arms.
-      m_ordersPlaced++;
-
-      // Commit the block exactly as a "placed, not yet filled" order would:
-      // hasPlacedOrder = true keeps every re-arm path from re-entering here,
-      // and the local_* prices are stored so the Front-Run Veto, the
-      // reversal path and SeedActiveTradeFromBlock all read real values.
-      block.hasPlacedOrder     = true;
-      block.localEntry         = entryPrice;
-      block.localSL            = adjustedSL;
-      block.localTP            = takeProfit;
-      block.rrUnit             = rrUnit;
-      block.limitOrderTicket   = 0;     // virtual: no broker ticket by design
-      block.pendingOrderCancel = false;
-      block.priceAbortLogged   = false;
-      if(m_blockManager != NULL) m_blockManager.SetBlockAt(blockIndex, block);
-
-      // Build the session ID at ARM time so the journal file exists before the
-      // fill, mirroring the pending path's place-time ID (ONE file per setup).
-      // Ticket 0 is passed deliberately: there is no pending ticket to name.
-      MqlDateTime vtm; TimeToStruct(TimeCurrent(), vtm);
-      string vts = StringFormat("%04d%02d%02d-%02d%02d%02d",
-                                vtm.year, vtm.mon, vtm.day, vtm.hour, vtm.min, vtm.sec);
-      if(m_journal != NULL)
-        {
-         m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, vts, block.serial));
-         m_journal.LogOrderPlaced(0, dir, block.type, entryPrice, adjustedSL, lotSize, block);
-        }
-
-      if(EnableLogging)
-         Print("[OrderManager] VIRTUAL ENTRY ARMED: serial=", block.serial,
-               " ", block.tradeId,
-               " dir=", (dir == DIR_LONG ? "LONG" : "SHORT"),
-               " type=", (otype == ORDER_TYPE_BUY ? "BUY" : "SELL"),
-               " entry=", DoubleToString(entryPrice, _Digits),
-               " sl=", DoubleToString(adjustedSL, _Digits),
-               " tp=", DoubleToString(takeProfit, _Digits),
-               " rrUnit=", DoubleToString(rrUnit, _Digits),
-               " lot=", DoubleToString(lotSize, 2));
-      return true;
-     }
-
-   //+------------------------------------------------------------------+
-   //| VirtualEntryReached — has price touched a stored entry yet?      |
-   //|                                                                  |
-   //| CORRECTNESS: an inverted entry rests on the FAR side of          |
-   //| the market for its direction, so the trigger is the side         |
-   //| price travels INTO. A reversed Resistance BUY sits ABOVE         |
-   //| the market: fires when the ASK rises to it. A reversed           |
-   //| Support SELL sits BELOW the market: fires when the BID           |
-   //| falls to it. Assumes the inverted geometry (InpReverseSR         |
-   //| + InpVirtualOrders). The old operators read bid<=entry           |
-   //| for BUY -- true on arming, so every setup fired at once.         |
-   //+------------------------------------------------------------------+
-   bool                    VirtualEntryReached(int v, double bid, double ask)
-     {
-      if(v < 0 || v >= m_virtualCount) return false;
-      if(m_virtualOrderType[v] == ORDER_TYPE_BUY)  return (ask >= m_virtualEntry[v]);
-      if(m_virtualOrderType[v] == ORDER_TYPE_SELL) return (bid <= m_virtualEntry[v]);
-      return false;
-     }
-
-   //+------------------------------------------------------------------+
-   //| GetBlockSnapshotBySerial — block copy keyed on the SERIAL.       |
-   //| The stored block INDEX is diagnostics only: the reaper compacts  |
-   //| m_blocks[] behind our back, the serial never moves.              |
-   //+------------------------------------------------------------------+
-   bool                    GetBlockSnapshotBySerial(int serial, SSniperBlock &out)
-     {
-      if(m_blockManager == NULL) return false;
-      SSniperBlock all[];
-      int n = m_blockManager.GetAllBlocks(all);
-      for(int k = 0; k < n; k++)
-         if(all[k].serial == serial) { out = all[k]; return true; }
-      return false;
-     }
-
-   //+------------------------------------------------------------------+
-   //| MarkBlockTriggeredBySerial — the post-fill bookkeeping the       |
-   //| pending handler performs on its block, keyed by serial.          |
-   //+------------------------------------------------------------------+
-   void                    MarkBlockTriggeredBySerial(int serial)
-     {
-      if(m_blockManager == NULL) return;
-      SSniperBlock all[];
-      int n = m_blockManager.GetAllBlocks(all);
-      for(int k = 0; k < n; k++)
-        {
-         if(all[k].serial != serial) continue;
-         SSniperBlock mod = all[k];
-         mod.isTriggered      = true;
-         mod.limitOrderTicket = 0;
-         mod.hasPlacedOrder   = true;
-         mod.deleteOnBarTime  = iTime(m_symbol, PERIOD_CURRENT, 0);
-         m_blockManager.SetBlockAt(k, mod);
-         return;
-        }
-     }
-
-   //+------------------------------------------------------------------+
-   //| FireVirtualMarketOrder — execute one stored setup at market.     |
-   //|                                                                  |
-   //| The SL comes from the STORED geometry (re-validated against the  |
-   //| live fill side), a TP is attached at the same InpMaxRR           |
-   //| projection, and the block is flagged triggered exactly as a      |
-   //| pending fill would leave it -- so the reaper deletes it next bar |
-   //| and the funnel cannot re-arm it.                                 |
-   //|                                                                  |
-   //| SendOrderWithRetry() re-prices market orders onto the executable |
-   //| side on a requote (BUY -> Ask, SELL -> Bid) and does NOT apply   |
-   //| the 3-second pending throttle to TRADE_ACTION_DEAL, so a fast    |
-   //| reversal is not artificially delayed.                            |
-   //+------------------------------------------------------------------+
-   bool                    FireVirtualMarketOrder(int v)
-     {
-      if(v < 0 || v >= m_virtualCount) return false;
-
-      // ONE BASKET AT A TIME. The arm path refuses NEW setups while a basket
-      // is live, so a stored trigger surviving into a live book was armed
-      // BEFORE that basket opened. It must not fire now: the reversal
-      // machinery is built around DETECTING a broker fill
-      // (CheckPendingOrderFills), and a market order opened here would have
-      // no fill for it to detect, leaving an unmanaged leg. The setup stays
-      // armed -- PurgeVirtualOrders() has already dropped the same-direction
-      // ones -- and is re-evaluated once the book is flat again.
-      if(m_hasActiveTrade) return false;
-
-      int    serial = m_virtualBlockSerial[v];
-      bool   isLong = (m_virtualOrderType[v] == ORDER_TYPE_BUY);
-      double sl     = m_virtualSL[v];
-      double tp     = m_virtualTP[v];
-      double lot    = m_virtualLot[v];
-
-      // Re-validate the stop against the ACTUAL fill side. A broker that has
-      // widened its stops level since arming is still honoured here.
-      double livePx = isLong ? GetAsk() : GetBid();
-      if(!ValidateStopDistance(livePx, sl, isLong))
-         sl = AdjustSLToMinimum(livePx, sl, isLong);
-
-      int digits = (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS);
-
-      MqlTradeRequest request;
-      MqlTradeResult  result;
-      ZeroMemory(request);
-      ZeroMemory(result);
-      request.action    = TRADE_ACTION_DEAL;
-      request.symbol    = m_symbol;
-      request.type      = isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-      request.volume    = lot;
-      request.price     = NormalizeDouble(livePx, digits);
-      request.sl        = NormalizeDouble(sl, digits);
-      request.tp        = (tp > 0.0) ? NormalizeDouble(tp, digits) : 0.0;
-      request.deviation = MaxSlippage;
-      request.magic     = MagicNumber;
-      request.comment   = BuildOrderComment(serial, 0);
-
-      if(lot < m_riskManager.GetVolumeMin() || lot > m_riskManager.GetVolumeMax())
-        {
-         Print("[OrderManager] VIRTUAL FIRE ABORT: volume ", DoubleToString(lot, 2),
-               " outside broker limits — setup dropped");
-         RemoveVirtualAt(v);
-         return false;
-        }
-
-      if(!SendOrderWithRetry(request, result))
-        {
-         Print("[OrderManager] VIRTUAL FIRE FAILED: serial=", serial,
-               " retcode=", GetTradeRetcodeString(result.retcode));
-         // Transient requote/connection errors keep the trigger for the next
-         // tick; anything else must not leave a trigger that re-fires forever.
-         if(result.retcode != TRADE_RETCODE_REQUOTE &&
-            result.retcode != TRADE_RETCODE_PRICE_CHANGED &&
-            result.retcode != TRADE_RETCODE_PRICE_OFF &&
-            result.retcode != TRADE_RETCODE_CONNECTION)
-            RemoveVirtualAt(v);
-         return false;
-        }
-
-      // Fire confirmed. Resolve the resulting position ticket via the same
-      // 3-tier resolver the pending path uses; fall back to the order ticket.
-      ulong ticket = 0;
-      ENUM_TRADE_DIRECTION fillDir = DIR_NONE;
-      if(!ResolveFilledPositionTicket(result.order,
-                                      m_hasActiveTrade ? m_activeTrade.ticket : 0,
-                                      ticket, fillDir) || ticket <= 0)
-         ticket = (result.order > 0) ? (ulong)result.order : 0;
-
-      // Adopt the fill ONLY when flat. When a basket is already running the
-      // arm path refused new setups, so reaching here with an active trade
-      // means the fill is a stray: it is not adopted, and the block is still
-      // marked triggered so the funnel does not re-arm it.
-      if(!m_hasActiveTrade && ticket > 0)
-        {
-         SSniperBlock blk;
-         if(GetBlockSnapshotBySerial(serial, blk))
-           {
-            SeedActiveTradeFromBlock(blk, ticket);
-            m_ordersFilled++;
-           }
-        }
-
-      MarkBlockTriggeredBySerial(serial);
-      RemoveVirtualAt(v);
-
-      if(EnableLogging)
-         Print("[OrderManager] VIRTUAL MARKET FILLED: serial=", serial,
-               " ticket=", ticket,
-               " dir=", (isLong ? "LONG" : "SHORT"),
-               " px=", DoubleToString(livePx, _Digits));
-      return true;
-     }
-
-   //+------------------------------------------------------------------+
-   //| DetectVirtualFires — per-tick scan: fire any reached setup.      |
-   //|                                                                  |
-   //| Ordering rationale:                                              |
-   //|   * the CANCEL sweep runs FIRST (MarkVirtualOrdersToMarket) so a |
-   //|     setup that price moved away from, or that the operator       |
-   //|     disarmed, cannot fire after it has already been abandoned;   |
-   //|   * the throttle is checked BEFORE the scan, so a throttled tick |
-   //|     does no work at all and the fire rate is hard-bounded;       |
-   //|   * only ONE setup fires per tick -- a second market order in    |
-   //|     the same tick would be refused by the can_place gate anyway, |
-   //|     and pushing it would burn a retry. The array also shifts     |
-   //|     when the fired entry is removed, so the scan restarts next   |
-   //|     tick.                                                        |
-   //+------------------------------------------------------------------+
-   void                    DetectVirtualFires(void)
-     {
-      if(m_virtualCount <= 0) return;
-
-      // Global throttle: at most one fire per InpVirtualTriggerThrottleMs.
-      // m_lastVirtualTriggerMs == 0 means "nothing fired yet in this run", so
-      // the first trigger is never delayed.
-      if(m_lastVirtualTriggerMs != 0 &&
-         (GetTickCount() - m_lastVirtualTriggerMs) < (ulong)InpVirtualTriggerThrottleMs)
-         return;
-
-      double bid = GetBid();
-      double ask = GetAsk();
-      for(int v = 0; v < m_virtualCount; v++)
-        {
-         if(!VirtualEntryReached(v, bid, ask)) continue;
-         if(FireVirtualMarketOrder(v))
-           {
-            m_lastVirtualTriggerMs = GetTickCount();
-            return;   // RemoveVirtualAt() shifted the array; restart next tick
-           }
-         // Reached but refused. Either the book went live (kept armed for
-         // later) or the fire failed transiently; scanning on would hit every
-         // other reached setup in the same tick, so stop and retry next tick.
-         return;
-        }
-     }
-
-
-   //+------------------------------------------------------------------+
-   //| CancelInvalidVirtualEntries — drop triggers whose block is gone. |
-   //|                                                                  |
-   //| A virtual setup has no broker artifact keeping it honest: if the |
-   //| owning block is vetoed, flipped, reclaimed or deleted, the       |
-   //| trigger must die with it. This mirrors the pending path's        |
-   //| CancelOrdersForInvalidBlocks(), which for a    virtual setup      |
-   //| has nothing in OrdersTotal() to cancel.                          |
-   //+------------------------------------------------------------------+
-   void                    CancelInvalidVirtualEntries(void)
-     {
-      for(int v = m_virtualCount - 1; v >= 0; v--)
-        {
-         int serial = m_virtualBlockSerial[v];
-         SSniperBlock blk;
-         bool alive = GetBlockSnapshotBySerial(serial, blk);
-         if(!alive)
-           {
-            if(EnableLogging)
-               Print("[OrderManager] VIRTUAL TRIGGER DROPPED: block serial ",
-                     serial, " no longer exists");
-            RemoveVirtualAt(v);
-            continue;
-           }
-         bool mustDrop = blk.isVetoed || blk.isTriggered ||
-                         blk.deleteOnBarTime > 0 || blk.pendingOrderCancel;
-         if(mustDrop)
-           {
-            if(EnableLogging)
-               Print("[OrderManager] VIRTUAL TRIGGER DROPPED: serial=", serial,
-                     " vetoed=", (blk.isVetoed ? "true" : "false"),
-                     " triggered=", (blk.isTriggered ? "true" : "false"),
-                     " deleteOnBar=", (blk.deleteOnBarTime > 0 ? "true" : "false"),
-                     " cancelReq=", (blk.pendingOrderCancel ? "true" : "false"));
-            RemoveVirtualAt(v);
-           }
-        }
-     }
-
-   //+------------------------------------------------------------------+
-   //| MarkVirtualOrdersToMarket — the InpVirtualOrders entry point.    |
-   //| Called from Update() every tick: drop dead triggers, then fire    |
-   //| whatever price has reached.                                      |
-   //+------------------------------------------------------------------+
-   void                    MarkVirtualOrdersToMarket(void)
-     {
-      if(!InpVirtualOrders) return;
-      CancelInvalidVirtualEntries();
-      DetectVirtualFires();
-     }
-
-   //+------------------------------------------------------------------+
-   //| PurgeVirtualOrders — the whole-store twin of the three broker    |
-   //| sweeps otto.mq5 already calls every tick / new bar:              |
-   //| CancelOrdersForInvalidBlocks(), CancelOpposingConsensusOrders()   |
-   //| and ManageDirectionConflict().                                   |
-   //|                                                                  |
-   //| A virtual setup has no ticket, so those sweeps can never see it: |
-   //| under InpVirtualOrders this EA's OrdersTotal() is empty. Every    |
-   //| reason those three use to kill a pending order must therefore be  |
-   //| applied HERE, to the store, or a dead setup stays armed forever.  |
-   //+------------------------------------------------------------------+
-   void                    PurgeVirtualOrders(void)
-     {
-      if(!InpVirtualOrders || m_virtualCount <= 0) return;
-
-      // (1) Block-integrity sweep: vetoed / triggered / reaped / cancel-flagged.
-      CancelInvalidVirtualEntries();
-
-      // (2) Consensus-opposed sweep — CancelOpposingConsensusOrders() twin.
-      if(InpCancelOpposingPendings && m_correlationFilter != NULL)
-         for(int v = m_virtualCount - 1; v >= 0; v--)
-            if(m_correlationFilter.IsConsensusOpposed(m_symbol, m_virtualDirection[v]))
-              {
-               if(EnableLogging)
-                  Print("[OrderManager] VIRTUAL VECTOR CANCEL: serial ",
-                        m_virtualBlockSerial[v], " ",
-                        (m_virtualDirection[v] == DIR_LONG ? "LONG" : "SHORT"));
-               RemoveVirtualAt(v);
-              }
-
-      // (3) Post-fill same-direction sweep — ManageDirectionConflict() twin.
-      //     Pine cancels a resting entry once a trade in that direction is on.
-      if(m_hasActiveTrade)
-         for(int v = m_virtualCount - 1; v >= 0; v--)
-            if(m_virtualDirection[v] == m_activeDirection)
-              {
-               if(EnableLogging)
-                  Print("[OrderManager] VIRTUAL DIRECTION CANCEL: serial ",
-                        m_virtualBlockSerial[v]);
-               RemoveVirtualAt(v);
-              }
-     }
-
-   //+------------------------------------------------------------------+
-   //| ResetVirtualStore — the InpVirtualOrders twin of                 |
-   //| CancelAllPendingOrders(). Called from a DD halt, from OnDeinit()  |
-   //| (via the public ClearVirtualStore() wrapper) and from             |
-   //| Initialize(): the pending path deletes every resting order, so    |
-   //| the store must be emptied too, or a halted EA would still fire a  |
-   //| market entry from a stale trigger.                                |
-   //+------------------------------------------------------------------+
-   void                    ResetVirtualStore(void)
-     {
-      if(m_virtualCount <= 0) return;
-      if(EnableLogging)
-         Print("[OrderManager] VIRTUAL STORE CLEARED (", m_virtualCount, " setup(s))");
-      ArrayFree(m_virtualBlockSerial);
-      ArrayFree(m_virtualBlockIndex);
-      ArrayFree(m_virtualDirection);
-      ArrayFree(m_virtualOrderType);
-      ArrayFree(m_virtualEntry);
-      ArrayFree(m_virtualSL);
-      ArrayFree(m_virtualTP);
-      ArrayFree(m_virtualRRUnit);
-      ArrayFree(m_virtualLot);
-      m_virtualCount = 0;
-     }
 
 
 
@@ -1233,23 +593,11 @@ private:
    //| into an MT5 pending SELL_LIMIT/BUY_LIMIT. NO take-profit is     |
    //| attached (exact mirror: exits are purely trail-based; localTP   |
    //| is stored on the block only for the Front-Run veto).            |
-   //|                                                                  |
-   //| EXPERIMENT (experiment/reverse-sr): under InpVirtualOrders this  |
-   //| method returns immediately. ArmVirtualEntry() replaces it.       |
-   //| is stored on the block only for the Front-Run veto).            |
    //+------------------------------------------------------------------+
    bool                    PlaceLimitOrder(int blockIndex, SSniperBlock &block)
      {
       if(block.isVetoed || block.isTriggered || block.hasPlacedOrder)
          return false;
-
-      // EXPERIMENT (experiment/reverse-sr): when virtual orders are enabled the
-      // broker pending path is retired for this run. ArmVirtualEntry() stores
-      // the identical geometry in memory and MarkVirtualOrdersToMarket() fires
-      // a market order only once price reaches the stored entry. Guarded here
-      // rather than at the call site so every caller (PlaceOrdersForArmedBlocks
-      // and the manual test hook) is covered by a single edit.
-      if(InpVirtualOrders) return false;
 
       // Duplicate prevention: triple-ticket verification
       if(IsBlockOrderAlive(block.limitOrderTicket))
@@ -1300,6 +648,29 @@ private:
       // even when it sits on the correct side of the market. slDist/rrUnit are
       // entry-independent, so snapping does not change the risk distance.
       double entryPrice = SnapToTick(CalcEntryPrice(block));
+
+      // v5.34 Part 3 — SHIFTED REVERSAL ENTRY (Phase 2 only). A Touch-1 block
+      // is a reclaimed zone being traded as a REVERSAL, so its entry is moved
+      // to the OUTER boundary of the block by one full stop distance. That
+      // orders the reversal BEYOND the extreme that rejected the Phase 1 fade,
+      // instead of back inside the zone the original fade already occupied. The
+      // shift is derived from the mapped (Phase 2) direction, so a LONG
+      // reversal lifts the entry and a SHORT reversal lowers it. slDist is
+      // hoisted here because both the shift and the LIVE PRICE VALIDATION below
+      // depend on it, and the validation must judge the SHIFTED price.
+      double slDist     = CalcSLDistance(block, atr);
+      if(InpShiftReversalEntry && block.touches == 1)
+        {
+         double shifted = (GetDirectionForBlock(block) == DIR_LONG) ? entryPrice - slDist
+                                                                   : entryPrice + slDist;
+         entryPrice = SnapToTick(shifted);   // re-snap: the shift may leave the grid
+         if(EnableLogging)
+            Print("[OrderManager] SHIFTED REVERSAL ENTRY: block ", block.tradeId,
+                  " touched=", block.touches,
+                  " dir=", (GetDirectionForBlock(block) == DIR_LONG ? "LONG" : "SHORT"),
+                  " entry=", DoubleToString(entryPrice, _Digits),
+                  " (slDist=", DoubleToString(slDist, _Digits), ")");
+        }
 
       // v5.28 — LIVE PRICE VALIDATION, before the duplicate shield so a refused
       // price never sets hasPlacedOrder (the block stays armed for a later tick).
@@ -1366,12 +737,11 @@ private:
          return false;
         }
 
-      double slDist     = CalcSLDistance(block, atr);
-      // EXPERIMENT (experiment/reverse-sr): SL/TP/isLong all key off the
-      // MAPPED direction (isLong below) so an inverted setup stops and targets
-      // on the correct side. With InpReverseSR=false and a Support block the
-      // expressions reduce exactly to the original (entry - slDist /
-      // entry + tpRR*slDist), so main-branch behaviour is bit-identical.
+      // slDist was HOISTED above the live-price pre-flight (v5.34 Part 3): the
+      // shifted Phase 2 entry consumes it, and the validation above must see
+      // the shifted price. SL/TP/isLong all key off the MAPPED direction
+      // (isLong below) so the inverted setup stops and targets on the correct
+      // side, and the Phase 2 mapping carries straight through.
       bool   isLong     = (GetDirectionForBlock(block) == DIR_LONG);
       double stopLoss   = isLong ? entryPrice - slDist : entryPrice + slDist;
       // v5.31: the take-profit projection is InpMaxRR (default 4.0R).
@@ -1881,12 +1251,10 @@ private:
    //+------------------------------------------------------------------+
    bool                    OpenReversalPosition(SSniperBlock &targetBlock)
      {
-      // EXPERIMENT (experiment/reverse-sr): the reversal target's direction is
-      // the MAPPED direction -- the same source InitiateReversal() already uses
-      // for m_reversalTargetDir (L1833). Deriving it here from the raw zone made
-      // an inverted Support block reverse into a LONG while the log and the
-      // target direction said SHORT. With InpReverseSR = false the two are the
-      // identity, so this reduces to the original expression.
+      // The reversal target's direction is the MAPPED direction -- the same
+      // source InitiateReversal() already uses for m_reversalTargetDir.
+      // Deriving it from the raw zone would make an inverted Support block
+      // reverse into a LONG while the log and target direction said SHORT.
       bool isLong  = (GetDirectionForBlock(targetBlock) == DIR_LONG);
       double entryPrice = isLong ? GetAsk() : GetBid();
       double stopLoss   = targetBlock.localSL;
@@ -2259,18 +1627,54 @@ private:
                         " ticket=", newTicket,
                         " dir=", (newDir == DIR_LONG ? "LONG" : "SHORT"));
               }
-            // Mark the block triggered + schedule deletion next bar
+            // ---- STEP 4: ADVANCE THE TWO-PHASE LIFECYCLE (v5.34 Part 3) ---
+            // A fill on a Phase 1 block (touches==0) does NOT retire the zone:
+            // it consumes Touch 1 and promotes the block to a Phase 2 REVERSAL
+            // candidate (touches==1) so a reclaimed zone can be traded from the
+            // opposite side. Only a fill on the Phase 2 block (touches==1)
+            // retires it (touches==2) + schedules next-bar deletion. The Phase-2
+            // promotion also syncs any overlapping same-type Phase 1 sibling so
+            // a cluster can never trade the same reclaim twice.
             int bi = m_blockManager.FindBlockIndexByTicket(ticket);
             if(bi >= 0)
               {
                SSniperBlock mod;
                if(m_blockManager.GetBlockAt(bi, mod))
                  {
-                  mod.isTriggered = true;
+                  int prevTouch = mod.touches;
+                  mod.touches += 1;
                   mod.limitOrderTicket = 0;
-                  mod.hasPlacedOrder = true;
-                  mod.deleteOnBarTime = iTime(m_symbol, PERIOD_CURRENT, 0);
-                  m_blockManager.SetBlockAt(bi, mod);
+                  mod.pendingOrderCancel = false;
+                  if(mod.touches >= 2)
+                    {
+                     // Touch 2 consumed — terminal: retire on the next bar.
+                     mod.isTriggered = true;
+                     mod.hasPlacedOrder = true;
+                     mod.deleteOnBarTime = iTime(m_symbol, PERIOD_CURRENT, 0);
+                     m_blockManager.SetBlockAt(bi, mod);
+                     if(EnableLogging)
+                        Print("[OrderManager] REVERSAL FILLED: block ", mod.tradeId,
+                              " touches=2 -> retired");
+                    }
+                  else
+                    {
+                     // Touch 1 consumed — keep the zone alive + unarmed so the
+                     // Phase 2 reversal can arm and place its shifted entry.
+                     mod.isTriggered   = false;
+                     mod.hasPlacedOrder = false;
+                     mod.isArmed       = false;
+                     mod.hasExited     = false;
+                     mod.deleteOnBarTime = 0;
+                     m_blockManager.SetBlockAt(bi, mod);
+                     // Cluster sync: a same-polarity Phase 1 sibling sharing
+                     // territory is now redundant — promote it in lockstep so
+                     // the cluster reverses as one.
+                     m_blockManager.SyncReversalCluster(bi);
+                     if(EnableLogging)
+                        Print("[OrderManager] TOUCH 1 CONSUMED: block ", mod.tradeId,
+                              " (prev=", prevTouch,
+                              ") -> Phase 2 reversal armed");
+                    }
                  }
               }
            }
@@ -2331,12 +1735,6 @@ public:
       m_adoptedManual  = false;
       m_manualNoSLWarnTick = 0;
 
-      // EXPERIMENT (experiment/reverse-sr): the virtual store starts cold and
-      // the trigger stamp is zeroed so the FIRST fire of a run is never
-      // swallowed by a timestamp left over from an earlier one.
-      m_virtualCount         = 0;
-      m_lastVirtualTriggerMs = 0;
-
      }
 
                     ~COttoOrderManager(void) { ArrayFree(m_pendingLimitTickets); }
@@ -2359,14 +1757,6 @@ public:
       // a re-init or a fresh no-SL refusal would be swallowed by a stale stamp.
       m_adoptedManual      = false;
       m_manualNoSLWarnTick = 0;
-      // EXPERIMENT (experiment/reverse-sr): a re-init means a fresh chart load,
-      // symbol change or parameter edit. Every stored trigger refers to block
-      // serials from a block array that no longer exists, so the store must be
-      // dropped here -- the pending path's equivalent is the broker book, which
-      // MT5 keeps in sync on its own. The throttle stamp is reset with it so
-      // the first fire after a re-init is not artificially delayed.
-      ClearVirtualStore();          // public wrapper -> ResetVirtualStore()
-      m_lastVirtualTriggerMs = 0;
       SyncActiveTrade();
       if(EnableLogging)
          Print("[OrderManager] Initialized for ", m_symbol, " | Magic: ", MagicNumber);
@@ -2698,17 +2088,6 @@ public:
       // then refuses. Called every tick; the gates above are pure reads and
       // the sweep is O(PositionsTotal), so this is cheap on a flat book.
       AdoptManualPosition();
-
-      // EXPERIMENT (experiment/reverse-sr) STEP 9: virtual market execution.
-      // Runs LAST on purpose: CompleteReversal() (which can turn a reversed
-      // basket into an active trade and therefore flips m_activeDirection)
-      // and CheckPendingOrderFills() (which completes the changeover on a
-      // basket that arrived some earlier tick) have both settled by now, so
-      // PurgeVirtualOrders() sees the true basket state and can never
-      // fire a market entry into a book that is mid-reversal.
-      // MarkVirtualOrdersToMarket() is a no-op unless InpVirtualOrders.
-      PurgeVirtualOrders();
-      MarkVirtualOrdersToMarket();
      }
 
    //+------------------------------------------------------------------+
@@ -2736,15 +2115,7 @@ public:
          if(m_blockManager.IsBlockedByPrimary(i))
             continue;
 
-         // EXPERIMENT (experiment/reverse-sr): one router, two back ends.
-         // InpVirtualOrders holds the geometry in RAM and fires at market when
-         // price reaches it; otherwise the broker pending path runs unchanged.
-         // PlaceLimitOrder() also self-guards, so the virtual branch below is
-         // the readable path and the guard is the belt-and-braces one.
-         if(InpVirtualOrders)
-            ArmVirtualEntry(i, blocks[i]);
-         else
-            PlaceLimitOrder(i, blocks[i]);
+         PlaceLimitOrder(i, blocks[i]);
         }
      }
 
@@ -2756,10 +2127,6 @@ public:
    //+------------------------------------------------------------------+
    void              CancelOrdersForInvalidBlocks(void)
      {
-      // EXPERIMENT (experiment/reverse-sr): under InpVirtualOrders this EA
-      // holds no resting broker orders, so the loop below can never fire for
-      // one of our blocks. The store gets the identical rule set instead.
-      PurgeVirtualOrders();
 
       SSniperBlock blocks[];
       int count = m_blockManager.GetAllBlocks(blocks);
@@ -2919,13 +2286,6 @@ public:
    int               CountMyPending(void) { return CountMyPendingOrders(); }
    bool              ForceClose(ulong ticket)  { return ClosePosition(ticket); }
    bool              ModifySL(ulong ticket, double newSL) { return ModifyStopLoss(ticket, newSL); }
-
-   // EXPERIMENT (experiment/reverse-sr) EA-facing wrappers, matching the
-   // CountMyPending/ForceClose/ModifySL convention above. ClearVirtualStore()
-   // is the public twin of CancelAllPendingOrders() (DD halt + OnDeinit);
-   // GetVirtualCount() is used by the periodic status log.
-   void              ClearVirtualStore(void) { ResetVirtualStore(); }
-   int               GetVirtualCount(void) const { return m_virtualCount; }
 
 
    //+------------------------------------------------------------------+
