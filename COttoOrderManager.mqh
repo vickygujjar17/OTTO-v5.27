@@ -414,27 +414,27 @@ private:
    ENUM_TRADE_DIRECTION    GetDirectionForBlock(const SSniperBlock &block)
      {
       // A Support/Resistance zone is DISCOVERED polarity, NOT trade direction.
-      // On the experiment/reverse-sr line the mapping is permanently INVERTED
-      // (the InpReverseSR toggle was retired in v5.34): support -> SHORT (SL
-      // above the zone, TP below) and resistance -> LONG (SL below, TP above).
+      // The mapping is the standard two-phase lifecycle: Phase 1 trades the
+      // zone as a BOUNCE, Phase 2 trades the reclaimed zone as a REVERSAL.
       // This is the single chokepoint every consumer reads (front edge, SL,
-      // TP, basket seed, correlation gate), so the inversion is coherent.
+      // TP, basket seed, correlation gate), so the mapping stays coherent.
       //
       // v5.34 Part 3 — TWO-PHASE LIFECYCLE. The counter in block.touches
-      // carries the phase, so the mapping itself is no longer constant:
-      //   touches == 0  -> PHASE 1, the ORIGINAL inverted fade (support ->
-      //                    SHORT, resistance -> LONG) as documented above.
-      //   touches == 1  -> PHASE 2, the REVERSAL. Reclaiming the zone is a
-      //                    genuine polarity flip, so the direction flips back
-      //                    (support -> LONG, resistance -> SHORT). The block
+      // carries the phase:
+      //   touches == 0  -> PHASE 1, the normal BOUNCE off the zone (support ->
+      //                    LONG, resistance -> SHORT): SL below a Long, TP
+      //                    above; mirrored for a Short.
+      //   touches == 1  -> PHASE 2, the REVERSAL. Having reclaimed the zone the
+      //                    setup trades the S/R FLIP, so the direction inverts
+      //                    (support -> SHORT, resistance -> LONG). The block
       //                    geometry and shifted entry are unchanged; only the
       //                    side of the trade changes.
       //   touches == 2  -> terminal (the reversal fill), Phase-2 mapping kept.
       // Keeping this decision in ONE place is what makes the reversal coherent
       // for the front edge, SL, TP, basket seed and correlation gate at once.
       if(block.touches >= 1)
-         return (block.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;   // Phase 2
-      return (block.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;      // Phase 1
+         return (block.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Phase 2 — reversal (S/R flip)
+      return (block.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;      // Phase 1 — normal bounce
      }
 
 
@@ -552,9 +552,9 @@ private:
       if(InpSimSentiment == SENT_IGNORE)
          return true;
       // Sentiment is a statement about DIRECTION, so it must be tested against
-      // the MAPPED direction. Keyed on the raw zone, an inverted Support block
-      // -- now a SHORT -- would pass a BULLISH filter and be refused by a
-      // BEARISH one, which is exactly backwards.
+      // the MAPPED direction. Keyed on the raw zone, a Phase-2 Support block
+      // -- trading the S/R flip as a SHORT -- would pass a BULLISH filter and
+      // be refused by a BEARISH one, which is exactly backwards.
       ENUM_TRADE_DIRECTION dir = GetDirectionForBlock(block);
       if(InpSimSentiment == SENT_BULLISH && dir == DIR_LONG)  return true;
       if(InpSimSentiment == SENT_BEARISH && dir == DIR_SHORT) return true;
@@ -568,10 +568,10 @@ private:
      {
       if(InpEntryStyle == ENTRY_MIDPOINT)
          return block.midpoint;
-      // EXPERIMENT (experiment/reverse-sr): the front edge is the edge the
-      // price APPROACHES FROM. With the default mapping that is the near edge
-      // (support.top / resistance.bottom); inverted, the setup is entered from
-      // the opposite side, so the front edge flips with the direction.
+      // The front edge is the edge the price APPROACHES FROM. With the standard
+      // bounce mapping that is the near edge (support.top / resistance.bottom);
+      // in Phase 2 the setup trades the reclaimed zone from the opposite side,
+      // so the front edge follows the phase-aware mapped direction.
       return (GetDirectionForBlock(block) == DIR_LONG) ? block.top : block.bottom;
      }
 
@@ -652,17 +652,21 @@ private:
       // v5.34 Part 3 — SHIFTED REVERSAL ENTRY (Phase 2 only). A Touch-1 block
       // is a reclaimed zone being traded as a REVERSAL, so its entry is moved
       // to the OUTER boundary of the block by one full stop distance. That
-      // orders the reversal BEYOND the extreme that rejected the Phase 1 fade,
-      // instead of back inside the zone the original fade already occupied. The
-      // shift is derived from the mapped (Phase 2) direction, so a LONG
-      // reversal lifts the entry and a SHORT reversal lowers it. slDist is
+      // orders the reversal BEYOND the extreme that rejected the Phase 1 bounce,
+      // instead of back inside the zone the bounce already occupied. The
+      // anchor is keyed off the block's OWN type (Phase 2 maps Resistance to a
+      // LONG and Support to a SHORT), so a LONG reversal sits BELOW the block
+      // bottom and a SHORT reversal sits ABOVE the block top. slDist is
       // hoisted here because both the shift and the LIVE PRICE VALIDATION below
       // depend on it, and the validation must judge the SHIFTED price.
       double slDist     = CalcSLDistance(block, atr);
       if(InpShiftReversalEntry && block.touches == 1)
         {
-         double shifted = (GetDirectionForBlock(block) == DIR_LONG) ? entryPrice - slDist
-                                                                   : entryPrice + slDist;
+         // Phase 2 Reversal Outer Boundary Geometry:
+         // Resistance-turned-Support (LONG): Entry is shifted BELOW the block bottom by slDist
+         // Support-turned-Resistance (SHORT): Entry is shifted ABOVE the block top by slDist
+         double shifted = (block.type == BLOCK_RESISTANCE) ? (block.bottom - slDist)
+                                                           : (block.top + slDist);
          entryPrice = SnapToTick(shifted);   // re-snap: the shift may leave the grid
          if(EnableLogging)
             Print("[OrderManager] SHIFTED REVERSAL ENTRY: block ", block.tradeId,
@@ -740,8 +744,8 @@ private:
       // slDist was HOISTED above the live-price pre-flight (v5.34 Part 3): the
       // shifted Phase 2 entry consumes it, and the validation above must see
       // the shifted price. SL/TP/isLong all key off the MAPPED direction
-      // (isLong below) so the inverted setup stops and targets on the correct
-      // side, and the Phase 2 mapping carries straight through.
+      // (isLong below) so each phase stops and targets on the correct side,
+      // and the Phase 2 mapping carries straight through.
       bool   isLong     = (GetDirectionForBlock(block) == DIR_LONG);
       double stopLoss   = isLong ? entryPrice - slDist : entryPrice + slDist;
       // v5.31: the take-profit projection is InpMaxRR (default 4.0R).
@@ -1253,8 +1257,9 @@ private:
      {
       // The reversal target's direction is the MAPPED direction -- the same
       // source InitiateReversal() already uses for m_reversalTargetDir.
-      // Deriving it from the raw zone would make an inverted Support block
-      // reverse into a LONG while the log and target direction said SHORT.
+      // Deriving it from the raw zone would make the Phase 2 S/R flip
+      // reverse into the wrong side while the log and target direction said
+      // otherwise.
       bool isLong  = (GetDirectionForBlock(targetBlock) == DIR_LONG);
       double entryPrice = isLong ? GetAsk() : GetBid();
       double stopLoss   = targetBlock.localSL;

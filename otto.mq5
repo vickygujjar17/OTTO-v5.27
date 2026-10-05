@@ -669,25 +669,27 @@ void UpdateMarketDay(void)
 //+------------------------------------------------------------------+
 //| MAPPED direction of a zone for the portfolio bias vote.         |
 //|                                                                 |
-//| EXPERIMENT (experiment/reverse-sr): a Support / Resistance zone  |
-//| is DISCOVERED polarity, NOT trade direction. HiveMind publishes  |
-//| a LONG / SHORT consensus into the correlation matrix, and the    |
-//| conflict tie-breaker does not merely prefer one of two opposing  |
-//| zones -- it DELETES the losing polarity and vetoes its live      |
-//| orders. Reading the raw zone here would therefore publish the    |
-//| the EXACT OPPOSITE bias to how every entry is mapped, so the hive |
-//| mind would systematically veto exactly the setups this build now  |
-//| takes.                                                            |
+//| A Support / Resistance zone is DISCOVERED polarity, NOT trade    |
+//| direction. HiveMind publishes a LONG / SHORT consensus into the  |
+//| correlation matrix, and the conflict tie-breaker does not merely  |
+//| prefer one of two opposing zones -- it DELETES the losing         |
+//| polarity and vetoes its live orders. Reading the raw zone here    |
+//| would therefore publish the EXACT OPPOSITE bias to how every      |
+//| entry is mapped, so the hive mind would systematically veto       |
+//| exactly the setups this build now takes.                          |
 //|                                                                  |
 //| Byte-identical twin of COttoOrderManager::GetDirectionForBlock()  |
 //| and COttoBlockManager::BlockDirection() (both private): the       |
-//| support<->resistance mapping is permanently INVERTED on this      |
-//| branch (the InpReverseSR toggle was retired in v5.34), so a       |
-//| Support zone maps to DIR_SHORT and a Resistance zone to DIR_LONG. |
+//| standard two-phase mapping is PHASE-AWARE -- a fresh zone          |
+//| (touches == 0) is a PHASE 1 BOUNCE (Support -> DIR_LONG) and a    |
+//| zone that has consumed Touch 1 (touches >= 1) is a PHASE 2        |
+//| REVERSAL that trades the S/R flip (Support -> DIR_SHORT).          |
 //+------------------------------------------------------------------+
-ENUM_TRADE_DIRECTION MappedZoneDirection(const ENUM_BLOCK_TYPE type)
+ENUM_TRADE_DIRECTION MappedZoneDirection(const SSniperBlock &b)
   {
-   return (type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;
+   if(b.touches >= 1)
+      return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Phase 2 — reversal (S/R flip)
+   return (b.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;      // Phase 1 — normal bounce
   }
 
 //+------------------------------------------------------------------+
@@ -709,9 +711,9 @@ void HiveMind(void)
       else if(allBlocks[b].type == BLOCK_RESISTANCE)
          resistanceVote++;
       // Each live zone votes with the direction it would actually TRADE,
-      // not with the polarity it was discovered as (the mapping is
-      // permanently INVERTED on this branch).
-      mappedVote += (MappedZoneDirection(allBlocks[b].type) == DIR_LONG) ? 1 : -1;
+      // not with the polarity it was discovered as: the two-phase mapping
+      // is PHASE-AWARE, so the vote uses the helper rather than the type.
+      mappedVote += (MappedZoneDirection(allBlocks[b]) == DIR_LONG) ? 1 : -1;
      }
 
    int myBias = 0;

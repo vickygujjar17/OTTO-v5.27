@@ -16,14 +16,17 @@
 //+------------------------------------------------------------------+
 
 // Block polarity as DISCOVERED by the pattern engine. Support/Resistance here
-// describe the ZONE, NOT the trade direction. On the experiment/reverse-sr line
-// the mapping is permanently INVERTED (the InpReverseSR toggle was retired in
-// v5.34): a Support zone maps to a SELL and a Resistance zone to a BUY. Enum
-// VALUES are persisted and compared, so they must never be renumbered.
+// describe the ZONE, NOT the trade direction. The zone -> direction mapping is
+// owned by COttoOrderManager::GetDirectionForBlock() and is PHASE-AWARE per the
+// two-phase lifecycle: a fresh zone (touches == 0) is a PHASE 1 BOUNCE
+// (Support -> BUY, Resistance -> SELL); a zone that has consumed Touch 1
+// (touches >= 1) is a PHASE 2 REVERSAL that trades the S/R flip
+// (Support -> SELL, Resistance -> BUY). Enum VALUES are persisted and compared,
+// so they must never be renumbered.
 enum ENUM_BLOCK_TYPE
   {
-   BLOCK_RESISTANCE = 0,  // Resistance zone -> BUY  LIMIT (inverted mapping)
-   BLOCK_SUPPORT    = 1   // Support zone    -> SELL LIMIT (inverted mapping)
+   BLOCK_RESISTANCE = 0,  // Resistance zone (Phase 1 -> SELL, Phase 2 -> BUY)
+   BLOCK_SUPPORT    = 1   // Support zone    (Phase 1 -> BUY,  Phase 2 -> SELL)
   };
 
 enum ENUM_TRADE_DIRECTION
@@ -403,8 +406,9 @@ input group "══════════════════════�
 input group "  [12] VETO REVERSAL CONVERSIONS — v5.34"
 input group "══════════════════════════════════════════════════"
 // v5.34: the old [12] "INVERTED S/R + VIRTUAL ORDERS" experiment block was
-// retired. The S/R inversion is now permanent on this branch (see ENUM_BLOCK_TYPE)
-// and the virtual-order engine was deleted. These five flags let a vetoed setup
+// retired. The zone -> direction mapping is now the standard PHASE-AWARE
+// two-phase lifecycle (see ENUM_BLOCK_TYPE and GetDirectionForBlock) and the
+// virtual-order engine was deleted. These five flags let a vetoed setup
 // be re-used as a REVERSAL candidate instead of being discarded. They are now
 // consumed by v5.34 Part 2: a convertible veto on a Phase 1 block (touches==0)
 // advances it to Touch 2 via COttoBlockManager::TryConvertToReversal instead of

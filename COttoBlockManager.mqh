@@ -95,20 +95,20 @@ private:
 
 
    //+------------------------------------------------------------------+
-   //| EXPERIMENT (experiment/reverse-sr) — DIRECTION CHOKEPOINT.        |
+   //| DIRECTION CHOKEPOINT (standard two-phase lifecycle).            |
    //|                                                                  |
    //| A block's ZONE type is not its TRADE direction: that mapping is   |
-   //| owned by COttoOrderManager::GetDirectionForBlock() and is         |
-   //| permanently INVERTED on this branch for PHASE 1 (the InpReverseSR  |
-   //| toggle was retired in v5.34). This file needs the direction in two |
-   //| places the OrderManager cannot reach (both veto funnel projections),|
-   //| so the same mapping is mirrored here rather than guessed.         |
+   //| owned by COttoOrderManager::GetDirectionForBlock() and mirrored   |
+   //| here. This file needs the direction in two places the OrderManager |
+   //| cannot reach (both veto funnel projections), so the same mapping  |
+   //| is mirrored rather than guessed.                                  |
    //|                                                                  |
-   //| v5.34 Part 3: the mapping is PHASE-AWARE. A block that has consumed|
-   //| Touch 1 (touches >= 1) is a PHASE 2 REVERSAL and flips back, so    |
-   //| support -> LONG. The Front-Run veto projects its target from here, |
-   //| so projecting off the un-flipped direction would veto the live     |
-   //| reversal or miss real front-runs -- silently.                      |
+   //| v5.34 Part 3: the mapping is PHASE-AWARE. A fresh block           |
+   //| (touches == 0) is a PHASE 1 BOUNCE (support -> LONG). A block that |
+   //| has consumed Touch 1 (touches >= 1) is a PHASE 2 REVERSAL and     |
+   //| trades the S/R flip, so support -> SHORT. The Front-Run veto       |
+   //| projects its target from here, so projecting off the wrong phase   |
+   //| would veto the live reversal or miss real front-runs -- silently.  |
    //|                                                                  |
    //| The two implementations deliberately sit side by side in review:   |
    //| they must stay IDENTICAL or the Front-Run veto would project its   |
@@ -119,19 +119,20 @@ private:
    ENUM_TRADE_DIRECTION    BlockDirection(const SSniperBlock &b) const
      {
       if(b.touches >= 1)
-         return (b.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;   // Phase 2
-      return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;      // Phase 1
+         return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Phase 2 — reversal (S/R flip)
+      return (b.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;      // Phase 1 — normal bounce
      }
 
    //+------------------------------------------------------------------+
    //| BlockEntryPrice — Pine entry price for a block, honouring         |
    //| InpEntryStyle. The front edge is the edge price APPROACHES FROM,  |
-   //| which flips with the mapped direction: for a LONG it is             |
+   //| which follows the mapped direction: for a LONG it is               |
    //| support.top / resistance.bottom, mirrored for a SHORT.            |
    //|                                                                  |
    //| This is the exact twin of COttoOrderManager::CalcEntryPrice() and  |
-   //| flips its front edge with the permanently-inverted mapped          |
-   //| direction (a Support zone is a SHORT, entered from the bottom).     |
+   //| flips its front edge with the phase-aware mapped direction (in     |
+   //| Phase 1 a Support zone is a LONG, entered from the top; in Phase 2 |
+   //| it is a SHORT, entered from the bottom).                          |
    //+------------------------------------------------------------------+
    double                  BlockEntryPrice(const SSniperBlock &b) const
      {
@@ -519,6 +520,12 @@ private:
             // -- which supersedes this projection once the order is placed --
             // would sit on the wrong side of price.
             bool   isLong = (BlockDirection(b) == DIR_LONG);
+            // v5.34 Part 2 - mirror the OrderManager's Phase 2 entry anchor so
+            // this projection cannot veto a live reversal from the wrong price.
+            // Once the order rests, b.localTP supersedes this below.
+            if(InpShiftReversalEntry && b.touches == 1)
+               calcEntry = (b.type == BLOCK_RESISTANCE) ? (b.bottom - calcSLDist)
+                                                        : (b.top + calcSLDist);
             double target = isLong ? calcEntry + tpRR * calcSLDist
                                    : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
@@ -675,9 +682,14 @@ private:
             double calcEntry = BlockEntryPrice(b);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-            // EXPERIMENT (experiment/reverse-sr): intra-bar twin of the
-            // Update() projection above — same mapped-direction change.
+            // Intra-bar twin of the Update() projection above — same
+            // phase-aware mapped direction.
             bool   isLong = (BlockDirection(b) == DIR_LONG);
+            // v5.34 Part 2 - same Phase 2 entry anchor as the Update() projector
+            // above, so both intra-bar and bar-close vetoes judge one price.
+            if(InpShiftReversalEntry && b.touches == 1)
+               calcEntry = (b.type == BLOCK_RESISTANCE) ? (b.bottom - calcSLDist)
+                                                        : (b.top + calcSLDist);
             double target = isLong ? calcEntry + tpRR * calcSLDist
                                    : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
