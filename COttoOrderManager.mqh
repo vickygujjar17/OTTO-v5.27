@@ -2115,12 +2115,218 @@ public:
             blocks[i].hasPlacedOrder || blocks[i].limitOrderTicket > 0)
             continue;
 
+         // v5.34 Part 4 -- HYBRID EXECUTION SPLIT. Phase 1 (touches==0) rests a
+         // LIMIT at its mapped entry, exactly as Pine's strategy.entry does.
+         // Phase 2 (touches>=1) is a RECLAIMED zone traded as a REVERSAL, and
+         // its entry is now a dynamically-triggered MARKET order fired by
+         // CheckPhase2MarketTriggers() the moment the market trades through the
+         // outer boundary. Letting this funnel also rest a Phase 2 limit would
+         // double-arm one block through two different execution paths.
+         if(blocks[i].touches >= 1)
+            continue;
+
          // STACKED / OVERLAPPING BLOCK LOCKOUT — skip if an older active
          // primary block of the same type is within 3.0*ATR (keep disarmed).
          if(m_blockManager.IsBlockedByPrimary(i))
             continue;
 
          PlaceLimitOrder(i, blocks[i]);
+        }
+     }
+
+   //+------------------------------------------------------------------+
+   //| PHASE 2 MARKET TRIGGERS (v5.34 Part 4) - DYNAMIC REVERSAL ENTRY  |
+   //|                                                                  |
+   //| A Phase 2 block (touches==1) is a RECLAIMED zone traded as a     |
+   //| REVERSAL from its OUTER boundary. v5.34 Part 3 modelled          |
+   //| that boundary as a resting LIMIT; this funnel replaces it        |
+   //| with a dynamically-triggered MARKET order, so the reversal       |
+   //| is only ever filled by the market actually TRADING THROUGH       |
+   //| the boundary instead of by a price merely touching it.           |
+   //|                                                                  |
+   //| Trigger geometry mirrors PlaceLimitOrder() exactly:              |
+   //|   Resistance -> LONG  : trigger = block.bottom - slDist          |
+   //|                         fires when Ask <= trigger                |
+   //|   Support    -> SHORT : trigger = block.top    + slDist          |
+   //|                         fires when Bid >= trigger                |
+   //| SL / TP / lot math is identical to the limit path, so both       |
+   //| phases stop and target on the same geometry; only the EXECUTION  |
+   //| mechanism differs (TRADE_ACTION_DEAL instead of PENDING).        |
+   //|                                                                  |
+   //| One-shot per block: hasPlacedOrder is latched BEFORE the send    |
+   //| and rolled back on failure, so a requote retry cannot fire the   |
+   //| same block twice. On success the block is retired (touches=2 +   |
+   //| next-bar deletion) exactly as a Touch-2 limit fill is retired in |
+   //| CheckPendingOrderFills().                                        |
+   //+------------------------------------------------------------------+
+   void              CheckPhase2MarketTriggers(void)
+     {
+      if(m_reversalInProgress) return;
+      if(InpSimNewsShield) return;          // Pine sim_news_shield: absolute lockdown
+      if(InpSimMacroVeto) return;           // Pine sim_macro_veto
+
+      SSniperBlock blocks[];
+      int count = m_blockManager.GetAllBlocks(blocks);
+      for(int i = 0; i < count; i++)
+        {
+         // Phase 2 candidates ONLY: armed, Touch-1, still live, and with no
+         // resting broker order (this path never creates one).
+         if(!blocks[i].isArmed || blocks[i].isVetoed || blocks[i].isTriggered ||
+            blocks[i].touches != 1 || blocks[i].hasPlacedOrder ||
+            blocks[i].limitOrderTicket > 0)
+            continue;
+
+         // STACKED / OVERLAPPING BLOCK LOCKOUT - the same rule the limit
+         // funnel applies, so the two execution paths can never enter the
+         // same cluster twice.
+         if(m_blockManager.IsBlockedByPrimary(i))
+            continue;
+
+         double atr = m_blockManager.GetATR();
+         if(atr <= 0) continue;
+
+         // Phase 2 trigger price - the SAME shifted outer-boundary anchor the
+         // limit path uses, so a change to the geometry moves both at once.
+         double slDist       = CalcSLDistance(blocks[i], atr);
+         double triggerPrice = SnapToTick(CalcEntryPrice(blocks[i]));
+         if(InpShiftReversalEntry && blocks[i].touches == 1)
+            triggerPrice = SnapToTick((blocks[i].type == BLOCK_RESISTANCE)
+                                      ? (blocks[i].bottom - slDist)
+                                      : (blocks[i].top + slDist));
+
+         ENUM_TRADE_DIRECTION dir    = GetDirectionForBlock(blocks[i]);
+         bool                 isLong = (dir == DIR_LONG);
+
+         // THE CROSS TEST. This is a MARKET condition, not a resting price: a
+         // LONG reversal fires once the market has traded DOWN to (or through)
+         // the outer boundary, a SHORT once it has traded UP to it.
+         double ask = GetAsk();
+         double bid = GetBid();
+         if(isLong ? (ask > triggerPrice) : (bid < triggerPrice))
+            continue;
+
+         // --- Pine gates: the identical ladder PlaceLimitOrder() applies ---
+         if(!IsSpreadAcceptable()) continue;
+         if(!CanPlaceForDirection(blocks[i])) continue;
+         if(m_correlationFilter != NULL && m_correlationFilter.IsTradeVetoed(dir))
+           {
+            if(EnableLogging)
+               Print("[Correlation] VETO on ", m_symbol,
+                     (dir == DIR_LONG ? " LONG" : " SHORT"), " (Phase 2 trigger)");
+            continue;
+           }
+         if(m_correlationFilter != NULL &&
+            m_correlationFilter.IsConsensusOpposed(m_symbol, dir))
+           {
+            SSniperBlock vet = blocks[i];
+            vet.isVetoed   = true;
+            vet.vetoReason = VETO_CORRELATION;
+            m_blockManager.SetBlockAt(i, vet);
+            if(EnableLogging)
+               Print("[Correlation] VECTOR VETO on ", m_symbol,
+                     (dir == DIR_LONG ? " LONG" : " SHORT"), " (Phase 2 trigger)");
+            continue;
+           }
+         if(!SentimentPasses(blocks[i])) continue;
+
+         // --- SL / TP / size: same math as the Phase 2 limit path ---
+         double stopLoss   = isLong ? triggerPrice - slDist : triggerPrice + slDist;
+         double adjustedSL = stopLoss;
+         if(!ValidateStopDistance(triggerPrice, adjustedSL, isLong))
+            adjustedSL = AdjustSLToMinimum(triggerPrice, adjustedSL, isLong);
+
+         double lotSize = m_riskManager.CalculateLotSize(triggerPrice, adjustedSL);
+         if(lotSize <= 0)
+           {
+            if(EnableLogging)
+               Print("[OrderManager] PHASE2 TRIGGER SAFETY ABORT: lot size zero (suppressed)");
+            continue;
+           }
+         if(lotSize < m_riskManager.GetVolumeMin() ||
+            lotSize > m_riskManager.GetVolumeMax())
+           {
+            Print("[OrderManager] PHASE2 TRIGGER: invalid volume");
+            continue;
+           }
+         if(!m_riskManager.HasSufficientMargin(lotSize)) continue;
+
+         double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
+
+         // --- Build the MARKET request (DEAL, not PENDING) ---
+         MqlTradeRequest request;
+         MqlTradeResult  result;
+         ZeroMemory(request);
+         ZeroMemory(result);
+         request.action    = TRADE_ACTION_DEAL;
+         request.symbol    = m_symbol;
+         request.type      = isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+         request.volume    = lotSize;
+         request.price     = SnapToTick(isLong ? ask : bid);
+         request.sl        = NormalizeDouble(adjustedSL, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
+         request.tp        = 0;   // NO TP - exact mirror of Pine (trail-only exits)
+         request.deviation = MaxSlippage;
+         request.magic     = MagicNumber;
+         request.comment   = BuildOrderComment(blocks[i].serial, 0);
+
+         // Optimistic one-shot lock (mirrors PlaceLimitOrder). Prevents a
+         // concurrent tick or a requote retry from firing this block twice.
+         SSniperBlock block = blocks[i];
+         block.hasPlacedOrder = true;
+         m_blockManager.SetBlockAt(i, block);
+
+         if(!SendOrderWithRetry(request, result))
+           {
+            // The trigger did not execute - release the lock so the block is
+            // eligible again on the next tick.
+            block.hasPlacedOrder = false;
+            m_blockManager.SetBlockAt(i, block);
+            continue;
+           }
+
+         // --- Commit the filled state ---
+         // local_* carry the SAME geometry the limit path stores, so
+         // SeedActiveTradeFromBlock() rebuilds identical basket 1R math.
+         block.localEntry = triggerPrice;
+         block.localSL    = adjustedSL;
+         block.localTP    = isLong ? triggerPrice + tpRR * slDist
+                                   : triggerPrice - tpRR * slDist;
+         block.rrUnit     = slDist;
+
+         // Phase 2 is now consumed: retire the zone on the next bar, exactly
+         // as a Touch-2 limit fill does in CheckPendingOrderFills().
+         block.touches            = 2;
+         block.isTriggered        = true;
+         block.hasPlacedOrder     = true;
+         block.limitOrderTicket   = 0;
+         block.pendingOrderCancel = false;
+         block.priceAbortLogged   = false;
+         block.deleteOnBarTime    = iTime(m_symbol, PERIOD_CURRENT, 0);
+         m_blockManager.SetBlockAt(i, block);
+
+         // Journal the entry under its own session ID, then seed the basket.
+         if(m_journal != NULL)
+           {
+            MqlDateTime ptm; TimeToStruct(TimeCurrent(), ptm);
+            string pts = StringFormat("%04d%02d%02d-%02d%02d%02d",
+                                      ptm.year, ptm.mon, ptm.day,
+                                      ptm.hour, ptm.min, ptm.sec);
+            m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d",
+                                                m_symbol, pts, block.serial));
+            m_journal.LogOrderPlaced(result.order, dir, block.type,
+                                     triggerPrice, adjustedSL, lotSize, block);
+           }
+
+         SeedActiveTradeFromBlock(block, result.order);
+         m_ordersFilled++;
+
+         if(EnableLogging)
+            Print("[OrderManager] PHASE 2 MARKET TRIGGER: ", block.tradeId,
+                  " ticket=", result.order,
+                  " dir=", (dir == DIR_LONG ? "LONG" : "SHORT"),
+                  " trigger=", DoubleToString(triggerPrice, _Digits),
+                  " entry=", DoubleToString(request.price, _Digits),
+                  " sl=", DoubleToString(adjustedSL, _Digits),
+                  " rrUnit=", DoubleToString(slDist, _Digits));
         }
      }
 

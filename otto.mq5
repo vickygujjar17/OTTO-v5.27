@@ -944,7 +944,13 @@ void OnTick(void)
    // Gated further by news blackout + daily-DD pause.
    // ================================================================
    if(!g_newsFilter.IsInNewsBlackout() && !g_dailyDD_Paused)
+     {
+      // Phase 1 (touches==0): resting LIMIT orders at the mapped entry.
       g_orderManager.PlaceOrdersForArmedBlocks();
+      // Phase 2 (touches==1): dynamically-triggered MARKET reversals, fired
+      // the moment price trades through the reclaimed zone's outer boundary.
+      g_orderManager.CheckPhase2MarketTriggers();
+     }
 
    // ================================================================
    // STEP 5: MANAGE ACTIVE TRADES â€” dynamic trail (every tick)
