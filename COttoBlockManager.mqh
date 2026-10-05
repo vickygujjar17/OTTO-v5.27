@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.35"
+#property version   "5.36"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -196,6 +196,7 @@ private:
 
       SSniperBlock b   = m_blocks[index];    // copy — no struct reference
       b.touches        = 1;                  // Phase 2 (Touch 1 consumed)
+      b.conversionReason = reason;           // v5.36: record the convertible veto that upgraded us
       b.isArmed        = false;
       b.hasPlacedOrder = false;
       b.hasExited      = false;
@@ -1135,6 +1136,7 @@ public:
 
          SSniperBlock sib = m_blocks[j];   // copy — persist before the cancel request
          sib.touches        = 1;           // Phase 2 (Touch 1 consumed)
+         sib.conversionReason = VETO_NONE; // v5.36: Phase 2 reached normally — NOT a veto conversion
          sib.isArmed        = false;
          sib.isTriggered    = false;
          sib.hasPlacedOrder = false;

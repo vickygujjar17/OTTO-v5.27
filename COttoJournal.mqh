@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.35"
+#property version   "5.36"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -295,6 +295,30 @@ public:
          Print("[Journal] FileMove FAILED (err=", err, ") for ", fname, " -> ", cancelledName);
         }
 
+      SendMailFromFile();
+     }
+
+   //+----------------------------------------------------------------+
+   //| LOG CONVERSION (v5.36) - Phase 1 dropped for Phase 2 Reversal  |
+   //| Appends a conversion notice + emails [CONVERTED TO REVERSAL].  |
+   //| Unlike LogCancellation() this does NOT rename the session file |
+   //| to CANCELLED_ : the setup is still live, merely re-phased.     |
+   //+----------------------------------------------------------------+
+   void              LogConversion(ulong ticket, ENUM_BLOCK_TYPE btype, string reason)
+     {
+      if(!m_ready) return;
+      if(!OpenAppend())
+        {
+         if(!OpenWrite()) return;   // no prior file -> create it
+        }
+      W("================================================================");
+      W("[CONVERTED TO REVERSAL] Session " + m_sessionID + " | " + m_symbol + " | " + TimeToString(TimeCurrent()));
+      W("  Ticket Dropped    : #" + IntegerToString((int)ticket));
+      W("  Block Polarity    : " + (btype == BLOCK_SUPPORT ? "SUPPORT" : "RESISTANCE"));
+      W("  Trigger Event     : " + reason);
+      W("  Next Action       : Phase 1 order cancelled; Block upgraded to Phase 2 Reversal.");
+      W("================================================================");
+      CloseHandle();
       SendMailFromFile();
      }
   };

@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.35"
+#property version   "5.36"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -2359,22 +2359,41 @@ public:
                          " (", blocks[i].tradeId, ")");
                 if(m_journal != NULL)
                   {
-                   string cancelReason = "Manual";
-                   if(blocks[i].vetoReason == VETO_FRONTRUN)       cancelReason = "Fired Front-Run 1:3 Veto";
-                   else if(blocks[i].vetoReason == VETO_STALE)     cancelReason = "Stale Veto (45D)";
-                   else if(blocks[i].vetoReason == VETO_NEARMISS)  cancelReason = "Near-Miss Veto (6D)";
-                   else if(blocks[i].vetoReason == VETO_MOMENTUM)  cancelReason = "Momentum Veto";
-                   else if(blocks[i].vetoReason == VETO_FVG)        cancelReason = "FVG Veto";
-                   else if(blocks[i].vetoReason == VETO_SIZING)     cancelReason = "Sizing Veto";
-                   else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
-                   else if(blocks[i].vetoReason == VETO_BROKEN)     cancelReason = "Block Broken";
-                   else if(blocks[i].vetoReason == VETO_FLIPPED)    cancelReason = "Block Flipped";
-                   else if(blocks[i].vetoReason == VETO_CORRELATION) cancelReason = "Vector Consensus Veto";
-                   else if(blocks[i].pendingOrderCancel)           cancelReason = "Manual / Direction Conflict";
-                   MqlDateTime ctm; TimeToStruct(TimeCurrent(), ctm);
-                   string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
-                   m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial));
-                   m_journal.LogCancellation(cancelReason);
+                   // v5.36: a block whose Phase 2 promotion came from a convertible
+                   // veto is NOT a fatal cancel: it is a re-phase. Journal (and email)
+                   // a conversion notice instead of a CANCELLED_ rename.
+                   if(blocks[i].conversionReason != VETO_NONE && blocks[i].touches >= 1)
+                     {
+                      string convReason = "Fired Front-Run 1:4 Veto";
+                      if(blocks[i].conversionReason == VETO_NEARMISS)      convReason = "Near-Miss Veto (6D)";
+                      else if(blocks[i].conversionReason == VETO_STALE)    convReason = "Stale Veto (45D)";
+                      else if(blocks[i].conversionReason == VETO_MOMENTUM) convReason = "Momentum Veto";
+                      else if(blocks[i].conversionReason == VETO_FVG)      convReason = "FVG Veto";
+
+                      MqlDateTime ctm2; TimeToStruct(TimeCurrent(), ctm2);
+                      string cts2 = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm2.year, ctm2.mon, ctm2.day, ctm2.hour, ctm2.min, ctm2.sec);
+                      m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts2, blocks[i].serial));
+                      m_journal.LogConversion(blocks[i].limitOrderTicket, blocks[i].type, convReason);
+                     }
+                   else
+                     {
+                      string cancelReason = "Manual";
+                      if(blocks[i].vetoReason == VETO_FRONTRUN)       cancelReason = "Fired Front-Run 1:4 Veto";
+                      else if(blocks[i].vetoReason == VETO_STALE)     cancelReason = "Stale Veto (45D)";
+                      else if(blocks[i].vetoReason == VETO_NEARMISS)  cancelReason = "Near-Miss Veto (6D)";
+                      else if(blocks[i].vetoReason == VETO_MOMENTUM)  cancelReason = "Momentum Veto";
+                      else if(blocks[i].vetoReason == VETO_FVG)        cancelReason = "FVG Veto";
+                      else if(blocks[i].vetoReason == VETO_SIZING)     cancelReason = "Sizing Veto";
+                      else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
+                      else if(blocks[i].vetoReason == VETO_BROKEN)     cancelReason = "Block Broken";
+                      else if(blocks[i].vetoReason == VETO_FLIPPED)    cancelReason = "Block Flipped";
+                      else if(blocks[i].vetoReason == VETO_CORRELATION) cancelReason = "Vector Consensus Veto";
+                      else if(blocks[i].pendingOrderCancel)           cancelReason = "Manual / Direction Conflict";
+                      MqlDateTime ctm; TimeToStruct(TimeCurrent(), ctm);
+                      string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
+                      m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial));
+                      m_journal.LogCancellation(cancelReason);
+                     }
                   }
                }
            }

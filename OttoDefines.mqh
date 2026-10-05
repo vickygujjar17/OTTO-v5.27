@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.35 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.36 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.35"
-#property description "OTTO v5.35 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.36"
+#property description "OTTO v5.36 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -139,6 +139,11 @@ struct SSniperBlock
    // normal entry) consumed, 2 = Touch 2 (the shifted reversal) consumed. It is
    // zeroed by ZeroMemory() at every block-creation site (see COttoBlockManager).
    int               touches;
+   // v5.36: why this zone was promoted to a Phase 2 reversal — the convertible
+   // veto that triggered the conversion. VETO_NONE when the block reached
+   // Phase 2 normally (or never did). Zeroed by ZeroMemory() at every
+   // block-creation site, so a fresh block reads VETO_NONE.
+   ENUM_VETO_REASON  conversionReason;
 
    // --- Order data (Pine: local_sl / local_tp / local_entry / rr_unit / trade_id) ---
    ulong             limitOrderTicket; // resting broker pending-order ticket (0 = none)
@@ -364,7 +369,7 @@ input double   SafetyMaxFloatingLoss = 0.90;  // Hard cap: smart-trim at this % 
 input double   InpTrimLoserStopPct = 70.0;    // Smart trim: non-primary legs >= this % toward SL
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.35"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.36"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart
@@ -376,7 +381,7 @@ input int      InpAnchorTF           = PERIOD_H1;  // Anchor candle timeframe (H
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
 
 input group "══════════════════════════════════════════════════"
-input group "  [10] HIGH TABLE AUDITOR — v5.35"
+input group "  [10] HIGH TABLE AUDITOR — v5.36"
 input group "══════════════════════════════════════════════════"
 // Decoupled watchdog: audits live state on its OWN timer cadence rather
 // than inside OnTick, so a halted / paused / tick-starved trade loop can
@@ -386,7 +391,7 @@ input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
 input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
 
 input group "══════════════════════════════════════════════════"
-input group "  [11] MANUAL TRADE ADOPTION — v5.35"
+input group "  [11] MANUAL TRADE ADOPTION — v5.36"
 input group "══════════════════════════════════════════════════"
 // Let this EA manage positions opened BY HAND on its own chart symbol.
 // A manual position is identified as a MAGIC-0 position on m_symbol: the
@@ -403,7 +408,7 @@ input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual
 
 //+------------------------------------------------------------------+
 input group "══════════════════════════════════════════════════"
-input group "  [12] VETO REVERSAL CONVERSIONS — v5.35"
+input group "  [12] VETO REVERSAL CONVERSIONS — v5.36"
 input group "══════════════════════════════════════════════════"
 // v5.34: the old [12] "INVERTED S/R + VIRTUAL ORDERS" experiment block was
 // retired. The zone -> direction mapping is now the standard PHASE-AWARE
@@ -413,11 +418,11 @@ input group "══════════════════════�
 // consumed by v5.34 Part 2: a convertible veto on a Phase 1 block (touches==0)
 // advances it to Touch 2 via COttoBlockManager::TryConvertToReversal instead of
 // deleting the zone outright.
-input bool     InpRevFrontRun = true;   // Convert Front-Run Vetoes to Reversal
-input bool     InpRevNearMiss = true;   // Convert Near-Miss Vetoes to Reversal
-input bool     InpRevStale    = false;  // Convert Stale (45D) Vetoes to Reversal
-input bool     InpRevMom      = true;   // Convert Momentum Vetoes to Reversal
-input bool     InpRevFvg      = true;   // Convert FVG Vetoes to Reversal
+input bool     InpRevFrontRun = true;   // Convert Front-Run Veto to Phase 2 Reversal
+input bool     InpRevNearMiss = true;   // Convert Near-Miss Veto to Phase 2 Reversal
+input bool     InpRevStale    = true;   // Convert Stale Veto to Phase 2 Reversal
+input bool     InpRevMom      = true;   // Convert Momentum Veto to Phase 2 Reversal
+input bool     InpRevFvg      = true;   // Convert FVG Veto to Phase 2 Reversal
 //| Global Constants                                                 |
 //+------------------------------------------------------------------+
 #define MAX_BLOCKS        50        // Max concurrent S/R blocks (memory safety)
