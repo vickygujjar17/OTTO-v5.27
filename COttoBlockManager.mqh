@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.36"
+#property version   "5.37"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -1092,6 +1092,24 @@ public:
       if(ticket <= 0) return -1;
       for(int i = 0; i < m_blockCount; i++)
          if(m_blocks[i].limitOrderTicket == ticket)
+            return i;
+      return -1;
+     }
+
+   //+------------------------------------------------------------------+
+   //| Finds a block by its unique serial (or -1)                       |
+   //|                                                                  |
+   //| v5.37 Part 3: the virtual-order engine keys its book by serial,  |
+   //| not by array index, because RemoveBlock() compacts m_blocks[] and |
+   //| a stored index would dangle. This is the serial twin of          |
+   //| FindBlockIndexByTicket() (which can no longer be used once no    |
+   //| broker ticket exists to key on).                                  |
+   //+------------------------------------------------------------------+
+   int               FindBlockIndexBySerial(int serial)
+     {
+      if(serial <= 0) return -1;
+      for(int i = 0; i < m_blockCount; i++)
+         if(m_blocks[i].serial == serial)
             return i;
       return -1;
      }

@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.36"
+#property version   "5.37"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -46,9 +46,20 @@ private:
    bool                    m_adoptedManual;
    datetime                m_manualNoSLWarnTick;
 
-   // --- Pending limit order tracking ---
-   ulong                   m_pendingLimitTickets[];
-   int                     m_pendingLimitCount;
+   // --- Virtual Order Engine (v5.37 Part 1) ---------------------------
+   // Phase 1/2 setups are held in memory and executed as MARKET orders
+   // when price reaches the zone, bypassing broker pending-price rules.
+   struct SVirtualOrder
+     {
+      int                  blockIndex;
+      int                  blockSerial;
+      ENUM_TRADE_DIRECTION direction;
+      double               triggerPrice;
+      double               stopLoss;
+      double               lotSize;
+     };
+   SVirtualOrder           m_virtualOrders[];
+   int                     m_virtualCount;
 
    // --- Statistics ---
    int                     m_ordersPlaced;
@@ -599,12 +610,10 @@ private:
       if(block.isVetoed || block.isTriggered || block.hasPlacedOrder)
          return false;
 
-      // Duplicate prevention: triple-ticket verification
-      if(IsBlockOrderAlive(block.limitOrderTicket))
-        {
-         block.priceAbortLogged = false;   // v5.30: new episode may log again
-         return true;
-        }
+      // v5.37 Part 3: the broker-limit duplicate guard is gone with the
+      // pending path. The virtual order IS the armed state (hasPlacedOrder
+      // is the latch; CheckVirtualTriggers() is the executor), so there is
+      // no broker ticket to re-verify here.
       block.limitOrderTicket = 0;
       block.pendingOrderCancel = false;
 
@@ -778,79 +787,38 @@ private:
         }
       if(!m_riskManager.HasSufficientMargin(lotSize)) return false;
 
-      // --- Build the pending order request ---
-      MqlTradeRequest request;
-      MqlTradeResult  result;
-      ZeroMemory(request);
-      ZeroMemory(result);
-      request.action   = TRADE_ACTION_PENDING;
-      request.symbol   = m_symbol;
-      request.type     = GetOrderTypeForBlock(block);
-      request.volume   = lotSize;
-      request.price    = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
-      request.sl       = NormalizeDouble(adjustedSL, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
-      request.tp       = 0;   // NO TP — exact mirror of Pine (trail-only exits)
-      request.deviation = MaxSlippage;
-      request.magic    = MagicNumber;
-      request.comment  = BuildOrderComment(block.serial, 0);   // v5.27: clamped to 31
+      // --- v5.37 Part 1: ARM A VIRTUAL ORDER (no broker send) ----------
+      // Replaces the old TRADE_ACTION_PENDING send. The setup is held in
+      // memory and executed as a MARKET order once price reaches the zone
+      // (the trigger logic lands in a later part of this change). Nothing
+      // is sent to the broker here, so broker pending-price rules (stops
+      // level, freeze level, Invalid Price) no longer gate the placement.
+      SVirtualOrder vo;
+      vo.blockIndex   = blockIndex;
+      vo.blockSerial  = block.serial;
+      vo.direction    = dir;
+      vo.triggerPrice = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
+      vo.stopLoss     = NormalizeDouble(adjustedSL, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
+      vo.lotSize      = lotSize;
 
-      if(request.volume < m_riskManager.GetVolumeMin() ||
-         request.volume > m_riskManager.GetVolumeMax())
-        {
-         Print("[OrderManager] Invalid volume");
-         return false;
-        }
+      int vIdx = ArraySize(m_virtualOrders);
+      ArrayResize(m_virtualOrders, vIdx + 1);
+      m_virtualOrders[vIdx] = vo;
+      m_virtualCount = ArraySize(m_virtualOrders);
 
       // Optimistic lock to prevent concurrent tick duplicate firing
       block.hasPlacedOrder = true;
       m_blockManager.SetBlockAt(blockIndex, block);
 
-      if(SendOrderWithRetry(request, result))
-        {
-          block.limitOrderTicket = result.order;
-          block.pendingOrderCancel = false;
-          block.priceAbortLogged = false;   // v5.30: order live, gate re-armed
-          m_blockManager.SetBlockOrderTicket(blockIndex, result.order);
-          m_blockManager.SetBlockAt(blockIndex, block);
-          // build a session ID at PLACE time so the journal file is created immediately
-          MqlDateTime ptm; TimeToStruct(TimeCurrent(), ptm);
-          string pts = StringFormat("%04d%02d%02d-%02d%02d%02d", ptm.year, ptm.mon, ptm.day, ptm.hour, ptm.min, ptm.sec);
-          if(m_journal != NULL)
-            {
-             m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, pts, block.serial));
-             m_journal.LogOrderPlaced(result.order, GetDirectionForBlock(block), block.type, entryPrice, adjustedSL, lotSize, block);
-            }
-         if(EnableLogging)
-            Print("[OrderManager] LIMIT PLACED: ", block.tradeId,
-                  " ticket=", result.order,
-                  " entry=", DoubleToString(entryPrice, _Digits),
-                  " sl=", DoubleToString(adjustedSL, _Digits),
-                  " rrUnit=", DoubleToString(slDist, _Digits));
-         return true;
-        }
-      else
-        {
-         // Rollback the lock if the order completely failed to place
-         block.hasPlacedOrder = false;
-         m_blockManager.SetBlockAt(blockIndex, block);
-         return false;
-        }
+      if(EnableLogging)
+         Print("[OrderManager] VIRTUAL ORDER ARMED for block ", block.tradeId,
+               " at price ", DoubleToString(entryPrice, _Digits),
+               " sl=", DoubleToString(adjustedSL, _Digits),
+               " lot=", DoubleToString(lotSize, 2),
+               " rrUnit=", DoubleToString(slDist, _Digits));
+      return true;
      }
 
-
-   //+------------------------------------------------------------------+
-   //| Triple-ticket verification: is this broker order still pending? |
-   //+------------------------------------------------------------------+
-   bool                    IsBlockOrderAlive(ulong ticket)
-     {
-      if(ticket <= 0) return false;
-      if(OrderSelect(ticket))
-        {
-         ENUM_ORDER_STATE state = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
-         return (state == ORDER_STATE_PLACED || state == ORDER_STATE_PARTIAL);
-        }
-      return false;
-     }
 
    //+------------------------------------------------------------------+
    //| HARD ANTI-DUPLICATE: scans the broker's LIVE pending-order pool   |
@@ -887,124 +855,6 @@ private:
       return false;
      }
 
-
-   //+------------------------------------------------------------------+
-   //| 3-TIER FILL DETECTION                                            |
-   //|                                                                  |
-   //| MT5 hedging mode gives a filled limit order a position ticket    |
-   //| unrelated to the order ticket, so resolve it by three sequential |
-   //| fallbacks, cheapest and most reliable first:                     |
-   //|                                                                  |
-   //|   TIER 1  PositionSelectByTicket(pending order ticket)           |
-   //|           Valid when the broker reuses the order id as position  |
-   //|           id (common on MT5 netting-style fills).                |
-   //|                                                                  |
-   //|   TIER 2  Deal history -> DEAL_POSITION_ID                       |
-   //|           Authoritative: find the IN deal whose DEAL_ORDER is    |
-   //|           the pending order and take its DEAL_POSITION_ID.       |
-   //|                                                                  |
-   //|   TIER 3  Magic+symbol scan EXCLUDING the currently tracked      |
-   //|           ticket. Last resort, but also the only tier that       |
-   //|           cannot return a stale pyramiding tranche.              |
-   //|                                                                  |
-   //| excludeTicket is the position already tracked; passing it makes  |
-   //| every tier refuse to re-adopt the incumbent position.            |
-   //+------------------------------------------------------------------+
-   bool                    ResolveFilledPositionTicket(ulong orderTicket,
-                                                       ulong excludeTicket,
-                                                       ulong &outTicket,
-                                                       ENUM_TRADE_DIRECTION &outDir)
-     {
-      outTicket = 0; outDir = DIR_NONE;
-      if(orderTicket <= 0) return false;
-
-      // ---- TIER 1: position ticket == pending order ticket -------------
-      // Guarded by excludeTicket for the same reason TIER 2 and TIER 3 are:
-      // if the incumbent position happens to share the id of a DIFFERENT
-      // pending order, echoing it back would mask a genuine reversal fill.
-      if(orderTicket != excludeTicket && PositionSelectByTicket(orderTicket))
-        {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
-            PositionGetString(POSITION_SYMBOL) == m_symbol)
-           {
-            outTicket = (ulong)PositionGetInteger(POSITION_TICKET);
-            outDir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-                     ? DIR_LONG : DIR_SHORT;
-            if(EnableLogging)
-               Print("[OrderManager] FILL TIER 1: position id matched order ticket ",
-                     orderTicket);
-            return true;
-           }
-        }
-
-      // ---- TIER 2: history -> DEAL_POSITION_ID ------------------------
-      // Scope the query tightly to avoid scanning the whole account book.
-      datetime from = TimeCurrent() - 7 * 24 * 60 * 60;
-      if(HistorySelect(from, TimeCurrent() + 60))
-        {
-         int deals = HistoryDealsTotal();
-         // Walk newest-first: the fill we care about is the most recent.
-         for(int d = deals - 1; d >= 0; d--)
-           {
-            ulong dt = HistoryDealGetTicket(d);
-            if(dt <= 0) continue;
-            if(HistoryDealGetInteger(dt, DEAL_ORDER) != (long)orderTicket) continue;
-            if(HistoryDealGetInteger(dt, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
-            if(HistoryDealGetString(dt, DEAL_SYMBOL) != m_symbol) continue;
-            if(HistoryDealGetInteger(dt, DEAL_MAGIC) != MagicNumber) continue;
-
-            ulong posId = (ulong)HistoryDealGetInteger(dt, DEAL_POSITION_ID);
-            if(posId <= 0) continue;
-            if(excludeTicket > 0 && posId == excludeTicket) continue;
-
-            if(PositionSelectByTicket(posId) &&
-               PositionGetString(POSITION_SYMBOL) == m_symbol &&
-               PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-              {
-               outTicket = posId;
-               outDir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-                        ? DIR_LONG : DIR_SHORT;
-               if(EnableLogging)
-                  Print("[OrderManager] FILL TIER 2: history resolved order ",
-                        orderTicket, " -> position ", posId);
-               return true;
-              }
-           }
-        }
-
-      // ---- TIER 3: magic+symbol scan, excluding the tracked ticket -----
-      // Newest position wins so a fresh fill cannot be confused with an
-      // older pyramid tranche of the same basket.
-      ulong    bestTicket = 0;
-      datetime bestTime   = 0;
-      for(int i = PositionsTotal() - 1; i >= 0; i--)
-        {
-         ulong pt = PositionGetTicket(i);
-         if(pt <= 0 || !PositionSelectByTicket(pt)) continue;
-         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-         if(excludeTicket > 0 && pt == excludeTicket) continue;
-
-         datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
-         if(opened >= bestTime)
-           {
-            bestTime   = opened;
-            bestTicket = pt;
-           }
-        }
-      if(bestTicket > 0)
-        {
-         outTicket = bestTicket;
-         outDir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-                  ? DIR_LONG : DIR_SHORT;
-         if(EnableLogging)
-            Print("[OrderManager] FILL TIER 3: magic/symbol scan found position ",
-                  bestTicket, " (excluded tracked=", excludeTicket, ")");
-         return true;
-        }
-
-      return false;
-     }
 
    //+------------------------------------------------------------------+
    //| Scans live positions for our Magic+symbol. excludeTicket lets a  |
@@ -1067,39 +917,15 @@ private:
       return count;
      }
 
+   //+------------------------------------------------------------------+
+   //| v5.37 Part 3: the pending book IS the in-memory virtual engine.  |
+   //| Returns the count of armed virtual orders. Kept under the old     |
+   //| name so every existing caller (AdoptManualPosition()'s gate, the  |
+   //| EA's CountMyPending() wrapper) reads exactly what it always did.  |
+   //+------------------------------------------------------------------+
    int                     CountMyPendingOrders(void)
      {
-      int count = 0;
-      for(int i = OrdersTotal() - 1; i >= 0; i--)
-        {
-         ulong ticket = OrderGetTicket(i);
-         if(ticket > 0 && OrderSelect(ticket))
-           {
-            if(OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
-               OrderGetString(ORDER_SYMBOL) == m_symbol)
-               count++;
-           }
-        }
-      return count;
-     }
-
-   ulong                   GetMyPendingOrderByIndex(int index)
-     {
-      int count = 0;
-      for(int i = OrdersTotal() - 1; i >= 0; i--)
-        {
-         ulong ticket = OrderGetTicket(i);
-         if(ticket > 0 && OrderSelect(ticket))
-           {
-            if(OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
-               OrderGetString(ORDER_SYMBOL) == m_symbol)
-              {
-               if(count == index) return ticket;
-               count++;
-              }
-           }
-        }
-      return 0;
+      return m_virtualCount;
      }
 
    //+------------------------------------------------------------------+
@@ -1171,28 +997,6 @@ private:
             " newSL=", DoubleToString(newSL, _Digits),
             " retcode=", modRes.retcode, " | total=", m_stopModifyFailures);
 
-      return false;
-     }
-
-   //+------------------------------------------------------------------+
-   //| Deletes a pending order by ticket                                |
-   //+------------------------------------------------------------------+
-   bool                    DeleteOrder(ulong ticket)
-     {
-      if(!OrderSelect(ticket)) return false;
-      MqlTradeRequest delReq;
-      MqlTradeResult  delRes;
-      ZeroMemory(delReq);
-      delReq.action = TRADE_ACTION_REMOVE;
-      delReq.order  = ticket;
-      delReq.magic  = MagicNumber;
-      delReq.comment = TradeComment + "_DEL";
-      if(SendOrderWithRetry(delReq, delRes))
-        {
-         if(EnableLogging)
-            Print("[OrderManager] Order DELETED: ticket=", ticket);
-         return true;
-        }
       return false;
      }
 
@@ -1560,145 +1364,17 @@ private:
 
 
    //+------------------------------------------------------------------+
-   //| Detects when a resting limit order has been FILLED. Seeds the   |
-   //| active trade from the block and marks the block triggered.      |
+   //| Removes a virtual order (v5.37 Part 2). Compacts the array in   |
+   //| place, exactly as COttoBlockManager::RemoveBlock() does, so the |
+   //| reverse-walk in CheckVirtualTriggers() stays index-safe.        |
    //+------------------------------------------------------------------+
-   void                    CheckPendingOrderFills(void)
+   void                    RemoveVirtualOrderAt(int index)
      {
-      SSniperBlock blocks[];
-      int count = m_blockManager.GetAllBlocks(blocks);
-      for(int i = 0; i < count; i++)
-        {
-         if(blocks[i].limitOrderTicket <= 0)
-            continue;
-         ulong ticket = blocks[i].limitOrderTicket;
-
-         // Order still resting?
-         if(IsBlockOrderAlive(ticket))
-            continue;
-
-         // Order is gone — filled, canceled, or expired.
-         // ---- STEP 1: 3-TIER FILL DETECTION -----------------------------
-         // excludeTicket = the position we already track, so no tier can
-         // re-adopt the incumbent and mask a genuine reversal fill.
-         ulong tracked = m_hasActiveTrade ? m_activeTrade.ticket : 0;
-         ulong newTicket; ENUM_TRADE_DIRECTION newDir;
-         if(ResolveFilledPositionTicket(ticket, tracked, newTicket, newDir))
-           {
-            // ---- STEP 2: STOP-AND-REVERSE ------------------------------
-            // MT5 hedging mode ADDS the new position instead of offsetting
-            // the old leg, so an opposite-side fill leaves both baskets
-            // live. Close the incumbent basket first, then adopt the new
-            // position. The exit is journaled HERE, in the still-current
-            // session, before the incoming fill mints its own session ID.
-            if(m_hasActiveTrade && m_activeTrade.ticket != newTicket)
-              {
-               if(EnableLogging)
-                  Print("[OrderManager] SAR REVERSAL: closing opposing basket ",
-                        "(tracked=", m_activeTrade.ticket,
-                        " dir=", (m_activeDirection == DIR_LONG ? "LONG" : "SHORT"),
-                        ") -> new=", newTicket,
-                        " dir=", (newDir == DIR_LONG ? "LONG" : "SHORT"));
-
-               bool wasReversing    = m_reversalInProgress;
-               m_reversalInProgress = true;
-               // FIX (v5.20): logExit=TRUE. The outgoing basket's exit price,
-               // fees and net P/L must reach the CURRENT session journal and
-               // the email report BEFORE the incoming fill seeds its own
-               // fresh session ID and basket. Deferring this (the old
-               // logExit=false) let the new session overwrite the session ID
-               // first, stranding the closure record in the wrong session.
-               // The closing deals are already settled here because the fill
-               // is confirmed by ResolveFilledPositionTicket() above, so
-               // LogClosedTrade() can find every DEAL_ENTRY_OUT.
-               // keepTicket=newTicket: the orphan sweep inside must NOT
-               // close the position we are reversing INTO. Without it the
-               // sweep would shut the new fill on the same tick it appears.
-               CloseEntireBasket("SAR Reversal", true, newTicket);
-               m_reversalInProgress = wasReversing;
-
-               if(EnableLogging)
-                  Print("[OrderManager] SAR REVERSAL complete: opposing basket closed");
-              }
-
-            // ---- STEP 3: ADOPT THE NEW TRADE ---------------------------
-            // The ticket differs (or there was no active trade), so seed.
-            if(!m_hasActiveTrade || m_activeTrade.ticket != newTicket)
-              {
-               SeedActiveTradeFromBlock(blocks[i], newTicket);
-               m_ordersFilled++;
-               if(EnableLogging)
-                  Print("[OrderManager] LIMIT FILLED: block ", blocks[i].tradeId,
-                        " ticket=", newTicket,
-                        " dir=", (newDir == DIR_LONG ? "LONG" : "SHORT"));
-              }
-            // ---- STEP 4: ADVANCE THE TWO-PHASE LIFECYCLE (v5.34 Part 3) ---
-            // A fill on a Phase 1 block (touches==0) does NOT retire the zone:
-            // it consumes Touch 1 and promotes the block to a Phase 2 REVERSAL
-            // candidate (touches==1) so a reclaimed zone can be traded from the
-            // opposite side. Only a fill on the Phase 2 block (touches==1)
-            // retires it (touches==2) + schedules next-bar deletion. The Phase-2
-            // promotion also syncs any overlapping same-type Phase 1 sibling so
-            // a cluster can never trade the same reclaim twice.
-            int bi = m_blockManager.FindBlockIndexByTicket(ticket);
-            if(bi >= 0)
-              {
-               SSniperBlock mod;
-               if(m_blockManager.GetBlockAt(bi, mod))
-                 {
-                  int prevTouch = mod.touches;
-                  mod.touches += 1;
-                  mod.limitOrderTicket = 0;
-                  mod.pendingOrderCancel = false;
-                  if(mod.touches >= 2)
-                    {
-                     // Touch 2 consumed — terminal: retire on the next bar.
-                     mod.isTriggered = true;
-                     mod.hasPlacedOrder = true;
-                     mod.deleteOnBarTime = iTime(m_symbol, PERIOD_CURRENT, 0);
-                     m_blockManager.SetBlockAt(bi, mod);
-                     if(EnableLogging)
-                        Print("[OrderManager] REVERSAL FILLED: block ", mod.tradeId,
-                              " touches=2 -> retired");
-                    }
-                  else
-                    {
-                     // Touch 1 consumed — keep the zone alive + unarmed so the
-                     // Phase 2 reversal can arm and place its shifted entry.
-                     mod.isTriggered   = false;
-                     mod.hasPlacedOrder = false;
-                     mod.isArmed       = false;
-                     mod.hasExited     = false;
-                     mod.deleteOnBarTime = 0;
-                     m_blockManager.SetBlockAt(bi, mod);
-                     // Cluster sync: a same-polarity Phase 1 sibling sharing
-                     // territory is now redundant — promote it in lockstep so
-                     // the cluster reverses as one.
-                     m_blockManager.SyncReversalCluster(bi);
-                     if(EnableLogging)
-                        Print("[OrderManager] TOUCH 1 CONSUMED: block ", mod.tradeId,
-                              " (prev=", prevTouch,
-                              ") -> Phase 2 reversal armed");
-                    }
-                 }
-              }
-           }
-         else
-           {
-            // Canceled/expired — just clear the ticket reference
-            int bi = m_blockManager.FindBlockIndexByTicket(ticket);
-            if(bi >= 0)
-              {
-               SSniperBlock mod;
-               if(m_blockManager.GetBlockAt(bi, mod))
-                 {
-                  mod.limitOrderTicket = 0;
-                  mod.pendingOrderCancel = false;
-                  m_blockManager.SetBlockAt(bi, mod);
-                 }
-              }
-           }
-        }
+      if(index < 0 || index >= m_virtualCount) return;
+      for(int i = index; i < m_virtualCount - 1; i++)
+         m_virtualOrders[i] = m_virtualOrders[i + 1];
+      m_virtualCount--;
+      ArrayResize(m_virtualOrders, m_virtualCount, 3);
      }
 
 
@@ -1715,7 +1391,6 @@ public:
       m_journal           = NULL;
       m_hasActiveTrade    = false;
       m_activeDirection   = DIR_NONE;
-      m_pendingLimitCount = 0;
       m_ordersPlaced      = 0;
       m_ordersFilled      = 0;
 
@@ -1727,7 +1402,6 @@ public:
       m_reversalStartTime = 0;
       m_lastOrderTime     = 0;
       ZeroMemory(m_activeTrade);
-      ArrayResize(m_pendingLimitTickets, 0);
       ArrayResize(m_basket, 0, 3);
       m_basketCount    = 0;
       m_primaryEntry   = 0.0;
@@ -1739,10 +1413,12 @@ public:
       m_sessionSL      = 0.0;
       m_adoptedManual  = false;
       m_manualNoSLWarnTick = 0;
+      m_virtualCount   = 0;
+      ArrayResize(m_virtualOrders, 0);
 
      }
 
-                    ~COttoOrderManager(void) { ArrayFree(m_pendingLimitTickets); }
+                    ~COttoOrderManager(void) { }
 
    //+------------------------------------------------------------------+
    //| Initialize                                                        |
@@ -2082,12 +1758,16 @@ public:
      }
 
    //+------------------------------------------------------------------+
-   //| Main update — reversal completion + pending-fill detection      |
+   //| Main update — reversal completion + virtual-order triggering      |
    //+------------------------------------------------------------------+
    void              Update(void)
      {
       CompleteReversal();
-      CheckPendingOrderFills();
+      // v5.37 Part 3: fire any armed virtual order whose level the live
+      // market has reached. This is the execution half of the in-memory
+      // engine whose ARM half is PlaceLimitOrder(); it replaces the old
+      // CheckPendingOrderFills() broker-fill scan.
+      CheckVirtualTriggers();
       // v5.33: LAST, so an EA fill detected in this same tick becomes the
       // primary first and AdoptManualPosition()'s one-basket-at-a-time gate
       // then refuses. Called every tick; the gates above are pure reads and
@@ -2329,12 +2009,193 @@ public:
                   " rrUnit=", DoubleToString(slDist, _Digits));
         }
      }
+   //+------------------------------------------------------------------+
+   //| v5.37 Part 2 - VIRTUAL MARKET TRIGGER. Watches the live price on |
+   //| every tick and fires a MARKET order the moment an armed virtual  |
+   //| order's level is reached. This is the execution half of the in-  |
+   //| memory engine whose ARM half is PlaceLimitOrder().               |
+   //|                                                                  |
+   //| The cross test mirrors Pine (and CheckPhase2MarketTriggers): a   |
+   //| LONG fires once the market has traded DOWN to/through its        |
+   //| trigger, a SHORT once it has traded UP to/through it - so a gap  |
+   //| past the level still triggers.                                   |
+   //+------------------------------------------------------------------+
+   void              CheckVirtualTriggers(void)
+     {
+      if(m_reversalInProgress) return;
+      if(InpSimNewsShield) return;          // Pine sim_news_shield: absolute lockdown
+      if(InpSimMacroVeto) return;           // Pine sim_macro_veto
+      if(m_virtualCount <= 0) return;
+
+      double ask = GetAsk();
+      double bid = GetBid();
+
+      SSniperBlock blocks[];
+      int count = m_blockManager.GetAllBlocks(blocks);
+
+      // Reverse walk: RemoveVirtualOrderAt() compacts the array in place, so
+      // an ascending walk would skip the element shifted into a fired slot.
+      for(int v = m_virtualCount - 1; v >= 0; v--)
+        {
+         SVirtualOrder vo = m_virtualOrders[v];
+
+         // Re-resolve the LIVE block by SERIAL, never by the stored index:
+         // COttoBlockManager::RemoveBlock() compacts m_blocks, so a stored
+         // blockIndex can point at a different zone by the time the trigger
+         // fires. serial is the stable identity (it also names tradeId).
+         int bi = -1;
+         for(int i = 0; i < count; i++)
+            if(blocks[i].serial == vo.blockSerial) { bi = i; break; }
+
+         if(bi < 0)                              // block gone -> drop orphan
+           { RemoveVirtualOrderAt(v); continue; }
+         if(blocks[bi].isVetoed || blocks[bi].isTriggered)
+           { RemoveVirtualOrderAt(v); continue; }
+
+         bool isLong = (vo.direction == DIR_LONG);
+
+         // THE CROSS TEST. A MARKET condition, not a resting price: a LONG
+         // fires once the market has traded DOWN to (or through) the level,
+         // a SHORT once it has traded UP to it - a gap past it still fires.
+         if(isLong ? (ask > vo.triggerPrice) : (bid < vo.triggerPrice))
+            continue;
+
+         // --- Pine gates: the identical ladder every other path applies ---
+         if(!IsSpreadAcceptable()) continue;
+         if(!CanPlaceForDirection(blocks[bi])) continue;
+
+         if(m_correlationFilter != NULL && m_correlationFilter.IsTradeVetoed(vo.direction))
+           {
+            if(EnableLogging)
+               Print("[Correlation] VETO on ", m_symbol,
+                     (isLong ? " LONG" : " SHORT"), " (virtual trigger)");
+            continue;
+           }
+         if(m_correlationFilter != NULL &&
+            m_correlationFilter.IsConsensusOpposed(m_symbol, vo.direction))
+           {
+            SSniperBlock vet = blocks[bi];
+            vet.isVetoed   = true;
+            vet.vetoReason = VETO_CORRELATION;
+            m_blockManager.SetBlockAt(bi, vet);
+            if(EnableLogging)
+               Print("[Correlation] VECTOR VETO on ", m_symbol,
+                     (isLong ? " LONG" : " SHORT"), " (virtual trigger)");
+            RemoveVirtualOrderAt(v);
+            continue;
+           }
+         if(!SentimentPasses(blocks[bi])) continue;
+         if(m_blockManager.IsBlockedByPrimary(bi)) continue;
+
+         // --- Build the MARKET request (DEAL, not PENDING) ---
+         MqlTradeRequest request;
+         MqlTradeResult  result;
+         ZeroMemory(request);
+         ZeroMemory(result);
+         request.action    = TRADE_ACTION_DEAL;
+         request.symbol    = m_symbol;
+         request.type      = isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+         request.volume    = vo.lotSize;            // stored size
+         request.price     = SnapToTick(isLong ? ask : bid);
+         request.sl        = vo.stopLoss;           // stored SL
+         request.tp        = 0;                     // NO TP - Pine trail-only exits
+         request.deviation = MaxSlippage;
+         request.magic     = MagicNumber;
+         request.comment   = BuildOrderComment(0, 0);
+
+         // Optimistic one-shot lock (mirrors PlaceLimitOrder). Prevents a
+         // concurrent tick or a requote retry from firing this order twice.
+         SSniperBlock block = blocks[bi];
+         block.hasPlacedOrder = true;
+         m_blockManager.SetBlockAt(bi, block);
+
+         if(!SendOrderWithRetry(request, result))
+           {
+            // The trigger did not execute - release the lock and leave the
+            // virtual order armed so the next tick may retry it.
+            block.hasPlacedOrder = false;
+            m_blockManager.SetBlockAt(bi, block);
+            continue;
+           }
+
+         // --- Commit the filled state ---
+         // rrUnit is recomputed from the block's OWN geometry (not the broker-
+         // adjusted stop) so SeedActiveTradeFromBlock() rebuilds exactly the
+         // basket 1R math a resting Phase 1 limit fill would have produced.
+         double atr    = m_blockManager.GetATR();
+         double slDist = (atr > 0) ? CalcSLDistance(block, atr)
+                                   : MathAbs(vo.triggerPrice - vo.stopLoss);
+         block.localEntry = vo.triggerPrice;
+         block.localSL    = vo.stopLoss;
+         block.localTP    = isLong ? vo.triggerPrice + slDist
+                                   : vo.triggerPrice - slDist;
+         block.rrUnit     = slDist;
+
+         // Consume the touch: 0 -> 1 promotes the block to a Phase 2 reversal
+         // candidate; 1 -> 2 retires it. Mirrors CheckPendingOrderFills().
+         block.touches            += 1;
+         block.limitOrderTicket    = 0;
+         block.pendingOrderCancel  = false;
+         block.priceAbortLogged    = false;
+         if(block.touches >= 2)
+           {
+            block.isTriggered     = true;
+            block.hasPlacedOrder  = true;
+            block.deleteOnBarTime = iTime(m_symbol, PERIOD_CURRENT, 0);
+           }
+         else
+           {
+            block.isTriggered     = false;
+            block.hasPlacedOrder  = false;
+            block.isArmed         = false;
+            block.hasExited       = false;
+            block.deleteOnBarTime = 0;
+           }
+         m_blockManager.SetBlockAt(bi, block);
+
+         // Cluster sync: any same-polarity Phase 1 sibling sharing this
+         // territory reverses in lockstep (same call CheckPendingOrderFills
+         // makes when Touch 1 is consumed).
+         if(block.touches == 1)
+            m_blockManager.SyncReversalCluster(bi);
+
+         // Journal the entry under its own session ID, then seed the basket.
+         if(m_journal != NULL)
+           {
+            MqlDateTime ptm;
+            TimeToStruct(TimeCurrent(), ptm);
+            string pts = StringFormat("%04d%02d%02d-%02d%02d%02d",
+                                      ptm.year, ptm.mon, ptm.day,
+                                      ptm.hour, ptm.min, ptm.sec);
+            m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d",
+                                                m_symbol, pts, block.serial));
+           }
+
+         SeedActiveTradeFromBlock(block, result.order);
+         m_ordersFilled++;
+
+         // The virtual order is now consumed - drop it from the engine.
+         RemoveVirtualOrderAt(v);
+
+         if(EnableLogging)
+            Print("[OrderManager] VIRTUAL TRIGGER FILLED: ", block.tradeId,
+                  " ticket=", result.order,
+                  " dir=", (isLong ? "LONG" : "SHORT"),
+                  " trigger=", DoubleToString(vo.triggerPrice, _Digits),
+                  " entry=", DoubleToString(request.price, _Digits),
+                  " sl=", DoubleToString(vo.stopLoss, _Digits),
+                  " rrUnit=", DoubleToString(slDist, _Digits));
+        }
+     }
+
 
    //+------------------------------------------------------------------+
-   //| ROBUST CLEANUP — cancels resting orders on blocks that are       |
-   //| vetoed, triggered, flipped, deleted, or flagged for cancellation.|
-   //| Runs before/after the block funnel so no broker order is ever   |
-   //| orphaned, and so the block array can release the struct safely. |
+   //| ROBUST CLEANUP — drops in-memory virtual orders belonging to     |
+   //| blocks that are vetoed, triggered, flipped, deleted, or flagged  |
+   //| for cancellation. Runs before/after the block funnel so no armed |
+   //| setup is ever orphaned, and so the block array can release the   |
+   //| struct safely. (v5.37 Part 3: the book IS the virtual engine —   |
+   //| there is no broker pending order to delete any more.)            |
    //+------------------------------------------------------------------+
    void              CancelOrdersForInvalidBlocks(void)
      {
@@ -2348,67 +2209,67 @@ public:
                            blocks[i].isTriggered ||
                            (blocks[i].deleteOnBarTime > 0);
          if(!mustCancel) continue;
-         if(blocks[i].limitOrderTicket <= 0) continue;
 
-         if(IsBlockOrderAlive(blocks[i].limitOrderTicket))
+         // Drop the armed virtual order (if any) that belongs to this block.
+         // Matched by SERIAL, never by a stored index: RemoveBlock() compacts
+         // the block array, so the index captured at arm time can be stale.
+         for(int v = m_virtualCount - 1; v >= 0; v--)
            {
-             if(DeleteOrder(blocks[i].limitOrderTicket))
-               {
-                if(EnableLogging)
-                   Print("[OrderManager] Cancelled order ", blocks[i].limitOrderTicket,
-                         " (", blocks[i].tradeId, ")");
-                if(m_journal != NULL)
-                  {
-                   // v5.36: a block whose Phase 2 promotion came from a convertible
-                   // veto is NOT a fatal cancel: it is a re-phase. Journal (and email)
-                   // a conversion notice instead of a CANCELLED_ rename.
-                   if(blocks[i].conversionReason != VETO_NONE && blocks[i].touches >= 1)
-                     {
-                      string convReason = "Fired Front-Run 1:4 Veto";
-                      if(blocks[i].conversionReason == VETO_NEARMISS)      convReason = "Near-Miss Veto (6D)";
-                      else if(blocks[i].conversionReason == VETO_STALE)    convReason = "Stale Veto (45D)";
-                      else if(blocks[i].conversionReason == VETO_MOMENTUM) convReason = "Momentum Veto";
-                      else if(blocks[i].conversionReason == VETO_FVG)      convReason = "FVG Veto";
+            if(m_virtualOrders[v].blockSerial != blocks[i].serial)
+               continue;
 
-                      MqlDateTime ctm2; TimeToStruct(TimeCurrent(), ctm2);
-                      string cts2 = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm2.year, ctm2.mon, ctm2.day, ctm2.hour, ctm2.min, ctm2.sec);
-                      m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts2, blocks[i].serial));
-                      m_journal.LogConversion(blocks[i].limitOrderTicket, blocks[i].type, convReason);
-                     }
-                   else
-                     {
-                      string cancelReason = "Manual";
-                      if(blocks[i].vetoReason == VETO_FRONTRUN)       cancelReason = "Fired Front-Run 1:4 Veto";
-                      else if(blocks[i].vetoReason == VETO_STALE)     cancelReason = "Stale Veto (45D)";
-                      else if(blocks[i].vetoReason == VETO_NEARMISS)  cancelReason = "Near-Miss Veto (6D)";
-                      else if(blocks[i].vetoReason == VETO_MOMENTUM)  cancelReason = "Momentum Veto";
-                      else if(blocks[i].vetoReason == VETO_FVG)        cancelReason = "FVG Veto";
-                      else if(blocks[i].vetoReason == VETO_SIZING)     cancelReason = "Sizing Veto";
-                      else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
-                      else if(blocks[i].vetoReason == VETO_BROKEN)     cancelReason = "Block Broken";
-                      else if(blocks[i].vetoReason == VETO_FLIPPED)    cancelReason = "Block Flipped";
-                      else if(blocks[i].vetoReason == VETO_CORRELATION) cancelReason = "Vector Consensus Veto";
-                      else if(blocks[i].pendingOrderCancel)           cancelReason = "Manual / Direction Conflict";
-                      MqlDateTime ctm; TimeToStruct(TimeCurrent(), ctm);
-                      string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
-                      m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial));
-                      m_journal.LogCancellation(cancelReason);
-                     }
-                  }
-               }
-           }
-         // zero the ticket regardless (order gone or cancelled)
-         int bi = m_blockManager.FindBlockIndexByTicket(blocks[i].limitOrderTicket);
-         if(bi >= 0)
-           {
-            SSniperBlock mod;
-            if(m_blockManager.GetBlockAt(bi, mod))
+            if(EnableLogging)
+               Print("[OrderManager] Cancelled virtual order for block ",
+                     blocks[i].tradeId, " (serial ", blocks[i].serial, ")");
+
+            if(m_journal != NULL)
               {
-               mod.limitOrderTicket = 0;
-               mod.pendingOrderCancel = false;
-               m_blockManager.SetBlockAt(bi, mod);
+               // v5.36: a block whose Phase 2 promotion came from a convertible
+               // veto is NOT a fatal cancel: it is a re-phase. Journal (and email)
+               // a conversion notice instead of a CANCELLED_ rename.
+               if(blocks[i].conversionReason != VETO_NONE && blocks[i].touches >= 1)
+                 {
+                  string convReason = "Fired Front-Run 1:4 Veto";
+                  if(blocks[i].conversionReason == VETO_NEARMISS)      convReason = "Near-Miss Veto (6D)";
+                  else if(blocks[i].conversionReason == VETO_STALE)    convReason = "Stale Veto (45D)";
+                  else if(blocks[i].conversionReason == VETO_MOMENTUM) convReason = "Momentum Veto";
+                  else if(blocks[i].conversionReason == VETO_FVG)      convReason = "FVG Veto";
+
+                  MqlDateTime ctm2; TimeToStruct(TimeCurrent(), ctm2);
+                  string cts2 = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm2.year, ctm2.mon, ctm2.day, ctm2.hour, ctm2.min, ctm2.sec);
+                  m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts2, blocks[i].serial));
+                  m_journal.LogConversion(0, blocks[i].type, convReason);
+                 }
+               else
+                 {
+                  string cancelReason = "Manual";
+                  if(blocks[i].vetoReason == VETO_FRONTRUN)       cancelReason = "Fired Front-Run 1:4 Veto";
+                  else if(blocks[i].vetoReason == VETO_STALE)     cancelReason = "Stale Veto (45D)";
+                  else if(blocks[i].vetoReason == VETO_NEARMISS)  cancelReason = "Near-Miss Veto (6D)";
+                  else if(blocks[i].vetoReason == VETO_MOMENTUM)  cancelReason = "Momentum Veto";
+                  else if(blocks[i].vetoReason == VETO_FVG)        cancelReason = "FVG Veto";
+                  else if(blocks[i].vetoReason == VETO_SIZING)     cancelReason = "Sizing Veto";
+                  else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
+                  else if(blocks[i].vetoReason == VETO_BROKEN)     cancelReason = "Block Broken";
+                  else if(blocks[i].vetoReason == VETO_FLIPPED)    cancelReason = "Block Flipped";
+                  else if(blocks[i].vetoReason == VETO_CORRELATION) cancelReason = "Vector Consensus Veto";
+                  else if(blocks[i].pendingOrderCancel)           cancelReason = "Manual / Direction Conflict";
+                  MqlDateTime ctm; TimeToStruct(TimeCurrent(), ctm);
+                  string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
+                  m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial));
+                  m_journal.LogCancellation(cancelReason);
+                 }
               }
+
+            RemoveVirtualOrderAt(v);
+            break;   // at most one virtual order per block
            }
+
+         // Release the block's arm latch so the array can drop the struct.
+         SSniperBlock mod = blocks[i];
+         mod.limitOrderTicket   = 0;
+         mod.pendingOrderCancel = false;
+         m_blockManager.SetBlockAt(i, mod);
         }
      }
    //+------------------------------------------------------------------+
@@ -2430,45 +2291,40 @@ public:
       if(!InpCancelOpposingPendings) return;
       if(m_correlationFilter == NULL) return;
 
-      for(int i = OrdersTotal() - 1; i >= 0; i--)
+      // v5.37 Part 3: walk our own in-memory virtual book (reverse, so
+      // RemoveVirtualOrderAt()'s compaction stays index-safe). Scoping this
+      // to m_virtualOrders[] is what the v5.28 note below always wanted:
+      // each chart now prunes only ITS OWN armed setups -- no shared broker
+      // book, no cancel storm across the portfolio.
+      for(int v = m_virtualCount - 1; v >= 0; v--)
         {
-         ulong ticket = OrderGetTicket(i);
-         if(ticket <= 0) continue;
-         if(!OrderSelect(ticket)) continue;
-         if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
-         if(OrderGetString(ORDER_SYMBOL) != m_symbol) continue;
-
-         ENUM_ORDER_TYPE ot = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-         ENUM_TRADE_DIRECTION dir = DIR_NONE;
-         if(ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP)   dir = DIR_LONG;
-         if(ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP) dir = DIR_SHORT;
-         if(dir == DIR_NONE) continue;
+         SVirtualOrder vo = m_virtualOrders[v];
+         if(vo.direction == DIR_NONE) continue;
 
          string sym = m_symbol;
-         if(!m_correlationFilter.IsConsensusOpposed(sym, dir)) continue;
+         if(!m_correlationFilter.IsConsensusOpposed(sym, vo.direction)) continue;
 
-         if(DeleteOrder(ticket))
+         if(EnableLogging)
+            Print("[OrderManager] VECTOR CANCEL: serial ", vo.blockSerial, " ", sym,
+                  (vo.direction == DIR_LONG ? " LONG" : " SHORT"),
+                  " | consensus = ",
+                  DoubleToString(m_correlationFilter.GetPairConsensus(sym), 1), "%");
+
+         // Release any block still latched to this serial so the array can
+         // free the struct and the duplicate shield stays consistent.
+         int bi = m_blockManager.FindBlockIndexBySerial(vo.blockSerial);
+         if(bi >= 0)
            {
-            if(EnableLogging)
-               Print("[OrderManager] VECTOR CANCEL: ticket ", ticket, " ", sym,
-                     (dir == DIR_LONG ? " LONG" : " SHORT"),
-                     " | consensus = ",
-                     DoubleToString(m_correlationFilter.GetPairConsensus(sym), 1), "%");
-
-            // Release any block still holding this ticket so the array can
-            // free the struct and the duplicate shield stays consistent.
-            int bi = m_blockManager.FindBlockIndexByTicket(ticket);
-            if(bi >= 0)
+            SSniperBlock mod;
+            if(m_blockManager.GetBlockAt(bi, mod))
               {
-               SSniperBlock mod;
-               if(m_blockManager.GetBlockAt(bi, mod))
-                 {
-                  mod.limitOrderTicket = 0;
-                  mod.pendingOrderCancel = false;
-                  m_blockManager.SetBlockAt(bi, mod);
-                 }
+               mod.limitOrderTicket = 0;
+               mod.pendingOrderCancel = false;
+               m_blockManager.SetBlockAt(bi, mod);
               }
            }
+
+         RemoveVirtualOrderAt(v);
         }
      }
 
@@ -2482,17 +2338,17 @@ public:
    void              ManageDirectionConflict(void)
      {
       if(!m_hasActiveTrade) return;
-      int myOrders = CountMyPendingOrders();
-      for(int i = myOrders - 1; i >= 0; i--)
+
+      // v5.37 Part 3: drop armed virtual orders that fight the live trade's
+      // direction. Reverse walk keeps RemoveVirtualOrderAt() index-safe.
+      for(int v = m_virtualCount - 1; v >= 0; v--)
         {
-         ulong ticket = GetMyPendingOrderByIndex(i);
-         if(ticket > 0 && OrderSelect(ticket))
-           {
-            ENUM_ORDER_TYPE oType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            if((m_activeDirection == DIR_LONG && oType == ORDER_TYPE_BUY_LIMIT) ||
-               (m_activeDirection == DIR_SHORT && oType == ORDER_TYPE_SELL_LIMIT))
-               DeleteOrder(ticket);
-           }
+         if(m_virtualOrders[v].direction != m_activeDirection)
+            continue;
+         if(EnableLogging)
+            Print("[OrderManager] DIRECTION CONFLICT: dropping virtual order ",
+                  m_virtualOrders[v].blockSerial, " (dir ", m_activeDirection, ")");
+         RemoveVirtualOrderAt(v);
         }
      }
 
@@ -2501,13 +2357,10 @@ public:
    //+------------------------------------------------------------------+
    void              CancelAllPendingOrders(void)
      {
-      int myOrders = CountMyPendingOrders();
-      for(int i = myOrders - 1; i >= 0; i--)
-        {
-         ulong ticket = GetMyPendingOrderByIndex(i);
-         if(ticket > 0)
-            DeleteOrder(ticket);
-        }
+      // v5.37 Part 3: the pending book is the in-memory virtual engine, so
+      // "cancel all" is simply an empty book — no broker round-trips.
+      ArrayResize(m_virtualOrders, 0, 3);
+      m_virtualCount = 0;
      }
 
    //+------------------------------------------------------------------+
@@ -2883,6 +2736,8 @@ public:
      {
       ArrayResize(m_basket, 0, 3);
       m_basketCount = 0;
+      ArrayResize(m_virtualOrders, 0, 3);
+      m_virtualCount = 0;
       m_nextTranche = 2;
       m_hasActiveTrade = false;
       m_activeDirection = DIR_NONE;
