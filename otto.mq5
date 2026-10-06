@@ -945,11 +945,12 @@ void OnTick(void)
    // ================================================================
    if(!g_newsFilter.IsInNewsBlackout() && !g_dailyDD_Paused)
      {
-      // Phase 1 (touches==0): resting LIMIT orders at the mapped entry.
+      // Every armed block - Phase 1 (touches==0) and Phase 2 (touches==1)
+      // alike - now routes through the single in-memory virtual engine:
+      // PlaceOrdersForArmedBlocks() ARMS the order and the order manager's
+      // CheckVirtualTriggers() FIRES the MARKET leg once the level trades
+      // through. The old per-phase execution split is gone.
       g_orderManager.PlaceOrdersForArmedBlocks();
-      // Phase 2 (touches==1): dynamically-triggered MARKET reversals, fired
-      // the moment price trades through the reclaimed zone's outer boundary.
-      g_orderManager.CheckPhase2MarketTriggers();
      }
 
    // ================================================================
