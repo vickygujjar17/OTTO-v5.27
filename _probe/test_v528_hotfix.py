@@ -14,8 +14,11 @@ Pins the four behaviours that the MQL5 compiler gate CANNOT exercise:
      i.e. it no longer depends on the broker's server timezone.
   4. The 1% floating rule measures the LIVE (balance - equity) float and no
      longer sets a permanent halt latch; the 5% trailing rule still does.
-  5. Order manager: the consensus cancel sweep is symbol-scoped, and
-     PlaceLimitOrder refuses a limit on the wrong side of the live market.
+  5. Order manager: the consensus cancel sweep is symbol-scoped. (v5.39: the
+     former "ArmVirtualOrder refuses an entry on the wrong side of the live
+     market" contract was RETIRED -- a v5.37+ setup is an in-memory virtual
+     order, never a resting broker limit -- so those pins now assert the guard's
+     absence rather than its presence.)
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -347,24 +350,21 @@ if sweep is not None:
 
 check("no CancelQuorumOpposingOrders exists (never did)", "CancelQuorum" not in OM_T)
 
-check("PlaceLimitOrder validates BUY_LIMIT against bid",
-      re.search(r"entryPrice\s*>=\s*\(liveBid\s*-\s*priceBuffer\)", OM_T) is not None)
-check("PlaceLimitOrder validates SELL_LIMIT against ask",
-      re.search(r"entryPrice\s*<=\s*\(liveAsk\s*\+\s*priceBuffer\)", OM_T) is not None)
-check("PlaceLimitOrder reads SYMBOL_TRADE_STOPS_LEVEL",
+# v5.40: the boundary buffer is LIVE again — the hybrid router consumes it to
+# decide whether an entry may REST at the broker (physical) or must arm
+# virtually. SYMBOL_TRADE_STOPS_LEVEL is read by the broker-level stop
+# validator too, which remains unrelated and live.
+check("PlaceOrArmOrder routes on the live-price boundary",
+      "GetPriceBoundaryBuffer()" in OM_T)
+check("PlaceOrArmOrder reads SYMBOL_TRADE_STOPS_LEVEL",
       "SYMBOL_TRADE_STOPS_LEVEL" in OM_T)
-check("PlaceLimitOrder reads live bid/ask",
-      re.search(r"double\s+liveAsk\s*=\s*GetAsk\(\)", OM_T) is not None
-      and re.search(r"double\s+liveBid\s*=\s*GetBid\(\)", OM_T) is not None)
+check("the boundary helper has a live caller again",
+      "GetPriceBoundaryBuffer()" in OM_T)
 
-# The guard must precede the duplicate shield, so a refused price can never
-# set hasPlacedOrder and strand the block. v5.30 renamed the boundary local
-# from `stopsLevel` (shadowed by the helpers of the same name) to the
-# cushioned `priceBuffer`, so this anchor tracks the new identifier.
-pos_guard = OM_T.find("entryPrice >= (liveBid - priceBuffer)")
-pos_shield = OM_T.find("IsOrderAlreadyLiveAtPrice(entryPrice, 5.0)")
-check("price guard precedes the duplicate shield", 0 < pos_guard < pos_shield,
-      "guard=%d shield=%d" % (pos_guard, pos_shield))
+# The v5.40 duplicate shield scans BOTH the broker pending pool and the virtual
+# book, and is the last price gate before the route decision.
+check("duplicate shield is still present in the ARM path",
+      OM_T.find("IsAnyOrderLiveAtPrice(entryPrice, 5.0)") > 0)
 
 
 # ----------------------------------------------------------------------

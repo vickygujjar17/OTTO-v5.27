@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.33"
+#property version   "5.41"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -95,6 +95,52 @@ private:
 
 
    //+------------------------------------------------------------------+
+   //| DIRECTION CHOKEPOINT (standard two-phase lifecycle).            |
+   //|                                                                  |
+   //| A block's ZONE type is not its TRADE direction: that mapping is   |
+   //| owned by COttoOrderManager::GetDirectionForBlock() and mirrored   |
+   //| here. This file needs the direction in two places the OrderManager |
+   //| cannot reach (both veto funnel projections), so the same mapping  |
+   //| is mirrored rather than guessed.                                  |
+   //|                                                                  |
+   //| v5.34 Part 3: the mapping is PHASE-AWARE. A fresh block           |
+   //| (touches == 0) is a PHASE 1 BOUNCE (support -> LONG). A block that |
+   //| has consumed Touch 1 (touches >= 1) is a PHASE 2 REVERSAL and     |
+   //| trades the S/R flip, so support -> SHORT. The Front-Run veto       |
+   //| projects its target from here, so projecting off the wrong phase   |
+   //| would veto the live reversal or miss real front-runs -- silently.  |
+   //|                                                                  |
+   //| The two implementations deliberately sit side by side in review:   |
+   //| they must stay IDENTICAL or the Front-Run veto would project its   |
+   //| target off the wrong direction while the order was priced from the |
+   //| other -- vetoing live entries or missing real front-runs, silently.|
+   //|                                                                  |
+   //+------------------------------------------------------------------+
+   ENUM_TRADE_DIRECTION    BlockDirection(const SSniperBlock &b) const
+     {
+      if(b.touches >= 1)
+         return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Phase 2 — reversal (S/R flip)
+      return (b.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;      // Phase 1 — normal bounce
+     }
+
+   //+------------------------------------------------------------------+
+   //| BlockEntryPrice — Pine entry price for a block, honouring         |
+   //| InpEntryStyle. The front edge is the edge price APPROACHES FROM,  |
+   //| which follows the mapped direction: for a LONG it is               |
+   //| support.top / resistance.bottom, mirrored for a SHORT.            |
+   //|                                                                  |
+   //| This is the exact twin of COttoOrderManager::CalcEntryPrice() and  |
+   //| flips its front edge with the phase-aware mapped direction (in     |
+   //| Phase 1 a Support zone is a LONG, entered from the top; in Phase 2 |
+   //| it is a SHORT, entered from the bottom).                          |
+   //+------------------------------------------------------------------+
+   double                  BlockEntryPrice(const SSniperBlock &b) const
+     {
+      if(InpEntryStyle == ENTRY_MIDPOINT) return b.midpoint;
+      return (BlockDirection(b) == DIR_LONG) ? b.top : b.bottom;
+     }
+
+   //+------------------------------------------------------------------+
    //| Human-readable veto reason (diagnostics)                         |
    //+------------------------------------------------------------------+
    string                  VetoReasonString(ENUM_VETO_REASON r)
@@ -132,6 +178,38 @@ private:
          Print("[Block] VETO #", m_blocks[index].serial,
                " (", (m_blocks[index].type == BLOCK_SUPPORT ? "SUP" : "RES"), ") ",
                VetoReasonString(reason));
+     }
+
+   //+------------------------------------------------------------------+
+   //| VETO-TO-REVERSAL (v5.34 Part 2) — a Phase 1 block (touches==0)   |
+   //| that trips a convertible veto is upgraded to Phase 2 instead of  |
+   //| being deleted: the lifecycle counter advances to Touch 2, any    |
+   //| resting Phase 1 order is cancelled, and the block is reset to a  |
+   //| clean, unarmed reversal candidate. Returns true so the caller    |
+   //| SKIPS its SetVeto() call (the block survives as Touch 2).        |
+   //+------------------------------------------------------------------+
+   bool                    TryConvertToReversal(int index, bool enabled, ENUM_VETO_REASON reason)
+     {
+      if(!enabled)                           return false;   // conversion disabled
+      if(index < 0 || index >= m_blockCount) return false;
+      if(m_blocks[index].touches != 0)       return false;   // Touch 2 -> permanent veto
+
+      SSniperBlock b   = m_blocks[index];    // copy — no struct reference
+      b.touches        = 1;                  // Phase 2 (Touch 1 consumed)
+      b.conversionReason = reason;           // v5.36: record the convertible veto that upgraded us
+      b.isArmed        = false;
+      b.hasPlacedOrder = false;
+      b.hasExited      = false;
+      b.isTriggered    = false;
+      m_blocks[index]  = b;                  // persist BEFORE the cancel request
+
+      RequestCancel(index);                  // drop any resting Phase 1 order
+
+      if(EnableLogging)
+         Print("[Block] CONVERT #", b.serial,
+               " (", (b.type == BLOCK_SUPPORT ? "SUP" : "RES"), ") ",
+               VetoReasonString(reason), " -> Touch 2 reversal");
+      return true;
      }
 
    //+------------------------------------------------------------------+
@@ -177,6 +255,25 @@ private:
       m_blockCount--;
       ArrayResize(m_blocks, m_blockCount, MAX_BLOCKS);
       return true;
+     }
+
+   //+------------------------------------------------------------------+
+   //| EXCLUSIVE TERRITORY (v5.34 Part 2) — anti-stacking guard. Returns |
+   //| true when a LIVE, non-vetoed, same-polarity block already occupies|
+   //| any part of [top,bottom]. Overlapping blocks are never pushed and |
+   //| never counted, so two zones can never share territory.           |
+   //+------------------------------------------------------------------+
+   bool                    HasTerritoryOverlap(ENUM_BLOCK_TYPE type, double top, double bottom) const
+     {
+      for(int j = 0; j < m_blockCount; j++)
+        {
+         if(m_blocks[j].isVetoed)              continue;
+         if(m_blocks[j].deleteOnBarTime > 0)   continue;   // marked for deletion
+         if(m_blocks[j].type != type)          continue;   // same polarity only
+         if(top >= m_blocks[j].bottom && bottom <= m_blocks[j].top)
+            return true;
+        }
+      return false;
      }
 
    //+------------------------------------------------------------------+
@@ -257,9 +354,14 @@ private:
                      nb.deleteOnBarTime = iTime(m_symbol, PERIOD_CURRENT, 0);
                     }
 
-                  AddBlock(nb);   // always pushed (Pine array.push)
-                  if(!nb.isVetoed)
-                     m_blocksCreated++;
+                  // --- EXCLUSIVE TERRITORY (v5.34 Part 2): skip entirely when
+                  // a live, same-polarity zone already overlaps this range.
+                  if(!HasTerritoryOverlap(nb.type, nb.top, nb.bottom))
+                    {
+                     AddBlock(nb);   // always pushed (Pine array.push)
+                     if(!nb.isVetoed)
+                        m_blocksCreated++;
+                    }
                  }
               }
            }
@@ -336,9 +438,14 @@ private:
                      nb.deleteOnBarTime = iTime(m_symbol, PERIOD_CURRENT, 0);
                     }
 
-                  AddBlock(nb);
-                  if(!nb.isVetoed)
-                     m_blocksCreated++;
+                  // --- EXCLUSIVE TERRITORY (v5.34 Part 2): skip entirely when
+                  // a live, same-polarity zone already overlaps this range.
+                  if(!HasTerritoryOverlap(nb.type, nb.top, nb.bottom))
+                    {
+                     AddBlock(nb);
+                     if(!nb.isVetoed)
+                        m_blocksCreated++;
+                    }
                  }
               }
            }
@@ -395,7 +502,8 @@ private:
            {
             if(b.wick1Day > 0 && (marketDay - b.wick1Day) >= InpStaleDays)
               {
-               m_blocks[i] = b;   // persist hasExited before veto
+               m_blocks[i] = b;   // persist hasExited before conversion decision
+               if(TryConvertToReversal(i, InpRevStale, VETO_STALE)) continue;
                SetVeto(i, VETO_STALE);
                continue;
               }
@@ -404,19 +512,33 @@ private:
          // --- FRONT-RUN VETO (InpMaxRR target hit before entry) ---
          if(InpUseFrontRunVeto && b.hasExited && !b.isTriggered)
            {
-            double calcEntry = (InpEntryStyle == ENTRY_MIDPOINT) ? b.midpoint
-                              : ((b.type == BLOCK_SUPPORT) ? b.top : b.bottom);
+            double calcEntry = BlockEntryPrice(b);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-            double target = (b.type == BLOCK_SUPPORT) ? calcEntry + tpRR * calcSLDist
-                                                     : calcEntry - tpRR * calcSLDist;
+            // Projected TP keys off the MAPPED direction (was: b.type ==
+            // BLOCK_SUPPORT), mirroring the identical arithmetic in
+            // COttoOrderManager::PlaceOrArmOrder. Both must agree or b.localTP
+            // -- which supersedes this projection once the order is placed --
+            // would sit on the wrong side of price.
+            bool   isLong = (BlockDirection(b) == DIR_LONG);
+            // v5.34 Part 2 - mirror the OrderManager's Phase 2 entry anchor so
+            // this projection cannot veto a live reversal from the wrong price.
+            // Once the order rests, b.localTP supersedes this below.
+            if(InpShiftReversalEntry && b.touches == 1)
+               calcEntry = (b.type == BLOCK_RESISTANCE) ? (b.bottom - calcSLDist)
+                                                        : (b.top + calcSLDist);
+            double target = isLong ? calcEntry + tpRR * calcSLDist
+                                   : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
                target = b.localTP;   // use exact TP parameter once placed
 
-            bool hit = (b.type == BLOCK_SUPPORT) ? (high1 >= target) : (low1 <= target);
+            // TP above entry is hit by the HIGH, TP below by the LOW; both are
+            // independent of how the trade direction was mapped.
+            bool hit = isLong ? (high1 >= target) : (low1 <= target);
             if(hit)
               {
-               m_blocks[i] = b;   // persist hasExited before veto
+               m_blocks[i] = b;   // persist hasExited before conversion decision
+               if(TryConvertToReversal(i, InpRevFrontRun, VETO_FRONTRUN)) continue;
                SetVeto(i, VETO_FRONTRUN);
                continue;
               }
@@ -449,7 +571,8 @@ private:
             // 6-market-day expiry from the anchor
             if(b.anchorDay > 0 && (marketDay - b.anchorDay) >= 6)
               {
-               m_blocks[i] = b;   // persist anchor before veto
+               m_blocks[i] = b;   // persist anchor before conversion decision
+               if(TryConvertToReversal(i, InpRevNearMiss, VETO_NEARMISS)) continue;
                SetVeto(i, VETO_NEARMISS);
                continue;
               }
@@ -523,7 +646,9 @@ private:
               }
             if(momentum || fvg)
               {
-               m_blocks[i] = b;   // persist isArmed before veto
+               m_blocks[i] = b;   // persist isArmed before conversion decision
+               if(TryConvertToReversal(i, momentum ? InpRevMom : InpRevFvg,
+                                       momentum ? VETO_MOMENTUM : VETO_FVG)) continue;
                SetVeto(i, momentum ? VETO_MOMENTUM : VETO_FVG);
                continue;
               }
@@ -555,18 +680,26 @@ private:
 
          if(InpUseFrontRunVeto)
            {
-            double calcEntry = (InpEntryStyle == ENTRY_MIDPOINT) ? b.midpoint
-                              : ((b.type == BLOCK_SUPPORT) ? b.top : b.bottom);
+            double calcEntry = BlockEntryPrice(b);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-            double target = (b.type == BLOCK_SUPPORT) ? calcEntry + tpRR * calcSLDist
-                                                     : calcEntry - tpRR * calcSLDist;
+            // Intra-bar twin of the Update() projection above — same
+            // phase-aware mapped direction.
+            bool   isLong = (BlockDirection(b) == DIR_LONG);
+            // v5.34 Part 2 - same Phase 2 entry anchor as the Update() projector
+            // above, so both intra-bar and bar-close vetoes judge one price.
+            if(InpShiftReversalEntry && b.touches == 1)
+               calcEntry = (b.type == BLOCK_RESISTANCE) ? (b.bottom - calcSLDist)
+                                                        : (b.top + calcSLDist);
+            double target = isLong ? calcEntry + tpRR * calcSLDist
+                                   : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
                target = b.localTP;
 
-            bool hit = (b.type == BLOCK_SUPPORT) ? (high0 >= target) : (low0 <= target);
+            bool hit = isLong ? (high0 >= target) : (low0 <= target);
             if(hit)
               {
+               if(TryConvertToReversal(i, InpRevFrontRun, VETO_FRONTRUN)) continue;
                SetVeto(i, VETO_FRONTRUN);
                continue;
               }
@@ -575,6 +708,7 @@ private:
          // 6-Day near-miss expiry re-check (harmless within a bar)
          if(InpUseNearMissVeto && b.anchorDay > 0 && (marketDay - b.anchorDay) >= 6)
            {
+            if(TryConvertToReversal(i, InpRevNearMiss, VETO_NEARMISS)) continue;
             SetVeto(i, VETO_NEARMISS);
             continue;
            }
@@ -748,7 +882,9 @@ public:
                         nb.vetoReason = VETO_SIZING;
                        }
 
-                     if(!nb.isVetoed)
+                     // --- EXCLUSIVE TERRITORY (v5.34 Part 2): skip entirely when
+                     // a live, same-polarity zone already overlaps this range.
+                     if(!nb.isVetoed && !HasTerritoryOverlap(nb.type, nb.top, nb.bottom))
                        {
                         AddBlock(nb);
                         m_blocksCreated++;
@@ -824,7 +960,9 @@ public:
                         nb.vetoReason = VETO_SIZING;
                        }
 
-                     if(!nb.isVetoed)
+                     // --- EXCLUSIVE TERRITORY (v5.34 Part 2): skip entirely when
+                     // a live, same-polarity zone already overlaps this range.
+                     if(!nb.isVetoed && !HasTerritoryOverlap(nb.type, nb.top, nb.bottom))
                        {
                         AddBlock(nb);
                         m_blocksCreated++;
@@ -956,6 +1094,82 @@ public:
          if(m_blocks[i].limitOrderTicket == ticket)
             return i;
       return -1;
+     }
+
+   //+------------------------------------------------------------------+
+   //| Finds a block by its unique serial (or -1)                       |
+   //|                                                                  |
+   //| v5.37 Part 3: the virtual-order engine keys its book by serial,  |
+   //| not by array index, because RemoveBlock() compacts m_blocks[] and |
+   //| a stored index would dangle. This is the serial twin of          |
+   //| FindBlockIndexByTicket() (which can no longer be used once no    |
+   //| broker ticket exists to key on).                                  |
+   //+------------------------------------------------------------------+
+   int               FindBlockIndexBySerial(int serial)
+     {
+      if(serial <= 0) return -1;
+      for(int i = 0; i < m_blockCount; i++)
+         if(m_blocks[i].serial == serial)
+            return i;
+      return -1;
+     }
+
+   //+------------------------------------------------------------------+
+   //| CLUSTER SYNC (v5.34 Part 3) — propagate a Phase 2 promotion to   |
+   //| every PHASE 1 sibling that shares territory.                     |
+   //|                                                                  |
+   //| When the OrderManager consumes Touch 1 on `originIndex` (its      |
+   //| touches just became 1) the reclaimed zone trades as a REVERSAL.   |
+   //| Any OTHER live, same-polarity block (touches==0) whose range      |
+   //| intersects the origin is the SAME reclaim seen twice, so it is    |
+   //| promoted in lockstep: touches -> 1, reset to a clean unarmed      |
+   //| reversal candidate, and any resting Phase 1 order is cancelled.   |
+   //| Without this the twin would keep fading the very level the origin |
+   //| is now reversing against.                                        |
+   //|                                                                  |
+   //| A block whose touches != 0 is a Phase 2 peer already handled (its |
+   //| own sync), so it is skipped — this cannot cascade. Returns the     |
+   //| count of siblings promoted.                                       |
+   //+------------------------------------------------------------------+
+   int               SyncReversalCluster(int originIndex)
+     {
+      if(originIndex < 0 || originIndex >= m_blockCount) return 0;
+      if(m_blocks[originIndex].touches < 1)              return 0;   // origin not Phase 2
+
+      SSniperBlock origin = m_blocks[originIndex];   // copy — no struct reference
+      int promoted = 0;
+
+      for(int j = 0; j < m_blockCount; j++)
+        {
+         if(j == originIndex)                  continue;
+         if(m_blocks[j].touches != 0)          continue;   // Phase 2 peer -> skip
+         if(m_blocks[j].type != origin.type)   continue;   // same polarity only
+         if(m_blocks[j].isVetoed)              continue;
+         if(m_blocks[j].deleteOnBarTime > 0)   continue;   // already leaving
+
+         // Same-territory test: ranges must intersect. This is the standard
+         // t1 >= b2 && b1 <= t2 test and is identical to HasTerritoryOverlap().
+         bool overlaps = (origin.top >= m_blocks[j].bottom && origin.bottom <= m_blocks[j].top);
+         if(!overlaps) continue;
+
+         SSniperBlock sib = m_blocks[j];   // copy — persist before the cancel request
+         sib.touches        = 1;           // Phase 2 (Touch 1 consumed)
+         sib.conversionReason = VETO_NONE; // v5.36: Phase 2 reached normally — NOT a veto conversion
+         sib.isArmed        = false;
+         sib.isTriggered    = false;
+         sib.hasPlacedOrder = false;
+         sib.hasExited      = false;
+         sib.deleteOnBarTime = 0;
+         m_blocks[j] = sib;
+         RequestCancel(j);                 // drop any resting Phase 1 order
+
+         if(EnableLogging)
+            Print("[Block] CLUSTER SYNC #", sib.serial,
+                  " (", (sib.type == BLOCK_SUPPORT ? "SUP" : "RES"), ")",
+                  " -> Touch 2 reversal (origin #", origin.serial, ")");
+         promoted++;
+        }
+      return promoted;
      }
 
    //+------------------------------------------------------------------+

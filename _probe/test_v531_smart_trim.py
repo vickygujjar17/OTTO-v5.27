@@ -149,8 +149,8 @@ check("order manager falls back to 1.0 when InpMaxRR <= 0",
       re.search(r"double\s+tpRR\s*=\s*\(InpMaxRR\s*>\s*0\.0\)\s*\?\s*InpMaxRR"
                 r"\s*:\s*1\.0\s*;", OM_C) is not None)
 check("order manager projects the take-profit from tpRR * slDist",
-      re.search(r"double\s+takeProfit\s*=\s*\(block\.type\s*==\s*BLOCK_SUPPORT\)"
-                r"\s*\?\s*entryPrice\s*\+\s*tpRR\s*\*\s*slDist", OM_C) is not None and
+      re.search(r"double\s+takeProfit\s*=\s*isLong\s*"
+                r"\?\s*entryPrice\s*\+\s*tpRR\s*\*\s*slDist", OM_C) is not None and
       re.search(r":\s*entryPrice\s*-\s*tpRR\s*\*\s*slDist\s*;", OM_C) is not None)
 check("order manager stores the projection as block.localTP",
       re.search(r"block\.localTP\s*=\s*takeProfit\s*;", OM_C) is not None)
@@ -164,8 +164,8 @@ bm_sites = re.findall(r"double\s+tpRR\s*=\s*\(InpMaxRR\s*>\s*0\.0\)\s*\?\s*InpMa
 check("both block-manager front-run passes read InpMaxRR", len(bm_sites) == 2,
       "found %d site(s)" % len(bm_sites))
 check("block-manager front-run projects from tpRR * calcSLDist",
-      re.search(r"double\s+target\s*=\s*\(b\.type\s*==\s*BLOCK_SUPPORT\)"
-                r"\s*\?\s*calcEntry\s*\+\s*tpRR\s*\*\s*calcSLDist", BM_C) is not None and
+      re.search(r"double\s+target\s*=\s*isLong\s*"
+                r"\?\s*calcEntry\s*\+\s*tpRR\s*\*\s*calcSLDist", BM_C) is not None and
       re.search(r":\s*calcEntry\s*-\s*tpRR\s*\*\s*calcSLDist\s*;", BM_C) is not None)
 check("front-run prefers the exact sent TP once the order is live",
       BM_C.count("target = b.localTP;") == 2,

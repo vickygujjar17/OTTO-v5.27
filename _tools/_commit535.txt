@@ -1,0 +1,78 @@
+v5.35: hybrid Phase 1 limit / Phase 2 market-trigger execution split
+
+Phase 2 reversals no longer rest a LIMIT order at a shifted boundary. A
+Phase 1 block (touches == 0) is still a resting limit at its mapped entry,
+exactly as Pine's strategy.entry behaves. A Phase 2 block (touches == 1) is
+a RECLAIMED zone traded as a REVERSAL, and it is now entered by a
+dynamically-triggered MARKET order the moment the market actually TRADES
+THROUGH the shifted outer boundary -- instead of by a price merely touching
+a resting order.
+
+WHY A MARKET TRIGGER AND NOT A LIMIT
+
+A reversal off a reclaimed zone only has meaning if price has genuinely
+gone through the far edge. A resting limit at that edge fills on a wick
+that never confirms the reclaim; the market trigger refuses to fire until
+the trade itself prints beyond the boundary. Same geometry, stricter
+admission.
+
+THE EXECUTION SPLIT (PlaceOrdersForArmedBlocks)
+
+The limit funnel now bails on `touches >= 1`, so it arms Phase 1 ONLY.
+Letting it also rest a Phase 2 limit would double-arm one block through two
+independent execution paths -- the reset that promotes a block to Phase 2
+clears limitOrderTicket and hasPlacedOrder precisely so this cannot
+silently happen.
+
+PHASE 2 MARKET TRIGGERS (CheckPhase2MarketTriggers)
+
+  * Candidate gate: armed, Touch-1, live, not triggered, and with NO resting
+    broker order (this path never creates one).
+  * The same stacked / overlapping block lockout the limit funnel applies
+    (IsBlockedByPrimary), so the two paths can never enter the same cluster.
+  * Trigger price mirrors PlaceLimitOrder() exactly: Resistance -> LONG at
+    block.bottom - slDist, fired when Ask <= trigger; Support -> SHORT at
+    block.top + slDist, fired when Bid >= trigger. Both are InpShiftReversal
+    guarded and SnapToTick'd, so a change to the entry geometry moves both
+    paths at once.
+  * The identical Pine gate ladder: spread, direction guard, correlation
+    veto + vector veto (which marks VETO_CORRELATION on the block), then
+    sentiment.
+  * SL / TP / lot math is byte-for-byte the limit path's, so both phases
+    stop and target on the same geometry. The request is TRADE_ACTION_DEAL,
+    NOT PENDING, with tp = 0 -- the exact mirror of Pine's trail-only exits.
+  * One-shot per block: hasPlacedOrder is latched BEFORE the send and rolled
+    back when SendOrderWithRetry() fails, so a requote retry or a concurrent
+    tick cannot fire the same block twice.
+  * On success the fill is committed as the limit path commits it:
+    localEntry / localSL / localTP / rrUnit are stamped with the same
+    geometry so SeedActiveTradeFromBlock() rebuilds identical basket 1R
+    math, the zone is retired exactly as a Touch-2 limit fill is in
+    CheckPendingOrderFills() (touches = 2, isTriggered, deleteOnBarTime),
+    and the entry is journalled under its own session ID.
+
+CALL SITE (otto.mq5)
+
+CheckPhase2MarketTriggers() runs immediately after
+PlaceOrdersForArmedBlocks(), inside the same news-blackout / daily-DD-pause
+gate, so both execution paths share one entry window.
+
+INPUT / STAMP
+
+No new input. InpShiftReversalEntry remains the single switch that enables
+the shifted outer-boundary entry, now consumed by BOTH paths.
+
+Version bumped 5.34 -> 5.35 in all 11 sources (#property version), the
+OttoDefines master-build banner and #property description, the [9]/[10]/[11]
+/[12] engine-group labels, the otto.mq5 startup Print and Pine port banner,
+and the README base line. Historical '// v5.34:' and 'v5.34 Part N' engine
+annotations are preserved untouched; _tools/_bump535.py skips any line
+containing "FIX (" and anchors every other pattern on a human-facing prefix
+so no versioned comment can be rewritten.
+
+VALIDATION
+
+  * build_check.ps1 - 0 errors / 0 warnings, all 11 headers [STAGED] from the
+    staging tree, binary produced (228070 bytes).
+  * scan_encoding.ps1 - strict CRLF, no BOM, valid UTF-8 on all 11 sources,
+    bareLF=0.

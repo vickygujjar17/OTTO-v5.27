@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.33"
+#property version   "5.41"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -150,17 +150,29 @@ public:
    string            GetSessionID(void) const { return m_sessionID; }
 
    //+--------------------------------------------------------------+
-   //| LOG ORDER PLACED - create file + SUBJECT line + setup details   |
+   //| LOG SETUP ARMED - create file + SUBJECT line + setup details.   |
+   //| v5.40: the hybrid router arms a setup EITHER as a physical       |
+   //| broker pending limit (price valid for a resting order) OR as an  |
+   //| in-memory virtual order (price already through the zone). This   |
+   //| CREATES the per-setup journal either way and stamps the two       |
+   //| facts the operator needs on the header: the N/R Phase (Normal    |
+   //| Touch-1 bounce vs Reversal Touch-2) and the Execution Mode       |
+   //| (PHYSICAL vs VIRTUAL). The later entry/cancel/exit append into   |
+   //| the same file; the email ships the full snapshot.                |
    //+--------------------------------------------------------------+
-   void              LogOrderPlaced(ulong ticket, ENUM_TRADE_DIRECTION dir, ENUM_BLOCK_TYPE btype, double entryPrice, double slPrice, double lotSize, const SSniperBlock &blk)
+   void              LogSetupArmed(bool physical, string tradeId, ENUM_TRADE_DIRECTION dir, ENUM_BLOCK_TYPE btype, double entryPrice, double slPrice, double lotSize, const SSniperBlock &blk)
      {
       if(!m_ready) return;
       if(!OpenWrite()) return;
+      string phase    = (blk.touches == 0) ? "N (Normal Bounce)" : "R (Reversal)";
+      string execMode = physical ? "PHYSICAL (Broker Limit Order)" : "VIRTUAL (In-Memory Arm)";
       W("SUBJECT: [ACTIVE] Session " + SubjectLine());
       W("================================================================");
-      W("[ORDER PLACED] Session " + m_sessionID + " | " + m_symbol + " (" + (dir==DIR_LONG?"BUY / LONG":"SELL / SHORT") + ") | " + TimeToString(TimeCurrent()));
-      W("  Pending Ticket    : #" + IntegerToString((int)ticket));
-      W("  Limit Price       : " + FmtPrice(entryPrice));
+      W("[SETUP ARMED] Session " + m_sessionID + " | " + m_symbol + " (" + (dir==DIR_LONG?"BUY / LONG":"SELL / SHORT") + ") | " + TimeToString(TimeCurrent()));
+      W("  Setup ID          : " + tradeId);
+      W("  Phase             : " + phase);
+      W("  Execution Mode    : " + execMode);
+      W("  Trigger Price     : " + FmtPrice(entryPrice));
       W("  Initial SL        : " + FmtPrice(slPrice));
       W("  Volume            : " + DoubleToString(lotSize,2));
       W("  Block Polarity    : " + (btype==BLOCK_SUPPORT?"SUPPORT":"RESISTANCE"));
@@ -169,11 +181,24 @@ public:
       W("  Separation        : " + (blk.vetoReason==VETO_NO_SEPARATION?"FAILED":"PASSED"));
       W("================================================================");
       CloseHandle();
+      // v5.39: email the arm snapshot, exactly as LogEntry()/LogExit()/
+      // LogCancellation() do. line[0] is the SUBJECT, so the full setup
+      // breakdown (phase, execution mode, wicks, entry, SL, volume,
+      // polarity) ships in one mail.
+      SendMailFromFile();
      }
    void              LogEntry(ulong ticket, ENUM_TRADE_DIRECTION dir, double entryPrice, double slPrice, double lotSize, double riskMoney, const SSniperBlock &blk)
      {
       if(!m_ready) return;
-      if(!OpenWrite()) return;
+      // v5.38: APPEND into the per-setup file the arm() created, so the armed
+      // snapshot and the fill share ONE journal. OpenAppend() seeks to EOF and
+      // fails when the file is absent (a manual adoption, or a legacy session),
+      // in which case OpenWrite() creates it -- same fallback the pyramid /
+      // trail / cancellation writers already use.
+      if(!OpenAppend())
+        {
+         if(!OpenWrite()) return;   // no prior file -> create it
+        }
       double riskDist = MathAbs(entryPrice - slPrice);
       W("SUBJECT: [ACTIVE] Session " + SubjectLine());
       W("================================================================");
@@ -192,6 +217,12 @@ public:
       W("    - Separation  : " + (blk.vetoReason==VETO_NO_SEPARATION?"FAILED":"PASSED"));
       W("================================================================");
       CloseHandle();
+      // v5.37 -- email the entry log, mirroring LogExit()/LogCancellation().
+      // Without this the entry record was written to disk but never sent, so
+      // the [ACTIVE] entry email that the exit email refers back to never
+      // arrived. SendMailFromFile() picks the subject from line[0] and falls
+      // back to the CANCELLED_<name> payload when the session was renamed.
+      SendMailFromFile();
      }
 
    void              LogPyramid(int tranche, ulong ticket, double entry, double size, double riskPct, double groupSL)
@@ -295,6 +326,30 @@ public:
          Print("[Journal] FileMove FAILED (err=", err, ") for ", fname, " -> ", cancelledName);
         }
 
+      SendMailFromFile();
+     }
+
+   //+----------------------------------------------------------------+
+   //| LOG CONVERSION (v5.36) - Phase 1 dropped for Phase 2 Reversal  |
+   //| Appends a conversion notice + emails [CONVERTED TO REVERSAL].  |
+   //| Unlike LogCancellation() this does NOT rename the session file |
+   //| to CANCELLED_ : the setup is still live, merely re-phased.     |
+   //+----------------------------------------------------------------+
+   void              LogConversion(ulong ticket, ENUM_BLOCK_TYPE btype, string reason)
+     {
+      if(!m_ready) return;
+      if(!OpenAppend())
+        {
+         if(!OpenWrite()) return;   // no prior file -> create it
+        }
+      W("================================================================");
+      W("[CONVERTED TO REVERSAL] Session " + m_sessionID + " | " + m_symbol + " | " + TimeToString(TimeCurrent()));
+      W("  Ticket Dropped    : #" + IntegerToString((int)ticket));
+      W("  Block Polarity    : " + (btype == BLOCK_SUPPORT ? "SUPPORT" : "RESISTANCE"));
+      W("  Trigger Event     : " + reason);
+      W("  Next Action       : Phase 1 order cancelled; Block upgraded to Phase 2 Reversal.");
+      W("================================================================");
+      CloseHandle();
       SendMailFromFile();
      }
   };

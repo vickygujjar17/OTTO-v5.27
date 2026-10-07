@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                       OttoEA.mq5 |
 //|                    OTTO — Goat Funded Trader (GFT) Master Build    |
-//|                    Pine Script Master Build Port (v5.33)            |
+//|                    Pine Script Master Build Port (v5.41)            |
 //|                                    Institutional / Real-Money    |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.33"
+#property version   "5.41"
 #property description "OTTO EA â€” Goat Funded Trader (GFT) Master Build"
 #property description "Separation | Sizing | Front-Run | Near-Miss | Stale vetoes"
 #property description "Modules: News Shield | Risk | Block Manager | Order Mgmt | Trail"
@@ -182,7 +182,7 @@ int OnInit(void)
    g_symbol = _Symbol;
 
    Print("==============================================================");
-   Print("  OTTO EA v5.33 — 28-Pair Institutional Master Build — INITIALIZING");
+   Print("  OTTO EA v5.41 — 28-Pair Institutional Master Build — INITIALIZING");
    Print("  Symbol: ", g_symbol, " | Magic: ", MagicNumber);
    Print("==============================================================");
 
@@ -667,6 +667,32 @@ void UpdateMarketDay(void)
   }
 
 //+------------------------------------------------------------------+
+//| MAPPED direction of a zone for the portfolio bias vote.         |
+//|                                                                 |
+//| A Support / Resistance zone is DISCOVERED polarity, NOT trade    |
+//| direction. HiveMind publishes a LONG / SHORT consensus into the  |
+//| correlation matrix, and the conflict tie-breaker does not merely  |
+//| prefer one of two opposing zones -- it DELETES the losing         |
+//| polarity and vetoes its live orders. Reading the raw zone here    |
+//| would therefore publish the EXACT OPPOSITE bias to how every      |
+//| entry is mapped, so the hive mind would systematically veto       |
+//| exactly the setups this build now takes.                          |
+//|                                                                  |
+//| Byte-identical twin of COttoOrderManager::GetDirectionForBlock()  |
+//| and COttoBlockManager::BlockDirection() (both private): the       |
+//| standard two-phase mapping is PHASE-AWARE -- a fresh zone          |
+//| (touches == 0) is a PHASE 1 BOUNCE (Support -> DIR_LONG) and a    |
+//| zone that has consumed Touch 1 (touches >= 1) is a PHASE 2        |
+//| REVERSAL that trades the S/R flip (Support -> DIR_SHORT).          |
+//+------------------------------------------------------------------+
+ENUM_TRADE_DIRECTION MappedZoneDirection(const SSniperBlock &b)
+  {
+   if(b.touches >= 1)
+      return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Phase 2 — reversal (S/R flip)
+   return (b.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;      // Phase 1 — normal bounce
+  }
+
+//+------------------------------------------------------------------+
 //| Hive Mind â€” broadcast bias and resolve bidirectional conflicts   |
 //+------------------------------------------------------------------+
 void HiveMind(void)
@@ -675,31 +701,47 @@ void HiveMind(void)
 
    SSniperBlock allBlocks[];
    int total = g_blockManager.GetAllBlocks(allBlocks);
-   bool hasSupport = false, hasResistance = false;
+   int supportVote = 0, resistanceVote = 0;   // raw zone polarity (diagnostics)
+   int mappedVote  = 0;                       // EXPERIMENT: MAPPED direction digest
    for(int b = 0; b < total; b++)
      {
       if(allBlocks[b].isVetoed) continue;
-      if(allBlocks[b].type == BLOCK_SUPPORT) hasSupport = true;
-      if(allBlocks[b].type == BLOCK_RESISTANCE) hasResistance = true;
+      if(allBlocks[b].type == BLOCK_SUPPORT)
+         supportVote++;
+      else if(allBlocks[b].type == BLOCK_RESISTANCE)
+         resistanceVote++;
+      // Each live zone votes with the direction it would actually TRADE,
+      // not with the polarity it was discovered as: the two-phase mapping
+      // is PHASE-AWARE, so the vote uses the helper rather than the type.
+      mappedVote += (MappedZoneDirection(allBlocks[b]) == DIR_LONG) ? 1 : -1;
      }
 
    int myBias = 0;
-   if(hasSupport && !hasResistance)
+   // The tie-breaker DELETES the zone whose MAPPED direction LOST the vote.
+   // Both DeleteBlockType arguments below carry an identical
+   // "supportVote > 0 ? Long : Short" discriminator:
+   //   in a two-polarity conflict (supportVote > 0) it picks polarity-vs-polarity;
+   //   with only a resistance zone live (supportVote == 0) it picks the polled
+   //   winner as a zone, so a resistance-only field cannot be deleted.
+   // Log lines and myBias are unchanged:
+   //   resolution == +1 -> peers Long  -> the SHORT-mapped zone is deleted
+   //   resolution == -1 -> peers Short -> the LONG-mapped  zone is deleted
+   if(mappedVote > 0 && resistanceVote == 0)
       myBias = 1;
-   else if(hasResistance && !hasSupport)
+   else if(mappedVote < 0 && supportVote == 0)
       myBias = -1;
-   else if(hasSupport && hasResistance)
+   else if(mappedVote != 0)
      {
       int resolution = g_correlationFilter.ResolveBidirectionalConflict();
       if(resolution == 1)
         {
-         g_blockManager.DeleteBlockType(BLOCK_RESISTANCE);
+         g_blockManager.DeleteBlockType(supportVote > 0 ? BLOCK_SUPPORT : BLOCK_RESISTANCE);
          myBias = 1;
          if(EnableLogging) Print("[HiveMind] CONFLICT: peers Long â†’ kept Support");
         }
       else if(resolution == -1)
         {
-         g_blockManager.DeleteBlockType(BLOCK_SUPPORT);
+         g_blockManager.DeleteBlockType(supportVote > 0 ? BLOCK_RESISTANCE : BLOCK_SUPPORT);
          myBias = -1;
          if(EnableLogging) Print("[HiveMind] CONFLICT: peers Short â†’ kept Resistance");
         }
@@ -877,7 +919,7 @@ void OnTick(void)
 
    // ================================================================
    // STEP 3: INTRA-BAR TARGET CHECKS (inside OnTick)
-   // Front-Run 1:3 target + 6-day near-miss expiry, live.
+   // Front-Run 1:4 target + 6-day near-miss expiry, live.
    // ================================================================
    g_blockManager.CheckVetoesInTick(g_marketDay);
    g_orderManager.CancelOrdersForInvalidBlocks();
@@ -902,7 +944,14 @@ void OnTick(void)
    // Gated further by news blackout + daily-DD pause.
    // ================================================================
    if(!g_newsFilter.IsInNewsBlackout() && !g_dailyDD_Paused)
+     {
+      // Every armed block - Phase 1 (touches==0) and Phase 2 (touches==1)
+      // alike - now routes through the single in-memory virtual engine:
+      // PlaceOrdersForArmedBlocks() ARMS the order and the order manager's
+      // CheckVirtualTriggers() FIRES the MARKET leg once the level trades
+      // through. The old per-phase execution split is gone.
       g_orderManager.PlaceOrdersForArmedBlocks();
+     }
 
    // ================================================================
    // STEP 5: MANAGE ACTIVE TRADES â€” dynamic trail (every tick)

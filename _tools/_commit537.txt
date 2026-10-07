@@ -1,0 +1,88 @@
+v5.37: swap resting broker pendings for an in-memory virtual-order engine
+
+Every Phase 1 setup used to be handed to the broker as a resting LIMIT
+(TRADE_ACTION_PENDING). That made the EA's fills a function of the venue's
+pending-order rules as much as of price: a mapped entry that sat inside the
+broker's stop level, freeze level, or stale-price band was refused outright
+(Invalid Price / Invalid Stops), and a DOZEN "is our order still there?" paths
+existed only to reconcile the broker's book against our in-memory one. The
+virtual-order engine removes the broker from the resting phase entirely: a
+setup is held in memory and, when the market actually TRADES to the level, sent
+as a MARKET order (TRADE_ACTION_DEAL). Nothing rests at the venue, so nothing
+can be refused for resting in the wrong place.
+
+THE VIRTUAL BOOK (OttoDefines.mqh + COttoOrderManager.mqh)
+
+SVirtualOrder { blockIndex, blockSerial, direction, triggerPrice, stopLoss,
+lotSize } lives inside COttoOrderManager alongside the backing array
+m_virtualOrders[] / m_virtualCount. It is deliberately keyed by blockSerial,
+not by blockIndex: COttoBlockManager::RemoveBlock() COMPACTS m_blocks[], so an
+index captured at arm time can later point at an unrelated zone. serial is the
+stable identity and already names the block's tradeId.
+
+  * PlaceLimitOrder() keeps its name and signature but no longer sends. It
+    computes entry/SL/lot exactly as before, appends an SVirtualOrder, latches
+    block.hasPlacedOrder (the concurrent-tick duplicate lock) and returns true.
+    It is the ARM half.
+  * CheckVirtualTriggers() (new) is the EXECUTION half, called from Update()
+    in place of the retired CheckPendingOrderFills() broker-fill scan. A LONG
+    fires once Ask has traded DOWN to/through its triggerPrice, a SHORT once
+    Bid has traded UP to/through it -- a MARKET cross, so a gap past the level
+    still fires where a resting limit would have been skipped. On fire it
+    re-runs the identical Pine gate ladder (spread, CanPlaceForDirection,
+    correlation veto, consensus vector veto), sends a TRADE_ACTION_DEAL, then
+    consumes the touch (0 -> 1 promotes to a Phase 2 reversal candidate via
+    SyncReversalCluster(); 1 -> 2 retires the block on the next bar) exactly as
+    CheckPendingOrderFills() used to.
+  * RemoveVirtualOrderAt() (new) compacts m_virtualOrders[] in place, the way
+    RemoveBlock() compacts m_blocks[]. Every sweep therefore walks the book in
+    REVERSE (m_virtualCount-1 -> 0) so compaction cannot skip a shifted element.
+
+BLOCK LOOKUP BY SERIAL (COttoBlockManager.mqh)
+
+FindBlockIndexBySerial() (new) is the serial twin of FindBlockIndexByTicket().
+Once no broker ticket exists there is nothing for the ticket-keyed lookup to
+find, so the virtual engine, the vector-cancel sweep, and the cleanup funnel
+all resolve their live block through the serial instead.
+
+CANCEL / CLEANUP REWRITE -- the book IS the engine
+
+The old paths each deleted a broker pending order; that work is gone.
+
+  * CancelOrdersForInvalidBlocks() -- for a vetoed / triggered / flipped /
+    deleted / cancel-flagged block it now drops the matching SVirtualOrder by
+    serial and keeps the existing journal branch (the v5.36 conversion-vs-cancel
+    discriminator, unchanged). No OrderDelete().
+  * CancelOpposingConsensusOrders() -- walks m_virtualOrders[] directly and
+    prunes only THIS chart's armed setups on a vector veto, which is what the
+    v5.28 note always intended (no shared broker book, no portfolio-wide
+    cancel storm).
+  * ManageDirectionConflict() -- drops armed virtual orders that fight the live
+    trade's direction; again pure array work.
+  * CancelAllPendingOrders() -- "cancel all" is now simply an empty book.
+  * The broker-side duplicate shield IsOrderAlreadyLiveAtPrice() and the
+    pending-order introspection (IsBlockOrderAlive / GetMyPendingOrderByIndex /
+    ResolveFilledPositionTicket / m_pendingLimit*) are removed with the
+    mechanism they protected; CountMyPendingOrders() remains as a live
+    broker-count helper for the auditor and the direction-conflict gate.
+
+Phase 2 is untouched: a reclaimed zone (touches >= 1) was already executed by
+CheckPhase2MarketTriggers() as a MARKET order and still is.
+
+VALIDATION
+
+  * build_check.ps1 - 0 errors / 0 warnings, all 11 headers [STAGED] from the
+    staging tree, binary produced.
+  * scan_encoding.ps1 - strict CRLF, no BOM, valid UTF-8, bareLF=0 on all 11
+    sources.
+  * verify_integrity.py - bareLF=0 / bareCR=0 on every source.
+
+Version bumped 5.36 -> 5.37 in all 11 sources (#property version), the
+OttoDefines master-build banner + #property description, the [9]/[10]/[11]
+/[12] engine-group labels, the otto.mq5 Pine port banner and startup Print,
+and the README base line. The '// vX.NNN Part N' annotations for the engine
+are re-stamped to v5.37 (v5.36 shipped WITHOUT this refactor, so those markers
+name code that first builds here), while the already-shipped '// v5.36:' notes
+(veto-to-reversal conversion) are preserved untouched. _tools/_bump537.py skips
+any line containing "FIX (" and anchors every other pattern on a human-facing
+prefix so no versioned comment can be rewritten.

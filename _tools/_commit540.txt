@@ -1,0 +1,75 @@
+feat: build hybrid physical/virtual order router with N/R setup tags and explicit arm email
+
+v5.37 turned the resting broker limit into an in-memory virtual-order engine and
+v5.38/v5.39 finished that cleanup, but the engine could only ever arm virtually:
+every setup waited for the market to trade through its entry and fired a MARKET
+deal. That loses the broker-side resting fill whenever the entry is STILL valid
+(priced short of the zone), which is the common case right after a block arms.
+v5.40 makes the engine HYBRID: it rests a real broker limit when the price is
+legal and arms in memory only when the market has already reached the zone.
+
+THE ROUTER (COttoOrderManager.mqh)
+
+ArmVirtualOrder() is renamed PlaceOrArmOrder() and now decides the route per
+setup. It computes the broker boundary via GetPriceBoundaryBuffer() (live again
+after its v5.39 retirement) and tests the entry's legality: a BUY_LIMIT must sit
+below the bid, a SELL_LIMIT above the ask, each clearing stops/freeze. A legal
+price sends a real TRADE_ACTION_PENDING limit (PHYSICAL route) whose order type
+follows GetOrderTypeForBlock(), records the resting ticket via SetBlockOrderTicket
+and journals LogSetupArmed(physical=true, ...). A price already through the zone
+arms an in-memory SVirtualOrder (VIRTUAL route) that CheckVirtualTriggers() fires
+as a MARKET deal on the cross. A physical send the venue REFUSES falls back to
+the virtual arm rather than dropping the setup.
+
+The v5.28 one-shot "Invalid Price" abort is deliberately NOT re-added as a guard:
+the router decides legality itself, so it can never dispatch a resting order the
+server refuses, and the abort literal / priceAbortLogged gate stay retired.
+
+PHYSICAL FILL SCANNER (COttoOrderManager.mqh)
+
+The pre-v5.37 CheckPendingOrderFills() (with IsBlockOrderAlive(), DeleteOrder()
+and the 3-tier ResolveFilledPositionTicket()) is recovered and wired into Update()
+FIRST, so a physical limit fill is detected as a broker event, resolved to its
+unrelated position ticket, seeded into the basket and advanced through the same
+two-phase (Touch 1 -> Phase 2 reversal) lifecycle the virtual trigger uses. A
+pending that vanished without a position is a cancel/expiry: its ticket is
+released.
+
+DUAL-BOOK HYGIENE (COttoOrderManager.mqh)
+
+Because a setup may now rest at the broker, every book operation spans BOTH the
+broker pending pool and the in-memory virtual book. IsOrderAlreadyLiveAtPrice()
+-> IsAnyOrderLiveAtPrice() (duplicate shield scans both). CountMyPendingOrders()
+returns pendings + m_virtualCount. CancelOrdersForInvalidBlocks(),
+CancelOpposingConsensusOrders(), ManageDirectionConflict() and
+CancelAllPendingOrders() delete a resting physical order before releasing the
+block. All physical cancels reuse the setup's arm-time session (carried on the
+block) so the cancel lands in the ONE journal file the setup opened.
+
+N/R PHASE + EXECUTION MODE JOURNAL (COttoJournal.mqh)
+
+LogVirtualOrderArmed() -> LogSetupArmed(bool physical, ...) which stamps two new
+header facts an operator cannot infer otherwise: the setup Phase (N = Normal
+Touch-1 bounce / R = Reversal Touch-2) and the Execution Mode (PHYSICAL broker
+limit vs VIRTUAL in-memory arm). It still emails the full snapshot via
+SendMailFromFile() after CloseHandle(), as LogEntry()/LogExit()/LogCancellation()
+do. The per-setup session is now pinned on the new SSniperBlock.sessionId field
+at arm time, so the arm, fill, cancel and conversion paths all resolve to ONE
+journal regardless of route. SSniperBlock is never raw-serialised (no
+FileWriteStruct / memcpy / sizeof anywhere in the tree), so the string member is
+safe.
+
+PROBES
+
+A new test_v540_hybrid.py pins the router (physical send, virtual arm, fallback,
+retired abort), the recovered fill scanner and its Update() wiring, the dual-book
+shield/count/cleanup and the N/R + execution-mode journal (41 checks). The
+v5.28/v5.30/v5.39 probes are realigned: the boundary helper is LIVE again and the
+duplicate shield is the renamed dual-book scan. Three stale pins stranded by the
+earlier v5.34 direction-mapping and v5.33 auditor-signature refactors are
+corrected (v527/v531/v532). Suite is green end-to-end (17 probes).
+
+VERSION BUMP
+
+_tools/_bump540.py rewrites the eleven #property version headers, the OttoDefines
+banner/description, the four input-group release stamps and the README base line.

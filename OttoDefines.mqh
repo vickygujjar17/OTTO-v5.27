@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.33 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.41 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.33"
-#property description "OTTO v5.33 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.41"
+#property description "OTTO v5.41 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -15,11 +15,18 @@
 //| Enumerations                                                     |
 //+------------------------------------------------------------------+
 
-// Block polarity. Support => Long, Resistance => Short (mirrors Pine is_support)
+// Block polarity as DISCOVERED by the pattern engine. Support/Resistance here
+// describe the ZONE, NOT the trade direction. The zone -> direction mapping is
+// owned by COttoOrderManager::GetDirectionForBlock() and is PHASE-AWARE per the
+// two-phase lifecycle: a fresh zone (touches == 0) is a PHASE 1 BOUNCE
+// (Support -> BUY, Resistance -> SELL); a zone that has consumed Touch 1
+// (touches >= 1) is a PHASE 2 REVERSAL that trades the S/R flip
+// (Support -> SELL, Resistance -> BUY). Enum VALUES are persisted and compared,
+// so they must never be renumbered.
 enum ENUM_BLOCK_TYPE
   {
-   BLOCK_RESISTANCE = 0,  // Resistance block -> SELL LIMIT
-   BLOCK_SUPPORT    = 1   // Support block    -> BUY  LIMIT
+   BLOCK_RESISTANCE = 0,  // Resistance zone (Phase 1 -> SELL, Phase 2 -> BUY)
+   BLOCK_SUPPORT    = 1   // Support zone    (Phase 1 -> BUY,  Phase 2 -> SELL)
   };
 
 enum ENUM_TRADE_DIRECTION
@@ -128,6 +135,15 @@ struct SSniperBlock
    datetime          creationTime;     // when the block was formed
    int               creationBarSerial;// Bars() serial at creation (diagnostics)
    int               serial;           // unique block id (for trade_id + visuals)
+   // v5.34: two-phase lifecycle counter. 0 = fresh/unarmed, 1 = Touch 1 (the
+   // normal entry) consumed, 2 = Touch 2 (the shifted reversal) consumed. It is
+   // zeroed by ZeroMemory() at every block-creation site (see COttoBlockManager).
+   int               touches;
+   // v5.36: why this zone was promoted to a Phase 2 reversal — the convertible
+   // veto that triggered the conversion. VETO_NONE when the block reached
+   // Phase 2 normally (or never did). Zeroed by ZeroMemory() at every
+   // block-creation site, so a fresh block reads VETO_NONE.
+   ENUM_VETO_REASON  conversionReason;
 
    // --- Order data (Pine: local_sl / local_tp / local_entry / rr_unit / trade_id) ---
    ulong             limitOrderTicket; // resting broker pending-order ticket (0 = none)
@@ -139,6 +155,13 @@ struct SSniperBlock
    double            rrUnit;           // = blockHeight + 0.5*ATR (Pine b.rr_unit)
    bool              priceAbortLogged; // v5.30: one-shot gate for the Invalid-Price abort
                                        //   (0 from ZeroMemory at every creation site)
+   // v5.40: the per-setup journal session, minted when the setup is ARMED (a
+   // physical broker limit OR an in-memory virtual arm) and reused at the fill,
+   // cancel and conversion paths so ONE setup maps to ONE journal file. Empty
+   // until arm time; ZeroMemory() clears it at every block-creation site. The
+   // string member is safe because SSniperBlock is never raw-serialised (no
+   // FileWriteStruct / FileReadStruct / memcpy / sizeof use anywhere in the tree).
+   string            sessionId;
 
    // --- v4.30 Near-Miss trackers (Pine: min_prox_dist / anchor_*) ---
    double            minProxDist;      // closest proximity wick distance (0 = unset)
@@ -237,6 +260,9 @@ input group "  [4] EXECUTION SETTINGS (Pine entry/arm)"
 input group "══════════════════════════════════════════════════"
 input ENUM_ENTRY_STYLE InpEntryStyle = ENTRY_MIDPOINT;  // Midpoint or Front Edge
 input double   InpArmATR          = 0.0;      // Arming distance (ATR) — 0 = instant arm
+// v5.34: Shift Reversal entry. When true, Touch 2 of a zone is entered from its
+// OUTER boundary instead of the midpoint (the "shifted reversal" geometry).
+input bool     InpShiftReversalEntry = true;  // Shift Reversal (Touch 2) Entry to Outer Boundary
 input double   InpFixedRiskUSD    = 0.0;      // Fixed $ risk/trade (0 = use RiskPercent%)
 input bool     InpPyramidEnable   = true;     // Enable 4-tranche pyramiding (unified group SL)
 // v5.29: Tranche 1 risk continues to flow through RiskPercent in group [6]
@@ -350,7 +376,7 @@ input double   SafetyMaxFloatingLoss = 0.90;  // Hard cap: smart-trim at this % 
 input double   InpTrimLoserStopPct = 70.0;    // Smart trim: non-primary legs >= this % toward SL
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.33"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.41"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart
@@ -362,7 +388,7 @@ input int      InpAnchorTF           = PERIOD_H1;  // Anchor candle timeframe (H
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
 
 input group "══════════════════════════════════════════════════"
-input group "  [10] HIGH TABLE AUDITOR — v5.33"
+input group "  [10] HIGH TABLE AUDITOR — v5.41"
 input group "══════════════════════════════════════════════════"
 // Decoupled watchdog: audits live state on its OWN timer cadence rather
 // than inside OnTick, so a halted / paused / tick-starved trade loop can
@@ -372,7 +398,7 @@ input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
 input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
 
 input group "══════════════════════════════════════════════════"
-input group "  [11] MANUAL TRADE ADOPTION — v5.33"
+input group "  [11] MANUAL TRADE ADOPTION — v5.41"
 input group "══════════════════════════════════════════════════"
 // Let this EA manage positions opened BY HAND on its own chart symbol.
 // A manual position is identified as a MAGIC-0 position on m_symbol: the
@@ -388,6 +414,22 @@ input bool     InpAdoptManualTrades     = true;  // Adopt magic-0 manual positio
 input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual leg with no SL (minutes)
 
 //+------------------------------------------------------------------+
+input group "══════════════════════════════════════════════════"
+input group "  [12] VETO REVERSAL CONVERSIONS — v5.41"
+input group "══════════════════════════════════════════════════"
+// v5.34: the old [12] "INVERTED S/R + VIRTUAL ORDERS" experiment block was
+// retired. The zone -> direction mapping is now the standard PHASE-AWARE
+// two-phase lifecycle (see ENUM_BLOCK_TYPE and GetDirectionForBlock) and the
+// virtual-order engine was deleted. These five flags let a vetoed setup
+// be re-used as a REVERSAL candidate instead of being discarded. They are now
+// consumed by v5.34 Part 2: a convertible veto on a Phase 1 block (touches==0)
+// advances it to Touch 2 via COttoBlockManager::TryConvertToReversal instead of
+// deleting the zone outright.
+input bool     InpRevFrontRun = true;   // Convert Front-Run Veto to Phase 2 Reversal
+input bool     InpRevNearMiss = true;   // Convert Near-Miss Veto to Phase 2 Reversal
+input bool     InpRevStale    = true;   // Convert Stale Veto to Phase 2 Reversal
+input bool     InpRevMom      = true;   // Convert Momentum Veto to Phase 2 Reversal
+input bool     InpRevFvg      = true;   // Convert FVG Veto to Phase 2 Reversal
 //| Global Constants                                                 |
 //+------------------------------------------------------------------+
 #define MAX_BLOCKS        50        // Max concurrent S/R blocks (memory safety)

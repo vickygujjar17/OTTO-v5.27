@@ -25,6 +25,15 @@ one is a runtime property of how a price is derived and re-sent:
   5. DUPLICATE-SHIELD UNITS. The tolerance band must track the snapped grid
      (min(tick, point)), or the snap can slide an entry outside the band.
 
+v5.39 UPDATE. The v5.28 LIVE PRICE VALIDATION pre-flight this probe was built
+around was DELETED from ArmVirtualOrder(): a v5.37+ setup is an in-memory
+SVirtualOrder, so no limit ever rests at the broker and TRADE_RETCODE_INVALID_PRICE
+cannot occur. Bullet 3 (the one-shot priceAbortLogged gate) and the GUARD-facing
+half of bullets 1/2 therefore no longer describe live code. Those assertions now
+pin the guard's ABSENCE (so a half-wired re-introduction is caught), while the
+snap mechanics, the buffer-helper internals, the retry re-quote, the
+duplicate-shield units and the version stamps remain live contracts.
+
 Pure static analysis of the shipped sources - no MT5 required.
 """
 
@@ -94,15 +103,15 @@ def body(start_marker, end_marker):
     return OM_C[i:j] if j > 0 else OM_C[i:]
 
 
-PLACE = body("bool                    PlaceLimitOrder(int blockIndex",
-             "bool                    IsBlockOrderAlive(ulong ticket)")
+PLACE = body("bool                    PlaceOrArmOrder(int blockIndex",
+             "bool                    IsAnyOrderLiveAtPrice(double targetPrice")
 SEND = body("bool                    SendOrderWithRetry(MqlTradeRequest &request",
             "string                  GetTradeRetcodeString(uint retcode)")
 BUF = body("double                  GetPriceBoundaryBuffer(void)",
            "double                  SnapToTick(double price)")
 SNAP = body("double                  SnapToTick(double price)",
             "double                  GetAsk(void)")
-SHIELD = body("bool                    IsOrderAlreadyLiveAtPrice(double targetPrice",
+SHIELD = body("bool                    IsAnyOrderLiveAtPrice(double targetPrice",
               "\n\n")
 
 
@@ -111,7 +120,7 @@ SHIELD = body("bool                    IsOrderAlreadyLiveAtPrice(double targetPr
 # ----------------------------------------------------------------------
 print("\n-- Tick-size snap --")
 
-check("PlaceLimitOrder located", PLACE is not None)
+check("PlaceOrArmOrder located", PLACE is not None)
 check("SendOrderWithRetry located", SEND is not None)
 check("GetPriceBoundaryBuffer located", BUF is not None)
 check("SnapToTick located", SNAP is not None)
@@ -124,9 +133,11 @@ check("snap rounds to the nearest tick",
 check("snap is guarded against a zero tick size", "tick > 0.0" in SNAP)
 check("snap normalises to the symbol's own digits",
       "SYMBOL_DIGITS" in SNAP and "SYMBOL_TRADE_TICK_SIZE" in SNAP)
-check("snap precedes the guard comparisons",
-      OM_T.find("SnapToTick(CalcEntryPrice(block))") <
-      OM_T.find("entryPrice >= (liveBid - priceBuffer)"))
+# v5.39: the live-price guard comparisons the snap used to precede are gone.
+check("entry price is snapped (v5.39: guard comparisons retired)",
+      OM_T.find("SnapToTick(CalcEntryPrice(block))") >= 0
+      and "entryPrice >= (liveBid - priceBuffer)" not in OM_T
+      and "entryPrice <= (liveAsk + priceBuffer)" not in OM_T)
 
 
 # ----------------------------------------------------------------------
@@ -145,72 +156,62 @@ check("buffer adds one point of cushion on top",
                 BUF) is not None)
 check("buffer falls back when the symbol reports point 0",
       re.search(r"point\s*<=\s*0\.0\)\s*point\s*=\s*_Point", BUF) is not None)
-check("PlaceLimitOrder uses the buffered boundary",
-      "double priceBuffer = GetPriceBoundaryBuffer();" in PLACE)
+# v5.40: the ROUTER consumes the boundary buffer to decide the route — a
+# legal resting price stays PHYSICAL, an illegal one arms VIRTUAL.
+check("PlaceOrArmOrder applies the live-price boundary to route",
+      "GetPriceBoundaryBuffer()" in PLACE and "priceBuffer" not in PLACE and
+      "boundary" in PLACE)
 
 # The old local shadowed the same-named locals in ValidateStopDistance and
 # AdjustSLToMinimum; the guard must no longer declare a bare `stopsLevel`.
 check("guard no longer shadows `stopsLevel`", "double stopsLevel" not in PLACE)
-check("BUY_LIMIT is still validated against the bid",
+# v5.39: the live bid/ask side checks and their invBuy/invSell reason literals
+# were all removed with the guard. Assert each is gone so a half-wired
+# re-introduction cannot slip back in unnoticed.
+check("legacy BUY_LIMIT-vs-bid check is retired",
       re.search(r"entryPrice\s*>=\s*\(liveBid\s*-\s*priceBuffer\)",
-                OM_T) is not None)
-check("SELL_LIMIT is still validated against the ask",
+                OM_T) is None)
+check("legacy SELL_LIMIT-vs-ask check is retired",
       re.search(r"entryPrice\s*<=\s*\(liveAsk\s*\+\s*priceBuffer\)",
-                OM_T) is not None)
-
-# The reason literals must stay identical to the comparisons they describe.
-lit_buy = re.search(r'string\s+invBuy\s*=\s*"([^"]+)"', OM_T)
-lit_sell = re.search(r'string\s+invSell\s*=\s*"([^"]+)"', OM_T)
-check("invBuy literal matches the BUY_LIMIT comparison",
-      lit_buy is not None and
-      norm(lit_buy.group(1)) == "entryPrice >= (liveBid - priceBuffer)")
-check("invSell literal matches the SELL_LIMIT comparison",
-      lit_sell is not None and
-      norm(lit_sell.group(1)) == "entryPrice <= (liveAsk + priceBuffer)")
+                OM_T) is None)
+check("invBuy reason literal is retired", "invBuy" not in OM_T)
+check("invSell reason literal is retired", "invSell" not in OM_T)
+check("no live bid/ask locals remain in the order manager",
+      "liveBid" not in OM_T and "liveAsk" not in OM_T)
 
 
 # ----------------------------------------------------------------------
-# 3. One-shot log gate on the block (NOT a veto - the block stays armed)
+# 3. One-shot log gate on the block (RETIRED in v5.39)
 # ----------------------------------------------------------------------
-print("\n-- One-shot log gate --")
+print("\n-- One-shot log gate (retired v5.39) --")
 
-check("SSniperBlock carries a priceAbortLogged field",
+# The v5.28/v5.30 one-shot ABORT gate no longer exists: the live-price
+# pre-flight it de-duplicated was removed in v5.39. The block field and the
+# zero-init contract remain, and the guard must now be ABSENT.
+check("SSniperBlock still carries the inert priceAbortLogged field",
       re.search(r"bool\s+priceAbortLogged\s*;", DEFS_T) is not None)
-check("gate suppresses the repeat print",
+check("one-shot gate print is retired",
       re.search(r"EnableLogging\s*&&\s*!block\.priceAbortLogged",
-                OM_T) is not None)
-check("abort raises the gate", "block.priceAbortLogged = true;" in PLACE)
-check("gate is cleared on the clear paths",
-      OM_T.count("block.priceAbortLogged = false;") >= 3,
-      "count=%d" % OM_T.count("block.priceAbortLogged = false;"))
-check("abort persists the gate to the block book",
-      re.search(r"block\.priceAbortLogged = true;\s*\n\s*"
-                r"m_blockManager\.SetBlockAt\(blockIndex, block\);\s*\n\s*"
-                r"return false;", PLACE) is not None)
-# Scoped to the guard region only: PlaceLimitOrder legitimately contains
-# VETO_CORRELATION at its earlier portfolio-consensus step, so scanning the
-# whole function for VETO_ would be a false alarm. The price abort itself must
-# leave the block armed (a veto also sets deleteOnBarTime, which destroys the
-# block on the next bar - turning a transient price condition into a
-# permanent block loss).
-# Both anchors are taken from the COMMENT-STRIPPED text on purpose: the
-# "LIVE PRICE VALIDATION" banner is itself a // comment, so it cannot survive
-# strip_comments() and would silently yield an empty region.
-g_start = OM_C.find("double priceBuffer = GetPriceBoundaryBuffer();")
-g_end = OM_C.find("IsOrderAlreadyLiveAtPrice(entryPrice, 5.0)", g_start)
-guard_region = OM_C[g_start:g_end] if 0 <= g_start < g_end else ""
-check("guard region located", bool(guard_region) and
-      "priceAbortLogged" in guard_region)
-check("abort does NOT veto the block",
-      "isVetoed" not in guard_region and "vetoReason" not in guard_region)
+                OM_T) is None)
+check("guard abort no longer raises the gate",
+      "block.priceAbortLogged = true;" not in PLACE)
+check("guard abort no longer persists the gate to the block book",
+      "block.priceAbortLogged = true;" not in OM_T)
 check("blocks are zero-initialised at creation", "ZeroMemory(nb)" in BM_T)
 
-# The guard must still precede the duplicate shield, so a refused price can
-# never set hasPlacedOrder and strand the block.
-pos_guard = OM_T.find("entryPrice >= (liveBid - priceBuffer)")
-pos_shield = OM_T.find("IsOrderAlreadyLiveAtPrice(entryPrice, 5.0)")
-check("price guard precedes the duplicate shield", 0 < pos_guard < pos_shield,
-      "guard=%d shield=%d" % (pos_guard, pos_shield))
+# The guard region itself must be empty: the retired bare-local form is gone
+# (the router names its local `boundary`, not `priceBuffer`).
+g_start = OM_C.find("double priceBuffer = GetPriceBoundaryBuffer();")
+check("live-price guard region is gone", g_start < 0)
+check("router does NOT re-introduce the bare priceBuffer local",
+      "double priceBuffer" not in OM_T)
+check("abort does NOT veto the block (routing replaces the guard)",
+      "IsAnyOrderLiveAtPrice(entryPrice, 5.0)" in OM_T)
+
+# The retired guard used to precede the duplicate shield; the v5.40 shield is
+# the last price gate before the route decision.
+check("duplicate shield is still present",
+      OM_T.find("IsAnyOrderLiveAtPrice(entryPrice, 5.0)") > 0)
 
 
 # ----------------------------------------------------------------------

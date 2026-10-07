@@ -1,0 +1,92 @@
+v5.34: complete two-phase shifted reversal execution hook
+
+A block is no longer a single-shot fade. It is a TWO-TOUCH lifecycle: Touch 1
+is the Phase 1 fade at the zone's inner geometry, and consuming that touch
+promotes the SAME zone to a Phase 2 REVERSAL whose entry is shifted to the
+zone's OUTER boundary. No new source file: the lifecycle lives in
+COttoBlockManager.mqh + COttoOrderManager.mqh.
+
+WHY TWO PHASES AT ALL
+
+The inverted S/R line fades a level once (Phase 1). When price then reclaims
+that same level the second time it is no longer a fade -- it is a reversal off
+the reclaimed zone, and it wants to be entered from the far edge (the shift),
+not the midpoint. The counter `touches` on SSniperBlock carries which phase a
+zone is in and is the single field every downstream read keys off.
+
+THE DIRECTION CHOKEPOINT (GetDirectionForBlock)
+
+Direction was already the one place the fade polarity lived, and every
+consumer reads it -- front edge, SL/TP geometry, basket seed, correlation
+gate. It is now touches-aware:
+
+  touches >= 1 -> Phase 2: SUPPORT -> LONG, RESISTANCE -> SHORT
+  touches == 0 -> Phase 1: SUPPORT -> SHORT, RESISTANCE -> LONG (fade)
+
+`>= 1` rather than `== 1` is deliberate: the terminal Touch-2 retire read must
+stay coherent, and a zone can only ever be at 1 when this is consulted.
+
+COttoBlockManager::BlockDirection is its mandated-identical twin. The
+Front-Run veto projects its target off the block direction the manager cannot
+reach, so it mirrors the same two-phase mapping in lockstep. The two sit side
+by side in review precisely because a drift between them would veto the live
+reversal (or miss a real front-run) while the order was priced from the other
+direction -- silently.
+
+SHIFTED REVERSAL ENTRY (PlaceLimitOrder)
+
+`slDist` is hoisted above the live-price pre-flight so the shift is available
+where the entry is finally known. After the entry snaps to tick from
+CalcEntryPrice(), a Phase 2 (touches == 1) entry is shifted to the OUTER
+boundary by one stop-distance:
+
+  LONG  -> entryPrice -= slDist
+  SHORT -> entryPrice += slDist
+
+then re-snapped with SnapToTick and logged. Guarded by InpShiftReversalEntry
+so the shift is a switch, not an accident, and applied ONLY at touches == 1 so
+Phase 1 keeps its inner geometry untouched.
+
+FILL BRANCH (CheckPendingOrderFills)
+
+On fill the block's `touches` increments:
+
+  == 1  -> KEEP ALIVE. The block is reset to a clean Phase 2 candidate
+           (isTriggered / hasPlacedOrder / isArmed / hasExited cleared,
+           limitOrderTicket = 0, pendingOrderCancel = false,
+           deleteOnBarTime = 0) and the reversal cluster is synced
+           (m_blockManager.SyncReversalCluster). Logged TOUCH 1 CONSUMED.
+  >= 2  -> TERMINAL RETIRE. isTriggered + hasPlacedOrder true and
+           deleteOnBarTime stamped, so the zone leaves after the bar.
+           Logged REVERSAL FILLED.
+
+CLUSTER SYNC (COttoBlockManager::SyncReversalCluster, public)
+
+A reclaim seen twice is one event, but the pattern engine can represent it as
+more than one same-polarity block whose territory overlaps. When the origin
+consumes Touch 1, every OTHER live same-polarity Phase 1 sibling (touches == 0)
+whose range intersects the origin is promoted in lockstep: touches -> 1, reset
+to a clean reversal candidate, and any resting Phase 1 order cancelled. Left
+alone, the twin would keep fading the very level the origin now reverses
+against. Siblings already at Phase 2 are skipped, so the promotion cannot
+cascade. Returns the promoted count; walks a snapshot-safe index range with no
+removals during the walk.
+
+INPUT / STAMP
+
+  InpShiftReversalEntry = true   // group [4] EXECUTION SETTINGS
+
+Version bumped 5.33 -> 5.34 in all 11 sources (#property version), the
+OttoDefines master-build banner and #property description, the [9]/[10]/[11]
+engine-group labels plus this release's new [12] VETO REVERSAL CONVERSIONS
+group, the otto.mq5 startup Print and Pine port banner, and the README base
+line. Historical '// v5.33:' and 'FIX (v5.2x)' annotations are preserved;
+_tools/_bump534.py skips any line containing "FIX (" and anchors every other
+pattern on a human-facing prefix so no versioned comment can be rewritten.
+
+VALIDATION
+
+  * build_check.ps1 - 0 errors / 0 warnings, all 11 headers [STAGED] from the
+    staging tree, binary produced.
+  * scan_encoding.ps1 - strict CRLF, no BOM, valid UTF-8 on all 11 sources,
+    bareLF=0.
