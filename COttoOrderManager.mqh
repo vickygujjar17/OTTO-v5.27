@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.42"
+#property version   "5.43"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -839,9 +839,17 @@ private:
 
             if(m_journal != NULL)
               {
+               // v5.43 -- save/restore the journal around this TRANSIENT log.
+               // Arming a NEW setup must not steal the journal from a live
+               // basket, or that basket's later exit/entry lines would land in
+               // this setup's file. When no basket is live (the common arm-time
+               // case) the arm id is left in place so the physical fill reuses
+               // it -- that is the one-file-per-setup contract.
+               string prevSession = m_sessionID;
                m_journal.SetSessionID(armSessionId);
                m_journal.LogSetupArmed(true, block.tradeId, dir, block.type,
                                        entryPrice, adjustedSL, lotSize, block);
+               if(prevSession != "") m_journal.SetSessionID(prevSession);
               }
             if(EnableLogging)
                Print("[OrderManager] PHYSICAL LIMIT PLACED: ", block.tradeId,
@@ -893,9 +901,14 @@ private:
       // --- JOURNAL: create the per-setup file at ARM time --------------
       if(m_journal != NULL)
         {
+         // v5.43 -- save/restore, exactly as ROUTE A above: leave the arm id
+         // resident only when no live basket owns the journal, so a later
+         // fill/cancel of a DIFFERENT setup cannot be logged into this file.
+         string prevSession = m_sessionID;
          m_journal.SetSessionID(armSessionId);
          m_journal.LogSetupArmed(false, block.tradeId, dir, block.type,
                                  entryPrice, adjustedSL, lotSize, block);
+         if(prevSession != "") m_journal.SetSessionID(prevSession);
         }
 
       if(EnableLogging)
@@ -2114,15 +2127,58 @@ public:
                         " dir=", (m_activeDirection == DIR_LONG ? "LONG" : "SHORT"),
                         ") -> new=", newTicket,
                         " dir=", (newDir == DIR_LONG ? "LONG" : "SHORT"));
+               // v5.43 -- lock the journal to the INCUMBENT basket before the
+               // close. Arming or cancelling another setup repoints the journal
+               // (see PlaceOrArmOrder / CancelOrdersForInvalidBlocks), so
+               // without this lock the incumbent's exit record can be appended
+               // to a DIFFERENT setup's file -- the session-ID crosstalk.
+               if(m_journal != NULL) m_journal.SetSessionID(m_sessionID);
                bool wasReversing    = m_reversalInProgress;
                m_reversalInProgress = true;
                CloseEntireBasket("SAR Reversal", true, newTicket);
                m_reversalInProgress = wasReversing;
               }
+            else if(m_hasActiveTrade && m_activeTrade.ticket != newTicket)
+              {
+               // v5.43 -- REDUNDANT SAME-DIRECTION FILL. The direction guard
+               // above refuses to reverse on a scale-in, but the incumbent
+               // basket must not be RE-SEEDED from the newcomer either: that
+               // would repoint the live basket's journal at the new fill's
+               // session and hand it a foreign 1R. The EA has no fill-driven
+               // scale-in machinery, so the safe action is to close the
+               // redundant position and release its block, leaving the
+               // incumbent basket (ticket, 1R, unified stop) untouched.
+               if(EnableLogging)
+                  Print("[OrderManager] REDUNDANT SAME-DIRECTION FILL (physical): closing ",
+                        "new=", newTicket,
+                        " dir=", (newDir == DIR_LONG ? "LONG" : "SHORT"),
+                        " | incumbent=", m_activeTrade.ticket, " retained");
+               ClosePosition(newTicket);
+               int rbi = m_blockManager.FindBlockIndexByTicket(ticket);
+               if(rbi >= 0)
+                 {
+                  SSniperBlock rmod;
+                  if(m_blockManager.GetBlockAt(rbi, rmod))
+                    {
+                     rmod.limitOrderTicket   = 0;
+                     rmod.pendingOrderCancel = false;
+                     m_blockManager.SetBlockAt(rbi, rmod);
+                    }
+                 }
+               continue;
+              }
 
             // ---- ADOPT the new fill -------------------------------------
             if(!m_hasActiveTrade || m_activeTrade.ticket != newTicket)
               {
+               // v5.43 -- carry this block's ARM-TIME session into the basket.
+               // On the fill-adoption path the leftover m_sessionID is normally
+               // "" (a first fill) or the INCUMBENT's id (a SAR reversal whose
+               // CloseEntireBasket cleared nothing), so point it at the block's
+               // own pinned session unconditionally before seeding. InitBasket()
+               // then adopts it verbatim and the whole basket logs to the ONE
+               // file the arm created.
+               if(blocks[i].sessionId != "") m_sessionID = blocks[i].sessionId;
                SeedActiveTradeFromBlock(blocks[i], newTicket);
                m_ordersFilled++;
                if(EnableLogging)
@@ -2283,7 +2339,13 @@ public:
                                         m_symbol, ntm.year, ntm.mon, ntm.day,
                                         ntm.hour, ntm.min, ntm.sec, blocks[bi].serial);
            }
-         if(m_journal != NULL) m_journal.SetSessionID(newSessionId);
+         // v5.43 -- do NOT repoint the journal before the send. This setup's own
+         // arm snapshot already created its file (PlaceOrArmOrder), and the live
+         // basket (if any) must keep owning the journal until a fill is actually
+         // adopted. Pointing it here would leak the new session into any exit
+         // logged before the fill commits. The deal COMMENT below still carries
+         // newSessionId; the journal is repointed only after the fill is seeded
+         // (see the m_sessionID hand-off at the commit step).
 
          // --- Build the MARKET request (DEAL, not PENDING) ---
          MqlTradeRequest request;
@@ -2332,8 +2394,17 @@ public:
             rej.vetoReason = VETO_BROKEN;
             m_blockManager.SetBlockAt(bi, rej);
             if(m_journal != NULL)
+              {
+               // v5.43 -- this setup's cancellation must rename ITS OWN arm
+               // file to CANCELLED_. The early session repoint was removed, so
+               // point the journal at the setup's session for this terminal
+               // write, then restore the live basket's pointer afterwards.
+               string prevSession = m_sessionID;
+               m_journal.SetSessionID(newSessionId);
                m_journal.LogCancellation("Broker Rejected Market Order: " + errorStr +
                                          " (Code: " + IntegerToString((long)result.retcode) + ")");
+               if(prevSession != "") m_journal.SetSessionID(prevSession);
+              }
             RemoveVirtualOrderAt(v);
             continue;
            }
@@ -2356,6 +2427,10 @@ public:
                      " dir=", (m_activeDirection == DIR_LONG ? "LONG" : "SHORT"),
                      " -> new=", result.order,
                      " dir=", (isLong ? "LONG" : "SHORT"));
+            // v5.43 -- lock the journal to the INCUMBENT basket before the
+            // close so its exit record lands in the incumbent's file, not in
+            // whichever setup last touched the journal.
+            if(m_journal != NULL) m_journal.SetSessionID(m_sessionID);
             bool wasReversing    = m_reversalInProgress;
             m_reversalInProgress = true;
             CloseEntireBasket("SAR Reversal", true, result.order);
@@ -2403,10 +2478,14 @@ public:
          if(block.touches == 1)
             m_blockManager.SyncReversalCluster(bi);
 
-         // The session ID was minted before the send (so the N/R comment and
-         // the journal agreed); SeedActiveTradeFromBlock() -> InitBasket()
-         // reuses it via the m_journal lookup, so no re-mint is needed here.
-         if(m_journal != NULL) m_journal.SetSessionID(newSessionId);
+         // v5.43 -- hand the setup's pre-minted session to THIS basket before
+         // seeding. InitBasket() reuses m_sessionID verbatim when it is already
+         // set, so the fill's entry record, the exit and every later append all
+         // resolve to the ONE file the arm created. Pointing the journal here is
+         // safe: any incumbent basket was closed (and ClearBasket() wiped
+         // m_sessionID) above, so nothing else owns the journal now.
+         m_sessionID = newSessionId;
+         if(m_journal != NULL) m_journal.SetSessionID(m_sessionID);
 
          SeedActiveTradeFromBlock(block, result.order);
          m_ordersFilled++;
@@ -2477,8 +2556,12 @@ public:
                      else if(blocks[i].conversionReason == VETO_STALE)    convReason = "Stale Veto (45D)";
                      else if(blocks[i].conversionReason == VETO_MOMENTUM) convReason = "Momentum Veto";
                      else if(blocks[i].conversionReason == VETO_FVG)      convReason = "FVG Veto";
+                     // v5.43 -- save/restore: a transient setup log must not
+                     // steal the journal from a live basket (see PlaceOrArmOrder).
+                     string prevSession = m_sessionID;
                      m_journal.SetSessionID(physSession);
                      m_journal.LogConversion(physTicket, blocks[i].type, convReason);
+                     if(prevSession != "") m_journal.SetSessionID(prevSession);
                     }
                   else
                     {
@@ -2494,8 +2577,11 @@ public:
                      else if(blocks[i].vetoReason == VETO_FLIPPED)       cancelReason = "Block Flipped";
                      else if(blocks[i].vetoReason == VETO_CORRELATION)   cancelReason = "Vector Consensus Veto";
                      else if(blocks[i].pendingOrderCancel)               cancelReason = "Manual / Direction Conflict";
+                     // v5.43 -- save/restore (see the conversion branch above).
+                     string prevSession = m_sessionID;
                      m_journal.SetSessionID(physSession);
                      m_journal.LogCancellation(cancelReason);
+                     if(prevSession != "") m_journal.SetSessionID(prevSession);
                     }
                  }
               }
@@ -2536,8 +2622,11 @@ public:
                      string cts2 = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm2.year, ctm2.mon, ctm2.day, ctm2.hour, ctm2.min, ctm2.sec);
                      voSession = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts2, blocks[i].serial);
                     }
+                  // v5.43 -- save/restore (see the physical-cancel path above).
+                  string prevSession = m_sessionID;
                   m_journal.SetSessionID(voSession);
                   m_journal.LogConversion(0, blocks[i].type, convReason);
+                  if(prevSession != "") m_journal.SetSessionID(prevSession);
                  }
                else
                  {
@@ -2562,8 +2651,11 @@ public:
                      string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
                      voSession = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial);
                     }
+                  // v5.43 -- save/restore (see the physical-cancel path above).
+                  string prevSession = m_sessionID;
                   m_journal.SetSessionID(voSession);
                   m_journal.LogCancellation(cancelReason);
+                  if(prevSession != "") m_journal.SetSessionID(prevSession);
                  }
               }
 
@@ -2812,15 +2904,24 @@ public:
       // v5.32: remember 1R against the PRIMARY ticket so a restart can rebuild
       // the basket geometry exactly instead of inferring it from a moved stop.
       PersistBasketR(rrUnit, ticket);
-        // Reuse place-time session ID if already set on the journal (ONE file per setup)
-        // v5.33: an ADOPTED basket must NOT inherit the journal's current ID.
-        // m_sessionID has just been wiped by ClearBasket(), PATH 2 of
-        // InitBasket() overwrites the journal ID on every basket it seeds, and
-        // LogCancellation() sets one for a cancelled block's own setup -- so
-        // the inherited value can easily name a setup that never opened this
-        // position. Only the EA block path (idSuffix=="") may reuse it.
-        if(idSuffix == "" && m_journal != NULL && m_journal.GetSessionID() != "")
-           m_sessionID = m_journal.GetSessionID();
+        // v5.43 -- SESSION OWNERSHIP. m_sessionID is the single source of
+        // truth for the live basket's journal, and it is WHO the basket's
+        // whole lifecycle resolves against (see the SAR locks in
+        // CheckPendingOrderFills / CheckVirtualTriggers). Reuse it verbatim
+        // when it is already resolved -- an EA block path hands over the
+        // arm-time session, a virtual fill hands over its pre-minted id, a
+        // restart rebuilds from the persisted block. Only mint a NEW id when
+        // it is empty (a legacy path with no arm-time session). An ADOPTED
+        // basket always mints its own "-MAN" id: it must never inherit the
+        // journal's current value, which can name a setup that never opened
+        // this position. Finally PUSH the resolved id into the journal so the
+        // caller's follow-up writer (LogEntry / LogManualAdoption) -- which
+        // opens a file purely from the journal's id -- lands in THIS basket's
+        // file, not whatever the journal happened to be left pointing at.
+        if(idSuffix == "" && m_sessionID != "")
+           {
+            // Reuse the resolved id; nothing to mint.
+           }
         else
           {
            MqlDateTime utm2; TimeToStruct(TimeCurrent(), utm2);
@@ -2831,6 +2932,7 @@ public:
            string tail = (idSuffix != "") ? idSuffix : StringFormat("BLK%d", blockSerial);
            m_sessionID = StringFormat("#OTTO-%s-%s-%s", m_symbol, tsF, tail);
           }
+      if(m_journal != NULL) m_journal.SetSessionID(m_sessionID);
       // FIX (v5.19): ArrayResize(m_basket, 0, 3) above leaves the array at
       // ZERO length, and m_basketCount was reset to 0 - so the write below
       // indexed [0] of an empty array and faulted ("array out of range").
