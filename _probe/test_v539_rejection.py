@@ -5,10 +5,10 @@ Pins the three behaviours v5.39 adds on top of the v5.37/v5.38 virtual-order
 engine. None of them is provable by the MQL5 compiler gate: they are control
 flow and side-effect properties of the shipped sources.
 
-  1. ARM EMAILS THE SETUP. COttoJournal::LogVirtualOrderArmed() must call
-     SendMailFromFile() after it has written the SUBJECT + setup block and
-     closed the handle, so the full arm snapshot ships as a mail exactly as
-     LogEntry()/LogExit()/LogCancellation() already do.
+  1. ARM IS SILENT (v5.42). COttoJournal::LogSetupArmed() must WRITE the
+     SUBJECT + setup block and close the handle but must NOT call
+     SendMailFromFile(): arming is an intermediate lifecycle stage. Only the
+     two terminal writers (LogExit()/LogCancellation()) email the session file.
 
   2. REJECTION IS TERMINAL AND READABLE. When SendOrderWithRetry() refuses the
      MARKET deal fired by CheckVirtualTriggers(), the raw retcode must be mapped
@@ -96,21 +96,19 @@ REJ = func_body(strip_comments(OM_T), r"if\s*\(!SendOrderWithRetry\(request, res
 
 
 # ----------------------------------------------------------------------
-# 1. Arm email
+# 1. Arm silence (v5.42)
 # ----------------------------------------------------------------------
-print("\n-- Arm email --")
+print("\n-- Arm silence --")
 
 check("LogSetupArmed located", ARM is not None)
 check("arm writes the SUBJECT line", ARM is not None and "SUBJECT:" in ARM)
-check("arm emails the setup via SendMailFromFile()",
-      ARM is not None and "SendMailFromFile();" in ARM)
-# The mail must be sent AFTER the handle closes, or the read-back that
-# SendMailFromFile() performs could race the writer still holding the lock.
-if ARM is not None:
-    check("arm email is sent after CloseHandle()",
-          ARM.find("CloseHandle();") < ARM.find("SendMailFromFile();"))
-check("LogEntry also emails (unchanged contract)",
-      "SendMailFromFile();" in func_body(JRN_T, r"void\s+LogEntry\s*\("))
+check("arm closes the handle", ARM is not None and "CloseHandle();" in ARM)
+# v5.42: arming is an intermediate stage, so it must NOT email. Only the two
+# terminal writers (LogExit/LogCancellation) ship the aggregated session file.
+check("arm does NOT email (v5.42 intermediate-silence)",
+      ARM is not None and "SendMailFromFile" not in ARM)
+check("LogEntry also does NOT email (v5.42)",
+      "SendMailFromFile" not in func_body(JRN_T, r"void\s+LogEntry\s*\("))
 
 
 # ----------------------------------------------------------------------
@@ -194,7 +192,7 @@ def main():
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)
     print("=" * 74)
-    print("v5.39 ARM EMAIL + TERMINAL REJECTION - STATIC PROBE")
+    print("v5.39 ARM (SILENT) + TERMINAL REJECTION - STATIC PROBE")
     print("=" * 74)
     for name, ok, detail in RESULTS:
         if ok:

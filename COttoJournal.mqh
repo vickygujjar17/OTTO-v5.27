@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.41"
+#property version   "5.42"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -181,11 +181,10 @@ public:
       W("  Separation        : " + (blk.vetoReason==VETO_NO_SEPARATION?"FAILED":"PASSED"));
       W("================================================================");
       CloseHandle();
-      // v5.39: email the arm snapshot, exactly as LogEntry()/LogExit()/
-      // LogCancellation() do. line[0] is the SUBJECT, so the full setup
-      // breakdown (phase, execution mode, wicks, entry, SL, volume,
-      // polarity) ships in one mail.
-      SendMailFromFile();
+      // v5.42: NO email here. Arming a setup is an intermediate lifecycle
+      // stage, not a session endpoint, so this write stays silent on disk.
+      // Only LogExit() and LogCancellation() ship the aggregated session
+      // file; every earlier append simply accumulates into it.
      }
    void              LogEntry(ulong ticket, ENUM_TRADE_DIRECTION dir, double entryPrice, double slPrice, double lotSize, double riskMoney, const SSniperBlock &blk)
      {
@@ -217,12 +216,9 @@ public:
       W("    - Separation  : " + (blk.vetoReason==VETO_NO_SEPARATION?"FAILED":"PASSED"));
       W("================================================================");
       CloseHandle();
-      // v5.37 -- email the entry log, mirroring LogExit()/LogCancellation().
-      // Without this the entry record was written to disk but never sent, so
-      // the [ACTIVE] entry email that the exit email refers back to never
-      // arrived. SendMailFromFile() picks the subject from line[0] and falls
-      // back to the CANCELLED_<name> payload when the session was renamed.
-      SendMailFromFile();
+      // v5.42: NO email here. A fill is an intermediate lifecycle stage, not
+      // a session endpoint, so this write stays silent on disk. Only
+      // LogExit() and LogCancellation() ship the aggregated session file.
      }
 
    void              LogPyramid(int tranche, ulong ticket, double entry, double size, double riskPct, double groupSL)
@@ -331,7 +327,8 @@ public:
 
    //+----------------------------------------------------------------+
    //| LOG CONVERSION (v5.36) - Phase 1 dropped for Phase 2 Reversal  |
-   //| Appends a conversion notice + emails [CONVERTED TO REVERSAL].  |
+   //| Appends a conversion notice to the session journal. v5.42: no  |
+   //| longer emails -- only LogExit()/LogCancellation() send mail.   |
    //| Unlike LogCancellation() this does NOT rename the session file |
    //| to CANCELLED_ : the setup is still live, merely re-phased.     |
    //+----------------------------------------------------------------+
@@ -350,7 +347,9 @@ public:
       W("  Next Action       : Phase 1 order cancelled; Block upgraded to Phase 2 Reversal.");
       W("================================================================");
       CloseHandle();
-      SendMailFromFile();
+      // v5.42: NO email here. A re-phase is an intermediate lifecycle stage,
+      // not a session endpoint -- only LogExit() and LogCancellation() ship
+      // the aggregated session file.
      }
   };
 

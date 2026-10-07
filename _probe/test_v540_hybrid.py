@@ -19,7 +19,8 @@ flow and side-effect properties of the shipped sources.
      the broker pending pool AND the in-memory virtual book.
 
   4. N/R PHASE + EXECUTION MODE journal: COttoJournal::LogSetupArmed() stamps
-     the Phase and Execution Mode on the arm header and emails it.
+     the Phase and Execution Mode on the arm header. v5.42: the arm no longer
+     emails -- only LogExit()/LogCancellation() ship the session file.
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -200,9 +201,9 @@ check("arm journal stamps the execution mode",
       "VIRTUAL (In-Memory Arm)" in ARM_J)
 check("arm journal keys the phase off touches",
       ARM_J is not None and "blk.touches == 0" in ARM_J)
-check("arm journal still emails the snapshot",
-      ARM_J is not None and "SendMailFromFile();" in ARM_J and
-      ARM_J.find("CloseHandle();") < ARM_J.find("SendMailFromFile();"))
+check("arm journal writes the snapshot but does NOT email (v5.42)",
+      ARM_J is not None and "SUBJECT:" in ARM_J and
+      "CloseHandle();" in ARM_J and "SendMailFromFile" not in ARM_J)
 check("the per-setup session is pinned on SSniperBlock.sessionId",
       re.search(r"string\s+sessionId\s*;", DEFS_T) is not None and
       "block.sessionId          = armSessionId;" in OM_T)

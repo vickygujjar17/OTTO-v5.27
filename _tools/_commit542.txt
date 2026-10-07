@@ -1,0 +1,59 @@
+5.42 refactor: remove intermediate email spam and restrict to final lifecycle summary
+
+An operator received an email at EVERY lifecycle stage -- arm, fill, re-phase,
+exit, cancel -- so a single trade produced a burst of near-duplicate mails whose
+only terminal one carried the aggregated session file. v5.42 collapses the
+contract so exactly ONE mail ships per trade, at a terminal moment.
+
+EMAIL CONTRACT (COttoJournal.mqh)
+
+SendMailFromFile() is now called from exactly two places:
+
+    LogExit()          -- the trade closed (net P/L, duration, reason)
+    LogCancellation()  -- the setup died before fill (reason appended)
+
+Every intermediate writer still records to disk but no longer emails; the writes
+simply accumulate into the SAME per-setup file the terminal writer ships:
+
+    LogSetupArmed()    (removed)  arm snapshot -- intermediate
+    LogEntry()         (removed)  fill record    -- intermediate
+    LogConversion()    (removed)  re-phase notice -- intermediate
+
+The W(...) payloads and CloseHandle() calls are untouched, so nothing is lost
+from the journal itself -- only the redundant mailbox traffic. The send is still
+positioned AFTER CloseHandle() in both surviving writers, so the read-back cannot
+race a writer holding the file lock. CHighTableAuditor.mqh calls SendMail()
+directly (its own auditor digest) and is deliberately out of scope.
+
+TRADE MECHANICS RE-VERIFIED (no source change)
+
+Trailing, pyramiding and the unified stop were re-checked across all three basket
+origins -- Normal, Reversal and Adopted-manual. They converge on a single seeding
+point, InitBasket(), which stamps m_basketRRUnit and m_sessionSL exactly once;
+those are then consumed only by ApplyUnifiedSL() (one-way ratchet) and
+AddPyramidTranche(). Every origin reaches InitBasket() with a correct 1R already
+computed:
+
+    Normal    SeedActiveTradeFromBlock() -> InitBasket()
+    Reversal  CloseEntireBasket() drops 1R, then re-seed
+    Adopted   AdoptManualPosition() sets rrUnit = |entry - sl| then InitBasket()
+    Restart   RestoreBasket() rebuilds 1R from the persisted block then InitBasket()
+
+Arm-time geometry is stamped physically at PlaceOrArmOrder() and persisted via
+SetBlockAt(), so a cold restart reconstructs the same unit. Verified, no fix.
+
+PROBES
+
+New test_v542_email.py pins the full contract: exactly two SendMailFromFile()
+call sites journal-wide, zero outside the journal, both survivors after
+CloseHandle(), and every intermediate writer (LogSetupArmed/LogEntry/
+LogConversion) writing its SUBJECT + closing the handle while NOT emailing.
+21 checks. test_v539_rejection.py and test_v540_hybrid.py are realigned to the
+new contract: they still assert the arm writes its snapshot, but now assert it
+does NOT email. The full suite is green end-to-end (20 probes).
+
+VERSION BUMP
+
+_tools/_bump542.py rewrites the eleven #property version headers, the OttoDefines
+banner/description, the four input-group release stamps and the README base line
+(20 lines). Strict gate: 0 errors, 0 warnings.
