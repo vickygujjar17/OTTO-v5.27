@@ -2160,6 +2160,8 @@ public:
                   SSniperBlock rmod;
                   if(m_blockManager.GetBlockAt(rbi, rmod))
                     {
+                     rmod.isVetoed = true;
+                     rmod.vetoReason = VETO_BROKEN; // Explicitly kill the redundant setup
                      rmod.limitOrderTicket   = 0;
                      rmod.pendingOrderCancel = false;
                      m_blockManager.SetBlockAt(rbi, rmod);

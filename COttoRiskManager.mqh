@@ -228,22 +228,6 @@ public:
       if(actualRiskMoney > (riskMoney * 1.05) && finalLotSize > m_volumeMin)
          finalLotSize -= m_volumeStep;
 
-      // --- PROP FIRM SAFETY CLAMP: verify actual risk % does not exceed limit ---
-      double accountCapital = AccountInfoDouble(ACCOUNT_EQUITY);
-      double actualRiskPct = (accountCapital > 0)
-                             ? (finalLotSize * slDistancePoints * tickValuePerLot) / accountCapital * 100.0
-                             : 0.0;
-      if(actualRiskPct > SafetyMaxRiskPct)
-        {
-         if(EnableLogging)
-            Print("[RiskManager] SAFETY CLAMP: risk ", DoubleToString(actualRiskPct,2),
-                  "% exceeds max ", SafetyMaxRiskPct, "% — aborting (lot=",
-                  DoubleToString(finalLotSize,4), ")");
-         m_lastRiskAmount = riskMoney;
-         m_lastLotSize    = finalLotSize;
-         return 0.0; // abort
-        }
-
       m_lastRiskAmount = riskMoney;
       m_lastLotSize    = finalLotSize;
       m_tradesCalculated++;
