@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.38"
+#property version   "5.39"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -173,6 +173,10 @@ public:
       W("  Separation        : " + (blk.vetoReason==VETO_NO_SEPARATION?"FAILED":"PASSED"));
       W("================================================================");
       CloseHandle();
+      // v5.39: email the arm snapshot, exactly as LogEntry()/LogExit()/
+      // LogCancellation() do. line[0] is the SUBJECT, so the full setup
+      // breakdown (wicks, entry, SL, volume, polarity) ships in one mail.
+      SendMailFromFile();
      }
    void              LogEntry(ulong ticket, ENUM_TRADE_DIRECTION dir, double entryPrice, double slPrice, double lotSize, double riskMoney, const SSniperBlock &blk)
      {

@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.38"
+#property version   "5.39"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -176,6 +176,10 @@ private:
    //| a local inside ValidateStopDistance, AdjustSLToMinimum and the   |
    //| guard in ArmVirtualOrder, so a field of that name would be       |
    //| shadowed at every call site.                                     |
+   //|                                                                  |
+   //| RETIRED (v5.39): the live-price limit guard that consumed this   |
+   //| buffer was removed (a virtual order never rests at the broker),  |
+   //| so no caller remains. Kept for reference / future pending use.   |
    //+------------------------------------------------------------------+
    double                  GetPriceBoundaryBuffer(void)
      {
@@ -678,8 +682,8 @@ private:
       // anchor is keyed off the block's OWN type (Phase 2 maps Resistance to a
       // LONG and Support to a SHORT), so a LONG reversal sits BELOW the block
       // bottom and a SHORT reversal sits ABOVE the block top. slDist is
-      // hoisted here because both the shift and the LIVE PRICE VALIDATION below
-      // depend on it, and the validation must judge the SHIFTED price.
+      // hoisted here because the shift below depends on it; both are
+      // entry-independent, so snapping/shifting never changes the risk distance.
       double slDist     = CalcSLDistance(block, atr);
       if(InpShiftReversalEntry && block.touches == 1)
         {
@@ -697,57 +701,12 @@ private:
                   " (slDist=", DoubleToString(slDist, _Digits), ")");
         }
 
-      // v5.28 — LIVE PRICE VALIDATION, before the duplicate shield so a refused
-      // price never sets hasPlacedOrder (the block stays armed for a later tick).
-      // A limit resting on the wrong side of the market is rejected by the
-      // server with TRADE_RETCODE_INVALID_PRICE, which previously burned a
-      // dispatch attempt and left the block in an ambiguous state. The broker's
-      // SYMBOL_TRADE_STOPS_LEVEL is honoured so the check matches server rules.
-      double priceBuffer = GetPriceBoundaryBuffer();
-      double liveAsk = GetAsk();
-      double liveBid = GetBid();
-
-      // Quoted once and reused in the Print below: the literals are the
-      // contract the v5.28/v5.30 probes assert on, so they must stay in sync
-      // with the comparisons in one place only.
-      string invBuy  = "entryPrice >= (liveBid  - priceBuffer)";
-      string invSell = "entryPrice <= (liveAsk + priceBuffer)";
-
-      if(GetDirectionForBlock(block) == DIR_LONG)   // long -> BUY LIMIT below market
-        {
-         if(entryPrice >= (liveBid - priceBuffer))
-           {
-            // One-shot: OnTick re-enters every tick while the block stays
-            // armed, so without this gate a single penetration floods the
-            // journal with one ABORT line per tick.
-            if(EnableLogging && !block.priceAbortLogged)
-               Print("[OrderManager] ABORT BUY_LIMIT: entry ",
-                     DoubleToString(entryPrice, _Digits), " >= bid ",
-                     DoubleToString(liveBid, _Digits),
-                     " (Invalid Price) — block left armed for retry [",
-                     invBuy, "]");
-            block.priceAbortLogged = true;
-            m_blockManager.SetBlockAt(blockIndex, block);
-            return false;
-           }
-         block.priceAbortLogged = false;   // clear of the boundary: log again later
-        }
-      else                              // short -> SELL LIMIT above market
-        {
-         if(entryPrice <= (liveAsk + priceBuffer))
-           {
-            if(EnableLogging && !block.priceAbortLogged)
-               Print("[OrderManager] ABORT SELL_LIMIT: entry ",
-                     DoubleToString(entryPrice, _Digits), " <= ask ",
-                     DoubleToString(liveAsk, _Digits),
-                     " (Invalid Price) — block left armed for retry [",
-                     invSell, "]");
-            block.priceAbortLogged = true;
-            m_blockManager.SetBlockAt(blockIndex, block);
-            return false;
-           }
-         block.priceAbortLogged = false;
-        }
+      // v5.39 — RETIRED: the v5.28 LIVE PRICE VALIDATION pre-flight (and its
+      // one-shot priceAbortLogged gate) is gone. Since v5.37 the setup is an
+      // in-memory SVirtualOrder, so no limit ever rests at the broker and the
+      // TRADE_RETCODE_INVALID_PRICE it guarded against cannot occur. The trigger
+      // is a MARKET deal on the cross (CheckVirtualTriggers), priced off the live
+      // book, so an off-market resting price is structurally impossible.
 
       // HARD ANTI-DUPLICATE CHECK against our in-memory virtual order book.
       // If an armed setup already rests at (near) this price, do NOT arm
@@ -762,9 +721,9 @@ private:
          return false;
         }
 
-      // slDist was HOISTED above the live-price pre-flight (v5.34 Part 3): the
-      // shifted Phase 2 entry consumes it, and the validation above must see
-      // the shifted price. SL/TP/isLong all key off the MAPPED direction
+      // slDist was HOISTED above the shifted Phase 2 entry (v5.34 Part 3): the
+      // shift consumes it, so it is computed once and reused here. SL/TP/isLong
+      // all key off the MAPPED direction
       // (isLong below) so each phase stops and targets on the correct side,
       // and the Phase 2 mapping carries straight through.
       bool   isLong     = (GetDirectionForBlock(block) == DIR_LONG);
@@ -1963,29 +1922,29 @@ public:
 
          if(!SendOrderWithRetry(request, result))
            {
-            // v5.37 -- BROKER REJECTION LOG. SendOrderWithRetry() has already
-            // bumped m_ordersRejected and printed the retcode for this fatal
-            // path; this adds the full broker context (raw result.comment,
-            // symbol, side, price and stop) so a rejected virtual trigger can
-            // be diagnosed from the journal alone. The one-shot latch below is
-            // left SET (see the FIX note) -- keep this print side-effect-free.
+            // v5.39 -- TERMINAL REJECTION. A broker rejection at a fired market
+            // cross is fatal: the deal was refused, so the setup is spent. Map
+            // the raw retcode to a human-readable cause, journal the
+            // cancellation, then KILL the block and drop its virtual order so
+            // no later tick re-fires it. (The v5.37 latch-then-retry path left
+            // the order armed and leaked a second SVirtualOrder every tick.)
+            string errorStr = GetTradeRetcodeString(result.retcode);
             if(EnableLogging)
                Print("[OrderManager] VIRTUAL REJECTED phase=", phaseType,
                      " session=", newSessionId,
-                     " retcode=", result.retcode, " (", GetTradeRetcodeString(result.retcode), ")",
+                     " retcode=", result.retcode, " (", errorStr, ")",
                      " broker=", result.comment,
                      " sym=", m_symbol, " side=", (isLong ? "LONG" : "SHORT"),
                      " price=", DoubleToString(request.price, _Digits),
                      " sl=", DoubleToString(request.sl, _Digits));
-            // FIX (v5.37): keep the one-shot latch SET. Clearing it here made
-            // the still-armed block eligible for ArmVirtualOrder(), whose only
-            // duplicate guard is "if(block.hasPlacedOrder) return false;" - so
-            // every subsequent tick re-armed a SECOND SVirtualOrder for the
-            // same block while the first one was still in m_virtualOrders[],
-            // leaking virtual orders. Leaving the latch set keeps this single
-            // virtual order as the only retry path, exactly the one-shot
-            // contract the retired Phase 2 funnel used.
-            m_blockManager.SetBlockAt(bi, block);
+            SSniperBlock rej = blocks[bi];
+            rej.isVetoed   = true;
+            rej.vetoReason = VETO_BROKEN;
+            m_blockManager.SetBlockAt(bi, rej);
+            if(m_journal != NULL)
+               m_journal.LogCancellation("Broker Rejected Market Order: " + errorStr +
+                                         " (Code: " + IntegerToString((long)result.retcode) + ")");
+            RemoveVirtualOrderAt(v);
             continue;
            }
 
