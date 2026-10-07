@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.40"
+#property version   "5.41"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -806,7 +806,14 @@ private:
          request.tp        = 0;   // NO TP — exact mirror of Pine (trail-only exits)
          request.deviation = MaxSlippage;
          request.magic     = MagicNumber;
-         request.comment   = ClampOrderComment(armSessionId + "_P");
+         // v5.41 -- N/R PHASE TAG (physical). Mirrors the virtual fill-time
+         // marker so a resting broker row names its phase: a block's FIRST
+         // fill (touches == 0) is the Phase 1 "N"ormal bounce, its SECOND
+         // (touches >= 1) the Phase 2 "R"eversal. ClampOrderComment() already
+         // tail-preserves the "-BLK<n>" setup id, so the extra tag still fits
+         // the MT5 31-char limit.
+         string phaseType  = (block.touches == 0) ? "N" : "R";
+         request.comment   = ClampOrderComment(armSessionId + "_" + phaseType + "_P");
 
          if(request.volume < m_riskManager.GetVolumeMin() ||
             request.volume > m_riskManager.GetVolumeMax())
@@ -2093,7 +2100,13 @@ public:
          if(ResolveFilledPositionTicket(ticket, tracked, newTicket, newDir))
            {
             // ---- STOP-AND-REVERSE: close an opposing incumbent first ----
-            if(m_hasActiveTrade && m_activeTrade.ticket != newTicket)
+            // v5.41 -- DIRECTION GUARD. A fill landing while a basket is live
+            // is a reversal ONLY when it OPPOSES that basket. Without the
+            // direction clause a same-direction scale-in fill would fratricide
+            // the incumbent it is meant to add to. Mirrors the virtual trigger's
+            // by-construction guard (m_activeDirection != newDir).
+            if(m_hasActiveTrade && m_activeTrade.ticket != newTicket &&
+               m_activeDirection != newDir)
               {
                if(EnableLogging)
                   Print("[OrderManager] SAR REVERSAL (physical): closing opposing basket ",
