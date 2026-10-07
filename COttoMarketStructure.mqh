@@ -4,7 +4,7 @@
 //|              OTTO EA — exact ta.pivothigh/pivotlow port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.39"
+#property version   "5.40"
 
 #ifndef __OTTO_MARKET_STRUCTURE__
 #define __OTTO_MARKET_STRUCTURE__

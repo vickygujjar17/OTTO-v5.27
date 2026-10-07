@@ -91,7 +91,7 @@ def strip_comments(code):
     return "\n".join(out)
 
 
-ARM = func_body(JRN_T, r"void\s+LogVirtualOrderArmed\s*\(")
+ARM = func_body(JRN_T, r"void\s+LogSetupArmed\s*\(")
 REJ = func_body(strip_comments(OM_T), r"if\s*\(!SendOrderWithRetry\(request, result\)\)")
 
 
@@ -100,7 +100,7 @@ REJ = func_body(strip_comments(OM_T), r"if\s*\(!SendOrderWithRetry\(request, res
 # ----------------------------------------------------------------------
 print("\n-- Arm email --")
 
-check("LogVirtualOrderArmed located", ARM is not None)
+check("LogSetupArmed located", ARM is not None)
 check("arm writes the SUBJECT line", ARM is not None and "SUBJECT:" in ARM)
 check("arm emails the setup via SendMailFromFile()",
       ARM is not None and "SendMailFromFile();" in ARM)
@@ -144,20 +144,28 @@ check("rejection no longer keeps the latch-and-retry path",
 
 
 # ----------------------------------------------------------------------
-# 3. Legacy guard retired
+# 3. Hybrid router (v5.40 supersedes the v5.39 "guard retired" pin)
 # ----------------------------------------------------------------------
-print("\n-- Legacy price guard retired --")
+# v5.40 reintroduces a live-price decision, but as a ROUTER not a guard: a
+# legal price becomes a resting BROKER limit (physical), an illegal one arms
+# virtually. GetPriceBoundaryBuffer() therefore HAS a caller again, and the
+# physical branch carries the priceBuffer local.
+print("\n-- Hybrid router --")
 
-ARM_OM = func_body(OM_T, r"bool\s+ArmVirtualOrder\s*\(int blockIndex")
-check("ArmVirtualOrder located", ARM_OM is not None)
-check("arm path has no live-price boundary local",
-      ARM_OM is not None and "priceBuffer" not in ARM_OM)
-check("arm path has no live bid/ask price guard",
-      "liveBid" not in OM_T and "liveAsk" not in OM_T)
-check("arm path never fires the (Invalid Price) abort",
-      "(Invalid Price)" not in OM_T)
-check("boundary helper is retired (no caller)",
-      "GetPriceBoundaryBuffer()" not in OM_T and
+ARM_OM = func_body(OM_T, r"bool\s+PlaceOrArmOrder\s*\(int blockIndex")
+check("PlaceOrArmOrder located", ARM_OM is not None)
+check("router consumes the boundary buffer to pick the route",
+      ARM_OM is not None and "GetPriceBoundaryBuffer()" in ARM_OM)
+check("router sends a PHYSICAL pending order",
+      ARM_OM is not None and "TRADE_ACTION_PENDING" in ARM_OM)
+check("router arms a VIRTUAL order when the price is through",
+      ARM_OM is not None and "SVirtualOrder vo;" in ARM_OM)
+check("router labels the physical route in its journal call",
+      ARM_OM is not None and "LogSetupArmed(true," in ARM_OM)
+check("router labels the virtual route in its journal call",
+      ARM_OM is not None and "LogSetupArmed(false," in ARM_OM)
+check("boundary helper is live again (has a caller)",
+      "GetPriceBoundaryBuffer()" in OM_T and
       "GetPriceBoundaryBuffer(void)" in OM_T)
 
 

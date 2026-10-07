@@ -242,8 +242,8 @@ check("BuildOrderComment helper exists with blockSerial + tranche params",
 check("clamp enforces the 31-char MT5 limit",
       re.search(r"MAX_COMMENT\s*=\s*31", OM_T) is not None)
 
-check("ArmVirtualOrder path uses BuildOrderComment(block.serial, 0)",
-      "request.comment  = BuildOrderComment(block.serial, 0);" in OM_T)
+check("physical route stamps the setup session on the comment",
+      "ClampOrderComment(armSessionId" in OM_T)
 
 check("AddPyramidTranche path uses BuildOrderComment(..., trancheToAdd)",
       re.search(r"req\.comment\s*=\s*BuildOrderComment\(m_activeTrade\.sourceBlockSerial,\s*trancheToAdd\)",

@@ -586,7 +586,7 @@ print("\n-- Part 2 pushed-fact ingress --")
 # as a phantom, so the ingress records the flag alongside the ticket.
 check("SetTrackedLegs carries the belief (legs, primary, active)",
       re.search(r"void\s+SetTrackedLegs\s*\(\s*int\s+\w+\s*,\s*ulong\s+\w+\s*,"
-                r"\s*bool\s+\w+\s*\)", AUD_C) is not None)
+                r"\s*bool\s+\w+", AUD_C) is not None)
 check("SetSafetyBaseline carries the anchors and the halt flag",
       re.search(r"SetSafetyBaseline\s*\(\s*double\s+\w+\s*,\s*double\s+\w+\s*,"
                 r"\s*bool\s+\w+\s*\)", AUD_C) is not None)

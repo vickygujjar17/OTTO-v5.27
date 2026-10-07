@@ -1,7 +1,7 @@
 # OTTO EA
 
 MetaTrader 5 Expert Advisor — MQL5 port of the Pine Script `prop_guard_tester.pine`
-master build. **Current base: v5.39**
+master build. **Current base: v5.40**
 
 ## Layout
 

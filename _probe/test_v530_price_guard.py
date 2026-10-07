@@ -103,15 +103,15 @@ def body(start_marker, end_marker):
     return OM_C[i:j] if j > 0 else OM_C[i:]
 
 
-PLACE = body("bool                    ArmVirtualOrder(int blockIndex",
-             "bool                    IsBlockOrderAlive(ulong ticket)")
+PLACE = body("bool                    PlaceOrArmOrder(int blockIndex",
+             "bool                    IsAnyOrderLiveAtPrice(double targetPrice")
 SEND = body("bool                    SendOrderWithRetry(MqlTradeRequest &request",
             "string                  GetTradeRetcodeString(uint retcode)")
 BUF = body("double                  GetPriceBoundaryBuffer(void)",
            "double                  SnapToTick(double price)")
 SNAP = body("double                  SnapToTick(double price)",
             "double                  GetAsk(void)")
-SHIELD = body("bool                    IsOrderAlreadyLiveAtPrice(double targetPrice",
+SHIELD = body("bool                    IsAnyOrderLiveAtPrice(double targetPrice",
               "\n\n")
 
 
@@ -120,7 +120,7 @@ SHIELD = body("bool                    IsOrderAlreadyLiveAtPrice(double targetPr
 # ----------------------------------------------------------------------
 print("\n-- Tick-size snap --")
 
-check("ArmVirtualOrder located", PLACE is not None)
+check("PlaceOrArmOrder located", PLACE is not None)
 check("SendOrderWithRetry located", SEND is not None)
 check("GetPriceBoundaryBuffer located", BUF is not None)
 check("SnapToTick located", SNAP is not None)
@@ -156,9 +156,11 @@ check("buffer adds one point of cushion on top",
                 BUF) is not None)
 check("buffer falls back when the symbol reports point 0",
       re.search(r"point\s*<=\s*0\.0\)\s*point\s*=\s*_Point", BUF) is not None)
-# v5.39: the ARM path no longer consumes the boundary buffer at all.
-check("ArmVirtualOrder no longer applies a live-price boundary",
-      "GetPriceBoundaryBuffer()" not in PLACE and "priceBuffer" not in PLACE)
+# v5.40: the ROUTER consumes the boundary buffer to decide the route — a
+# legal resting price stays PHYSICAL, an illegal one arms VIRTUAL.
+check("PlaceOrArmOrder applies the live-price boundary to route",
+      "GetPriceBoundaryBuffer()" in PLACE and "priceBuffer" not in PLACE and
+      "boundary" in PLACE)
 
 # The old local shadowed the same-named locals in ValidateStopDistance and
 # AdjustSLToMinimum; the guard must no longer declare a bare `stopsLevel`.
@@ -197,16 +199,19 @@ check("guard abort no longer persists the gate to the block book",
       "block.priceAbortLogged = true;" not in OM_T)
 check("blocks are zero-initialised at creation", "ZeroMemory(nb)" in BM_T)
 
-# The guard region itself must be empty: no boundary local, no comparison.
+# The guard region itself must be empty: the retired bare-local form is gone
+# (the router names its local `boundary`, not `priceBuffer`).
 g_start = OM_C.find("double priceBuffer = GetPriceBoundaryBuffer();")
 check("live-price guard region is gone", g_start < 0)
-check("abort does NOT veto the block (guard region absent)",
-      "IsOrderAlreadyLiveAtPrice(entryPrice, 5.0)" in OM_T)
+check("router does NOT re-introduce the bare priceBuffer local",
+      "double priceBuffer" not in OM_T)
+check("abort does NOT veto the block (routing replaces the guard)",
+      "IsAnyOrderLiveAtPrice(entryPrice, 5.0)" in OM_T)
 
-# The retired guard used to precede the duplicate shield; with it gone the
-# shield is the first price gate, so there is no ordering left to assert.
+# The retired guard used to precede the duplicate shield; the v5.40 shield is
+# the last price gate before the route decision.
 check("duplicate shield is still present",
-      OM_T.find("IsOrderAlreadyLiveAtPrice(entryPrice, 5.0)") > 0)
+      OM_T.find("IsAnyOrderLiveAtPrice(entryPrice, 5.0)") > 0)
 
 
 # ----------------------------------------------------------------------

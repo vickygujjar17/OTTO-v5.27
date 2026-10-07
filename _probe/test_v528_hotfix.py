@@ -350,27 +350,21 @@ if sweep is not None:
 
 check("no CancelQuorumOpposingOrders exists (never did)", "CancelQuorum" not in OM_T)
 
-# v5.39: the v5.28/v5.30 wrong-side price guard was DELETED from the ARM path
-# (a v5.37+ setup is an in-memory virtual order, never a resting broker limit,
-# so TRADE_RETCODE_INVALID_PRICE cannot occur). These pins now assert the
-# guard's ABSENCE; SYMBOL_TRADE_STOPS_LEVEL is still read by the broker-level
-# stop validator, which is unrelated and remains live.
-check("ArmVirtualOrder no longer refuses via a bid/ask boundary",
-      re.search(r"entryPrice\s*>=\s*\(liveBid\s*-\s*priceBuffer\)", OM_T) is None
-      and re.search(r"entryPrice\s*<=\s*\(liveAsk\s*\+\s*priceBuffer\)", OM_T) is None)
-check("ArmVirtualOrder no longer reads live bid/ask for a price guard",
-      re.search(r"double\s+liveAsk\s*=\s*GetAsk\(\)", OM_T) is None
-      and re.search(r"double\s+liveBid\s*=\s*GetBid\(\)", OM_T) is None)
-check("ArmVirtualOrder reads SYMBOL_TRADE_STOPS_LEVEL",
+# v5.40: the boundary buffer is LIVE again — the hybrid router consumes it to
+# decide whether an entry may REST at the broker (physical) or must arm
+# virtually. SYMBOL_TRADE_STOPS_LEVEL is read by the broker-level stop
+# validator too, which remains unrelated and live.
+check("PlaceOrArmOrder routes on the live-price boundary",
+      "GetPriceBoundaryBuffer()" in OM_T)
+check("PlaceOrArmOrder reads SYMBOL_TRADE_STOPS_LEVEL",
       "SYMBOL_TRADE_STOPS_LEVEL" in OM_T)
-check("the retired boundary helper no longer has a caller",
-      "GetPriceBoundaryBuffer()" not in OM_T)
+check("the boundary helper has a live caller again",
+      "GetPriceBoundaryBuffer()" in OM_T)
 
-# With the guard gone the duplicate shield is the first price gate in the ARM
-# path, so there is no guard-vs-shield ordering left to assert; only the shield
-# itself must still be present.
+# The v5.40 duplicate shield scans BOTH the broker pending pool and the virtual
+# book, and is the last price gate before the route decision.
 check("duplicate shield is still present in the ARM path",
-      OM_T.find("IsOrderAlreadyLiveAtPrice(entryPrice, 5.0)") > 0)
+      OM_T.find("IsAnyOrderLiveAtPrice(entryPrice, 5.0)") > 0)
 
 
 # ----------------------------------------------------------------------

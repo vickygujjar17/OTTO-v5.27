@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.39"
+#property version   "5.40"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -150,20 +150,28 @@ public:
    string            GetSessionID(void) const { return m_sessionID; }
 
    //+--------------------------------------------------------------+
-   //| LOG VIRTUAL ORDER ARMED - create file + SUBJECT line + setup    |
-   //| details. v5.38: the armed setup is no longer a broker pending   |
-   //| order, so the identifying value is the block tradeId (the setup |
-   //| key), not a pending ticket. This CREATES the per-setup journal  |
-   //| so the later entry/exit append into the same file.              |
+   //| LOG SETUP ARMED - create file + SUBJECT line + setup details.   |
+   //| v5.40: the hybrid router arms a setup EITHER as a physical       |
+   //| broker pending limit (price valid for a resting order) OR as an  |
+   //| in-memory virtual order (price already through the zone). This   |
+   //| CREATES the per-setup journal either way and stamps the two       |
+   //| facts the operator needs on the header: the N/R Phase (Normal    |
+   //| Touch-1 bounce vs Reversal Touch-2) and the Execution Mode       |
+   //| (PHYSICAL vs VIRTUAL). The later entry/cancel/exit append into   |
+   //| the same file; the email ships the full snapshot.                |
    //+--------------------------------------------------------------+
-   void              LogVirtualOrderArmed(string tradeId, ENUM_TRADE_DIRECTION dir, ENUM_BLOCK_TYPE btype, double entryPrice, double slPrice, double lotSize, const SSniperBlock &blk)
+   void              LogSetupArmed(bool physical, string tradeId, ENUM_TRADE_DIRECTION dir, ENUM_BLOCK_TYPE btype, double entryPrice, double slPrice, double lotSize, const SSniperBlock &blk)
      {
       if(!m_ready) return;
       if(!OpenWrite()) return;
+      string phase    = (blk.touches == 0) ? "N (Normal Bounce)" : "R (Reversal)";
+      string execMode = physical ? "PHYSICAL (Broker Limit Order)" : "VIRTUAL (In-Memory Arm)";
       W("SUBJECT: [ACTIVE] Session " + SubjectLine());
       W("================================================================");
-      W("[VIRTUAL ORDER ARMED] Session " + m_sessionID + " | " + m_symbol + " (" + (dir==DIR_LONG?"BUY / LONG":"SELL / SHORT") + ") | " + TimeToString(TimeCurrent()));
+      W("[SETUP ARMED] Session " + m_sessionID + " | " + m_symbol + " (" + (dir==DIR_LONG?"BUY / LONG":"SELL / SHORT") + ") | " + TimeToString(TimeCurrent()));
       W("  Setup ID          : " + tradeId);
+      W("  Phase             : " + phase);
+      W("  Execution Mode    : " + execMode);
       W("  Trigger Price     : " + FmtPrice(entryPrice));
       W("  Initial SL        : " + FmtPrice(slPrice));
       W("  Volume            : " + DoubleToString(lotSize,2));
@@ -175,7 +183,8 @@ public:
       CloseHandle();
       // v5.39: email the arm snapshot, exactly as LogEntry()/LogExit()/
       // LogCancellation() do. line[0] is the SUBJECT, so the full setup
-      // breakdown (wicks, entry, SL, volume, polarity) ships in one mail.
+      // breakdown (phase, execution mode, wicks, entry, SL, volume,
+      // polarity) ships in one mail.
       SendMailFromFile();
      }
    void              LogEntry(ulong ticket, ENUM_TRADE_DIRECTION dir, double entryPrice, double slPrice, double lotSize, double riskMoney, const SSniperBlock &blk)
