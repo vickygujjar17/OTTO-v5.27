@@ -242,7 +242,7 @@ check("BuildOrderComment helper exists with blockSerial + tranche params",
 check("clamp enforces the 31-char MT5 limit",
       re.search(r"MAX_COMMENT\s*=\s*31", OM_T) is not None)
 
-check("PlaceLimitOrder path uses BuildOrderComment(block.serial, 0)",
+check("ArmVirtualOrder path uses BuildOrderComment(block.serial, 0)",
       "request.comment  = BuildOrderComment(block.serial, 0);" in OM_T)
 
 check("AddPyramidTranche path uses BuildOrderComment(..., trancheToAdd)",

@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.37"
+#property version   "5.38"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -517,7 +517,7 @@ private:
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
             // Projected TP keys off the MAPPED direction (was: b.type ==
             // BLOCK_SUPPORT), mirroring the identical arithmetic in
-            // COttoOrderManager::PlaceLimitOrder. Both must agree or b.localTP
+            // COttoOrderManager::ArmVirtualOrder. Both must agree or b.localTP
             // -- which supersedes this projection once the order is placed --
             // would sit on the wrong side of price.
             bool   isLong = (BlockDirection(b) == DIR_LONG);

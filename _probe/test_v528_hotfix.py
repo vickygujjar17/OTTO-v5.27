@@ -15,7 +15,7 @@ Pins the four behaviours that the MQL5 compiler gate CANNOT exercise:
   4. The 1% floating rule measures the LIVE (balance - equity) float and no
      longer sets a permanent halt latch; the 5% trailing rule still does.
   5. Order manager: the consensus cancel sweep is symbol-scoped, and
-     PlaceLimitOrder refuses a limit on the wrong side of the live market.
+     ArmVirtualOrder refuses an entry on the wrong side of the live market.
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -347,13 +347,13 @@ if sweep is not None:
 
 check("no CancelQuorumOpposingOrders exists (never did)", "CancelQuorum" not in OM_T)
 
-check("PlaceLimitOrder validates BUY_LIMIT against bid",
+check("ArmVirtualOrder validates BUY_LIMIT against bid",
       re.search(r"entryPrice\s*>=\s*\(liveBid\s*-\s*priceBuffer\)", OM_T) is not None)
-check("PlaceLimitOrder validates SELL_LIMIT against ask",
+check("ArmVirtualOrder validates SELL_LIMIT against ask",
       re.search(r"entryPrice\s*<=\s*\(liveAsk\s*\+\s*priceBuffer\)", OM_T) is not None)
-check("PlaceLimitOrder reads SYMBOL_TRADE_STOPS_LEVEL",
+check("ArmVirtualOrder reads SYMBOL_TRADE_STOPS_LEVEL",
       "SYMBOL_TRADE_STOPS_LEVEL" in OM_T)
-check("PlaceLimitOrder reads live bid/ask",
+check("ArmVirtualOrder reads live bid/ask",
       re.search(r"double\s+liveAsk\s*=\s*GetAsk\(\)", OM_T) is not None
       and re.search(r"double\s+liveBid\s*=\s*GetBid\(\)", OM_T) is not None)
 

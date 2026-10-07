@@ -94,7 +94,7 @@ def body(start_marker, end_marker):
     return OM_C[i:j] if j > 0 else OM_C[i:]
 
 
-PLACE = body("bool                    PlaceLimitOrder(int blockIndex",
+PLACE = body("bool                    ArmVirtualOrder(int blockIndex",
              "bool                    IsBlockOrderAlive(ulong ticket)")
 SEND = body("bool                    SendOrderWithRetry(MqlTradeRequest &request",
             "string                  GetTradeRetcodeString(uint retcode)")
@@ -111,7 +111,7 @@ SHIELD = body("bool                    IsOrderAlreadyLiveAtPrice(double targetPr
 # ----------------------------------------------------------------------
 print("\n-- Tick-size snap --")
 
-check("PlaceLimitOrder located", PLACE is not None)
+check("ArmVirtualOrder located", PLACE is not None)
 check("SendOrderWithRetry located", SEND is not None)
 check("GetPriceBoundaryBuffer located", BUF is not None)
 check("SnapToTick located", SNAP is not None)
@@ -187,7 +187,7 @@ check("abort persists the gate to the block book",
       re.search(r"block\.priceAbortLogged = true;\s*\n\s*"
                 r"m_blockManager\.SetBlockAt\(blockIndex, block\);\s*\n\s*"
                 r"return false;", PLACE) is not None)
-# Scoped to the guard region only: PlaceLimitOrder legitimately contains
+# Scoped to the guard region only: ArmVirtualOrder legitimately contains
 # VETO_CORRELATION at its earlier portfolio-consensus step, so scanning the
 # whole function for VETO_ would be a false alarm. The price abort itself must
 # leave the block armed (a veto also sets deleteOnBarTime, which destroys the

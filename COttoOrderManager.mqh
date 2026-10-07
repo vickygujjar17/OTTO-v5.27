@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.37"
+#property version   "5.38"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -57,6 +57,11 @@ private:
       double               triggerPrice;
       double               stopLoss;
       double               lotSize;
+      // v5.38: the per-setup journal session, minted when the setup is ARMED
+      // and reused at the fire path. Carrying it on the descriptor (rather
+      // than re-minting on each event) is what lets the arm snapshot, the
+      // fill, and the exit all land in ONE journal file per setup.
+      string               sessionId;
      };
    SVirtualOrder           m_virtualOrders[];
    int                     m_virtualCount;
@@ -169,7 +174,7 @@ private:
    //|                                                                  |
    //| Deliberately NOT named `stopsLevel` — that identifier is already |
    //| a local inside ValidateStopDistance, AdjustSLToMinimum and the   |
-   //| guard in PlaceLimitOrder, so a field of that name would be       |
+   //| guard in ArmVirtualOrder, so a field of that name would be       |
    //| shadowed at every call site.                                     |
    //+------------------------------------------------------------------+
    double                  GetPriceBoundaryBuffer(void)
@@ -185,7 +190,7 @@ private:
    //| SnapToTick — round a price onto the symbol's trade tick grid.    |
    //| A price that is off-grid is refused by the server with           |
    //| TRADE_RETCODE_INVALID_PRICE even when it sits on the correct     |
-   //| side of the market. Shared by the PlaceLimitOrder pre-flight     |
+   //| side of the market. Shared by the ArmVirtualOrder pre-flight     |
    //| snap and the SendOrderWithRetry re-quote path so the two grids   |
    //| can never drift apart.                                           |
    //+------------------------------------------------------------------+
@@ -606,12 +611,13 @@ private:
 
 
    //+------------------------------------------------------------------+
-   //| PlaceLimitOrder — translates Pine strategy.entry(limit=...)     |
-   //| into an MT5 pending SELL_LIMIT/BUY_LIMIT. NO take-profit is     |
-   //| attached (exact mirror: exits are purely trail-based; localTP   |
-   //| is stored on the block only for the Front-Run veto).            |
+   //| ArmVirtualOrder — translates Pine strategy.entry(limit=...) into |
+   //| an in-memory SVirtualOrder. NO take-profit is attached (exact     |
+   //| mirror: exits are purely trail-based; localTP is stored on the    |
+   //| block only for the Front-Run veto). Since v5.37 nothing rests at  |
+   //| the broker; CheckVirtualTriggers() sends the MARKET leg on cross. |
    //+------------------------------------------------------------------+
-   bool                    PlaceLimitOrder(int blockIndex, SSniperBlock &block)
+   bool                    ArmVirtualOrder(int blockIndex, SSniperBlock &block)
      {
       if(block.isVetoed || block.isTriggered || block.hasPlacedOrder)
          return false;
@@ -743,16 +749,16 @@ private:
          block.priceAbortLogged = false;
         }
 
-      // HARD ANTI-DUPLICATE CHECK against MT5's live pending-order book.
-      // If an order of ours already rests at (near) this price, do NOT send
+      // HARD ANTI-DUPLICATE CHECK against our in-memory virtual order book.
+      // If an armed setup already rests at (near) this price, do NOT arm
       // another — closes the OnTick race and any bookkeeping write-back lag.
       if(IsOrderAlreadyLiveAtPrice(entryPrice, 5.0))
         {
          block.hasPlacedOrder = true;
          m_blockManager.SetBlockAt(blockIndex, block);
          if(EnableLogging)
-            Print("[OrderManager] DUPLICATE SHIELD: Order already live near ",
-                  DoubleToString(entryPrice, _Digits), " — skipping OrderSend.");
+            Print("[OrderManager] DUPLICATE SHIELD: virtual order already armed near ",
+                  DoubleToString(entryPrice, _Digits), " — skipping arm.");
          return false;
         }
 
@@ -799,6 +805,18 @@ private:
       // (the trigger logic lands in a later part of this change). Nothing
       // is sent to the broker here, so broker pending-price rules (stops
       // level, freeze level, Invalid Price) no longer gate the placement.
+
+      // --- Mint the per-setup journal session at ARM time (v5.38) ------
+      // The setup gets ONE journal file the instant it is armed, so the arm
+      // snapshot and the later fill/exit append into the same file instead of
+      // a re-minted session fragmenting the record. Stored on the descriptor
+      // so the fire path (and any later cancel) reuses the SAME id.
+      MqlDateTime atm;
+      TimeToStruct(TimeCurrent(), atm);
+      string armSessionId = StringFormat("#OTTO-%s-%04d%02d%02d-%02d%02d%02d-BLK%d",
+                                         m_symbol, atm.year, atm.mon, atm.day,
+                                         atm.hour, atm.min, atm.sec, block.serial);
+
       SVirtualOrder vo;
       vo.blockIndex   = blockIndex;
       vo.blockSerial  = block.serial;
@@ -806,6 +824,7 @@ private:
       vo.triggerPrice = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
       vo.stopLoss     = NormalizeDouble(adjustedSL, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
       vo.lotSize      = lotSize;
+      vo.sessionId    = armSessionId;
 
       int vIdx = ArraySize(m_virtualOrders);
       ArrayResize(m_virtualOrders, vIdx + 1);
@@ -816,21 +835,31 @@ private:
       block.hasPlacedOrder = true;
       m_blockManager.SetBlockAt(blockIndex, block);
 
+      // --- JOURNAL: create the per-setup file at ARM time --------------
+      if(m_journal != NULL)
+        {
+         m_journal.SetSessionID(armSessionId);
+         m_journal.LogVirtualOrderArmed(block.tradeId, dir, block.type,
+                                        entryPrice, adjustedSL, lotSize, block);
+        }
+
       if(EnableLogging)
          Print("[OrderManager] VIRTUAL ORDER ARMED for block ", block.tradeId,
                " at price ", DoubleToString(entryPrice, _Digits),
                " sl=", DoubleToString(adjustedSL, _Digits),
                " lot=", DoubleToString(lotSize, 2),
-               " rrUnit=", DoubleToString(slDist, _Digits));
+               " rrUnit=", DoubleToString(slDist, _Digits),
+               " session=", armSessionId);
       return true;
      }
 
 
    //+------------------------------------------------------------------+
-   //| HARD ANTI-DUPLICATE: scans the broker's LIVE pending-order pool   |
-   //| for ANY order of our Magic/symbol resting at (near) targetPrice. |
-   //| Independent of local block bookkeeping — closes the race where a |
-   //| new tick doesn't yet know an order was just requested.          |
+   //| HARD ANTI-DUPLICATE: scans our in-memory VIRTUAL ORDER BOOK for   |
+   //| an armed setup resting at (near) targetPrice. Since v5.37 nothing |
+   //| rests at the broker, so the duplicate source is our own armed     |
+   //| list, not the broker pending pool -- this closes the OnTick race  |
+   //| where a second tick re-arms a setup before the first is latched.  |
    //+------------------------------------------------------------------+
    bool                    IsOrderAlreadyLiveAtPrice(double targetPrice, double tolerancePoints = 5.0)
      {
@@ -839,24 +868,15 @@ private:
       // v5.30: the tolerance must track the price grid the entry was snapped
       // to. A tick can be coarser than a point (3-digit metals: tick 0.01 vs
       // point 0.001), so a tick-snapped entry can slide outside a point-based
-      // band and either place a duplicate or trip a false DUPLICATE SHIELD.
+      // band and either arm a duplicate or trip a false DUPLICATE SHIELD.
       double tick = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
       double unit = (tick > 0.0) ? MathMin(tick, point) : point;
 
-      int total = OrdersTotal();
-      for(int i = total - 1; i >= 0; i--)
+      for(int v = m_virtualCount - 1; v >= 0; v--)
         {
-         ulong ticket = OrderGetTicket(i);
-         if(ticket > 0 && OrderSelect(ticket))
-           {
-            if(OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
-               OrderGetString(ORDER_SYMBOL) == m_symbol)
-              {
-               double openPrice = OrderGetDouble(ORDER_PRICE_OPEN);
-               if(MathAbs(openPrice - targetPrice) <= (tolerancePoints * unit))
-                  return true; // Duplicate detected: order already sitting on broker
-              }
-           }
+         double trigger = m_virtualOrders[v].triggerPrice;
+         if(MathAbs(trigger - targetPrice) <= (tolerancePoints * unit))
+            return true; // Duplicate detected: armed virtual order already sits here
         }
       return false;
      }
@@ -1771,7 +1791,7 @@ public:
       CompleteReversal();
       // v5.37 Part 3: fire any armed virtual order whose level the live
       // market has reached. This is the execution half of the in-memory
-      // engine whose ARM half is PlaceLimitOrder(); it replaces the old
+      // engine whose ARM half is ArmVirtualOrder(); it replaces the old
       // CheckPendingOrderFills() broker-fill scan.
       CheckVirtualTriggers();
       // v5.33: LAST, so an EA fill detected in this same tick becomes the
@@ -1783,9 +1803,9 @@ public:
 
    //+------------------------------------------------------------------+
    //| PINE ORDER PLACEMENT — for every armed, non-vetoed, non-        |
-   //| triggered, not-yet-placed block, apply the Pine gates and place |
-   //| a pending limit order. Called from OnTick (has_placed_order     |
-   //| prevents duplicates).                                          |
+   //| triggered, not-yet-placed block, apply the Pine gates and ARM   |
+   //| an in-memory virtual order. Called from OnTick (hasPlacedOrder  |
+   //| prevents duplicates).                                           |
    //+------------------------------------------------------------------+
    void              PlaceOrdersForArmedBlocks(void)
      {
@@ -1802,7 +1822,7 @@ public:
             continue;
 
          // v5.37: Phase 1 (touches==0) and Phase 2 (touches>=1) now BOTH arm
-         // through the in-memory virtual engine. PlaceLimitOrder() is
+         // through the in-memory virtual engine. ArmVirtualOrder() is
          // phase-aware - it rests a Phase 2 entry at the shift-reversal outer
          // boundary via InpShiftReversalEntry - and CheckVirtualTriggers()
          // fires the MARKET leg once the level is traded through. This is the
@@ -1814,7 +1834,7 @@ public:
          if(m_blockManager.IsBlockedByPrimary(i))
             continue;
 
-         PlaceLimitOrder(i, blocks[i]);
+         ArmVirtualOrder(i, blocks[i]);
         }
      }
 
@@ -1822,7 +1842,7 @@ public:
    //| v5.37 Part 2 - VIRTUAL MARKET TRIGGER. Watches the live price on |
    //| every tick and fires a MARKET order the moment an armed virtual  |
    //| order's level is reached. This is the execution half of the in-  |
-   //| memory engine whose ARM half is PlaceLimitOrder().               |
+   //| memory engine whose ARM half is ArmVirtualOrder().               |
    //|                                                                  |
    //| The cross test mirrors Pine's own strategy fill logic: a         |
    //| LONG fires once the market has traded DOWN to/through its        |
@@ -1896,19 +1916,24 @@ public:
          if(!SentimentPasses(blocks[bi])) continue;
          if(m_blockManager.IsBlockedByPrimary(bi)) continue;
 
-         // v5.37 -- N/R PHASE TAG. A block serial executes at most twice: its
-         // FIRST fill (touches == 0) is the Phase 1 "N"ormal bounce, its
-         // SECOND (touches >= 1) the Phase 2 "R"eversal. The one-letter marker
-         // rides in the broker comment, and the SAME session ID names the
-         // journal file, so the terminal row, the journal and the emailed log
-         // all share a single identifier. Minted HERE (before the send) so the
-         // comment and the journal cannot disagree if the fill path re-mints.
+         // v5.38 -- N/R PHASE TAG + REUSE OF THE ARM SESSION. A block serial
+         // executes at most twice: its FIRST fill (touches == 0) is the Phase 1
+         // "N"ormal bounce, its SECOND (touches >= 1) the Phase 2 "R"eversal.
+         // The one-letter marker rides in the broker comment. The SESSION id is
+         // NOT re-minted here: it was minted when the setup was ARMED and is
+         // carried on the descriptor, so the arm snapshot, this fill and the
+         // later exit all resolve to ONE journal file. A fallback mint (only
+         // if a descriptor predates the field) keeps the identifier defined.
          string phaseType = (blocks[bi].touches == 0) ? "N" : "R";
-         MqlDateTime ntm;
-         TimeToStruct(TimeCurrent(), ntm);
-         string newSessionId = StringFormat("#OTTO-%s-%04d%02d%02d-%02d%02d%02d-BLK%d",
-                                            m_symbol, ntm.year, ntm.mon, ntm.day,
-                                            ntm.hour, ntm.min, ntm.sec, blocks[bi].serial);
+         string newSessionId = vo.sessionId;
+         if(newSessionId == "")
+           {
+            MqlDateTime ntm;
+            TimeToStruct(TimeCurrent(), ntm);
+            newSessionId = StringFormat("#OTTO-%s-%04d%02d%02d-%02d%02d%02d-BLK%d",
+                                        m_symbol, ntm.year, ntm.mon, ntm.day,
+                                        ntm.hour, ntm.min, ntm.sec, blocks[bi].serial);
+           }
          if(m_journal != NULL) m_journal.SetSessionID(newSessionId);
 
          // --- Build the MARKET request (DEAL, not PENDING) ---
@@ -1930,7 +1955,7 @@ public:
          // row and the journal agree without a second source of truth.
          request.comment   = ClampOrderComment(newSessionId + "_" + phaseType);
 
-         // Optimistic one-shot lock (mirrors PlaceLimitOrder). Prevents a
+         // Optimistic one-shot lock (mirrors ArmVirtualOrder). Prevents a
          // concurrent tick or a requote retry from firing this order twice.
          SSniperBlock block = blocks[bi];
          block.hasPlacedOrder = true;
@@ -1953,7 +1978,7 @@ public:
                      " price=", DoubleToString(request.price, _Digits),
                      " sl=", DoubleToString(request.sl, _Digits));
             // FIX (v5.37): keep the one-shot latch SET. Clearing it here made
-            // the still-armed block eligible for PlaceLimitOrder(), whose only
+            // the still-armed block eligible for ArmVirtualOrder(), whose only
             // duplicate guard is "if(block.hasPlacedOrder) return false;" - so
             // every subsequent tick re-armed a SECOND SVirtualOrder for the
             // same block while the first one was still in m_virtualOrders[],
@@ -2098,9 +2123,17 @@ public:
                   else if(blocks[i].conversionReason == VETO_MOMENTUM) convReason = "Momentum Veto";
                   else if(blocks[i].conversionReason == VETO_FVG)      convReason = "FVG Veto";
 
-                  MqlDateTime ctm2; TimeToStruct(TimeCurrent(), ctm2);
-                  string cts2 = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm2.year, ctm2.mon, ctm2.day, ctm2.hour, ctm2.min, ctm2.sec);
-                  m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts2, blocks[i].serial));
+                  // v5.38: keep the setup's ONE journal. Reuse the arm-time
+                  // session carried on the descriptor; only a legacy entry
+                  // with no session id falls back to a freshly minted one.
+                  string voSession = m_virtualOrders[v].sessionId;
+                  if(voSession == "")
+                    {
+                     MqlDateTime ctm2; TimeToStruct(TimeCurrent(), ctm2);
+                     string cts2 = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm2.year, ctm2.mon, ctm2.day, ctm2.hour, ctm2.min, ctm2.sec);
+                     voSession = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts2, blocks[i].serial);
+                    }
+                  m_journal.SetSessionID(voSession);
                   m_journal.LogConversion(0, blocks[i].type, convReason);
                  }
                else
@@ -2117,9 +2150,16 @@ public:
                   else if(blocks[i].vetoReason == VETO_FLIPPED)    cancelReason = "Block Flipped";
                   else if(blocks[i].vetoReason == VETO_CORRELATION) cancelReason = "Vector Consensus Veto";
                   else if(blocks[i].pendingOrderCancel)           cancelReason = "Manual / Direction Conflict";
-                  MqlDateTime ctm; TimeToStruct(TimeCurrent(), ctm);
-                  string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
-                  m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial));
+                  // v5.38: reuse the arm-time session (see the conversion branch
+                  // above) so the cancel lands in the setup's ONE journal.
+                  string voSession = m_virtualOrders[v].sessionId;
+                  if(voSession == "")
+                    {
+                     MqlDateTime ctm; TimeToStruct(TimeCurrent(), ctm);
+                     string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
+                     voSession = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial);
+                    }
+                  m_journal.SetSessionID(voSession);
                   m_journal.LogCancellation(cancelReason);
                  }
               }

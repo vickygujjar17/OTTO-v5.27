@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.37"
+#property version   "5.38"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -150,17 +150,21 @@ public:
    string            GetSessionID(void) const { return m_sessionID; }
 
    //+--------------------------------------------------------------+
-   //| LOG ORDER PLACED - create file + SUBJECT line + setup details   |
+   //| LOG VIRTUAL ORDER ARMED - create file + SUBJECT line + setup    |
+   //| details. v5.38: the armed setup is no longer a broker pending   |
+   //| order, so the identifying value is the block tradeId (the setup |
+   //| key), not a pending ticket. This CREATES the per-setup journal  |
+   //| so the later entry/exit append into the same file.              |
    //+--------------------------------------------------------------+
-   void              LogOrderPlaced(ulong ticket, ENUM_TRADE_DIRECTION dir, ENUM_BLOCK_TYPE btype, double entryPrice, double slPrice, double lotSize, const SSniperBlock &blk)
+   void              LogVirtualOrderArmed(string tradeId, ENUM_TRADE_DIRECTION dir, ENUM_BLOCK_TYPE btype, double entryPrice, double slPrice, double lotSize, const SSniperBlock &blk)
      {
       if(!m_ready) return;
       if(!OpenWrite()) return;
       W("SUBJECT: [ACTIVE] Session " + SubjectLine());
       W("================================================================");
-      W("[ORDER PLACED] Session " + m_sessionID + " | " + m_symbol + " (" + (dir==DIR_LONG?"BUY / LONG":"SELL / SHORT") + ") | " + TimeToString(TimeCurrent()));
-      W("  Pending Ticket    : #" + IntegerToString((int)ticket));
-      W("  Limit Price       : " + FmtPrice(entryPrice));
+      W("[VIRTUAL ORDER ARMED] Session " + m_sessionID + " | " + m_symbol + " (" + (dir==DIR_LONG?"BUY / LONG":"SELL / SHORT") + ") | " + TimeToString(TimeCurrent()));
+      W("  Setup ID          : " + tradeId);
+      W("  Trigger Price     : " + FmtPrice(entryPrice));
       W("  Initial SL        : " + FmtPrice(slPrice));
       W("  Volume            : " + DoubleToString(lotSize,2));
       W("  Block Polarity    : " + (btype==BLOCK_SUPPORT?"SUPPORT":"RESISTANCE"));
@@ -173,7 +177,15 @@ public:
    void              LogEntry(ulong ticket, ENUM_TRADE_DIRECTION dir, double entryPrice, double slPrice, double lotSize, double riskMoney, const SSniperBlock &blk)
      {
       if(!m_ready) return;
-      if(!OpenWrite()) return;
+      // v5.38: APPEND into the per-setup file the arm() created, so the armed
+      // snapshot and the fill share ONE journal. OpenAppend() seeks to EOF and
+      // fails when the file is absent (a manual adoption, or a legacy session),
+      // in which case OpenWrite() creates it -- same fallback the pyramid /
+      // trail / cancellation writers already use.
+      if(!OpenAppend())
+        {
+         if(!OpenWrite()) return;   // no prior file -> create it
+        }
       double riskDist = MathAbs(entryPrice - slPrice);
       W("SUBJECT: [ACTIVE] Session " + SubjectLine());
       W("================================================================");
