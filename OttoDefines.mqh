@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.43 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.44 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.43"
-#property description "OTTO v5.43 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.44"
+#property description "OTTO v5.44 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -263,16 +263,15 @@ input double   InpArmATR          = 0.0;      // Arming distance (ATR) — 0 = i
 // v5.34: Shift Reversal entry. When true, Touch 2 of a zone is entered from its
 // OUTER boundary instead of the midpoint (the "shifted reversal" geometry).
 input bool     InpShiftReversalEntry = true;  // Shift Reversal (Touch 2) Entry to Outer Boundary
-input double   InpFixedRiskUSD    = 0.0;      // Fixed $ risk/trade (0 = use RiskPercent%)
 input bool     InpPyramidEnable   = true;     // Enable 4-tranche pyramiding (unified group SL)
 // v5.29: Tranche 1 risk continues to flow through RiskPercent in group [6]
-// (0.25%), so there is NO separate InpRiskT1Pct input. The v5.27 declaration of
+// (1.0%), so there is NO separate InpRiskT1Pct input. The v5.27 declaration of
 // one was dead -- nothing in the tree ever read it -- and a second knob that
 // silently changes no behaviour is worse than no knob at all.
 // v5.29: the ladder is now a true risk-percent pyramid. Each scale-in risks
-// roughly half the previous rung and the four rungs total 0.6875% of equity,
+// roughly half the previous rung and the four rungs total 1.4375% of equity,
 // comfortably inside the SafetyMaxRiskPct = 1.5% budget:
-//   T1  0.25%    RiskPercent (group [6])   at market
+//   T1  1.0%     RiskPercent (group [6])   at market
 //   T2  0.25%    InpRiskT2Pct              at +1.0R  (InpPyramidT2RR)
 //   T3  0.125%   InpRiskT3Pct              at +2.0R  (InpPyramidT3RR)
 //   T4  0.0625%  InpRiskT4Pct              at +3.0R  (InpPyramidT4RR)
@@ -332,7 +331,7 @@ input double   InpLockProfitTargetRR = 2.0;  // Step profit lock target: lock SL
 input group "══════════════════════════════════════════════════"
 input group "  [6] RISK MANAGEMENT"
 input group "══════════════════════════════════════════════════"
-input double   RiskPercent        = 0.25;     // Risk per trade (% of account)
+input double   RiskPercent        = 1.0;      // Risk per trade (% of account)
 input int      MaxSlippage        = 30;       // Max slippage in points
 input int      MaxRetries         = 3;        // OrderSend retry attempts
 input int      RetryDelayMs       = 500;      // Retry delay (milliseconds)
@@ -354,29 +353,9 @@ input group "══════════════════════�
 input double   SafetyMaxRiskPct    = 1.5;     // Hard abort if risk > this % of account
 input double   SafetyDailyDDLimit  = 3.0;     // Soft breach: pause new orders at this %
 input double   SafetyTotalDDLimit  = 5.0;     // Hard breach: close all + halt at this % (Trailing)
-// v5.31: GFT 0.90% max FLOATING loss. Basis is the raw live float,
-// (balance - equity) / balance -- NOT a retracement from the peak-equity
-// high-water mark. The HWM basis was abandoned in v5.28: it fired whenever
-// equity sat below its own peak even with nothing open, and latched the
-// permanent halt on an ordinary tick. A float measure reads 0 whenever the
-// book is empty. See the FIX (v5.28) note in otto.mq5.
-//
-// The breach response is a SMART TRIM, not a liquidation: tranche 1 (the
-// primary -- the only leg whose stop-loss defines the trade's risk geometry)
-// is preserved, and every NON-PRIMARY leg that has travelled at least
-// InpTrimLoserStopPct of the way to its own stop is closed. The whole basket
-// is still closed wholesale when no trimmable leg survives, so 0.90% remains
-// a hard ceiling on floating loss either way.
-input double   SafetyMaxFloatingLoss = 0.90;  // Hard cap: smart-trim at this % floating loss
-// v5.31: how far a NON-PRIMARY tranche must have moved toward its own SL
-// before the smart trim is willing to close it. At 70% the leg is already
-// most of the way to being stopped out, so closing it early recovers float
-// without surrendering a pyramid leg that is merely breathing. Set to 0 to
-// let every non-primary leg qualify (trim to the primary alone).
-input double   InpTrimLoserStopPct = 70.0;    // Smart trim: non-primary legs >= this % toward SL
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.43"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.44"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart
@@ -388,7 +367,7 @@ input int      InpAnchorTF           = PERIOD_H1;  // Anchor candle timeframe (H
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
 
 input group "══════════════════════════════════════════════════"
-input group "  [10] HIGH TABLE AUDITOR — v5.43"
+input group "  [10] HIGH TABLE AUDITOR — v5.44"
 input group "══════════════════════════════════════════════════"
 // Decoupled watchdog: audits live state on its OWN timer cadence rather
 // than inside OnTick, so a halted / paused / tick-starved trade loop can
@@ -398,7 +377,7 @@ input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
 input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
 
 input group "══════════════════════════════════════════════════"
-input group "  [11] MANUAL TRADE ADOPTION — v5.43"
+input group "  [11] MANUAL TRADE ADOPTION — v5.44"
 input group "══════════════════════════════════════════════════"
 // Let this EA manage positions opened BY HAND on its own chart symbol.
 // A manual position is identified as a MAGIC-0 position on m_symbol: the
@@ -415,7 +394,7 @@ input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual
 
 //+------------------------------------------------------------------+
 input group "══════════════════════════════════════════════════"
-input group "  [12] VETO REVERSAL CONVERSIONS — v5.43"
+input group "  [12] VETO REVERSAL CONVERSIONS — v5.44"
 input group "══════════════════════════════════════════════════"
 // v5.34: the old [12] "INVERTED S/R + VIRTUAL ORDERS" experiment block was
 // retired. The zone -> direction mapping is now the standard PHASE-AWARE

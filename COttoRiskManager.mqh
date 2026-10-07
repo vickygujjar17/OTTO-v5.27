@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                              COttoRiskManager.mqh |
-//|                 MODULE — Risk Sizing (RiskPercent% or Fixed $)   |
+//|                 MODULE — Risk Sizing (RiskPercent% of equity)    |
 //|              OTTO EA — Institutional risk manager                |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.43"
+#property version   "5.44"
 
 #ifndef __OTTO_RISK_MANAGER__
 #define __OTTO_RISK_MANAGER__
@@ -13,9 +13,9 @@
 
 //+------------------------------------------------------------------+
 //| COttoRiskManager class                                           |
-//| Calculates lot size for an exact risk amount. Mirrors the Pine   |
-//| "fixed $25 risk" via InpFixedRiskUSD, else uses institutional    |
-//| RiskPercent of the lower of Balance/Equity.                      |
+//| Calculates lot size for an exact risk amount from a dynamic      |
+//| RiskPercent% of LIVE ACCOUNT EQUITY (Forex & Gold).              |
+//| Strict 1% dynamic-equity model - no fixed-dollar override.       |
 //+------------------------------------------------------------------+
 class COttoRiskManager
   {
@@ -60,11 +60,8 @@ private:
    //+------------------------------------------------------------------+
    double            GetRiskMoney(void)
      {
-      // Option A: fixed $ risk per trade (Pine fixed_risk_usd = 25)
-      if(InpFixedRiskUSD > 0.0)
-         return InpFixedRiskUSD;
-
-      // Option B: 0.25% risk of LIVE ACCOUNT EQUITY (universal, Forex & Gold)
+      // Strict dynamic-equity risk: RiskPercent% of LIVE ACCOUNT EQUITY
+      // (universal, Forex & Gold). No fixed-dollar override.
       double accountEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       return accountEquity * (RiskPercent / 100.0);
      }
@@ -127,7 +124,12 @@ public:
       if(actualRiskMoney > (riskMoney * 1.05) && lot > m_volumeMin)
          lot -= m_volumeStep;
 
-      if(lot > m_volumeMax)  lot = m_volumeMax;
+      if(lot > m_volumeMax)
+        {
+         if(EnableLogging)
+            Print("[RiskManager] Lot clamped to broker max: ", DoubleToString(m_volumeMax,2));
+         lot = m_volumeMax;
+        }
       if(lot < m_volumeMin)  return 0.0;   // below min -> cannot size this tier
       return lot;
      }
@@ -173,7 +175,7 @@ public:
                " | VolMin=", DoubleToString(m_volumeMin, 2),
                " | VolMax=", DoubleToString(m_volumeMax, 2),
                " | VolStep=", DoubleToString(m_volumeStep, 2),
-               " | Risk: ", (InpFixedRiskUSD > 0 ? ("$" + DoubleToString(InpFixedRiskUSD,2)) : (DoubleToString(RiskPercent,2) + "% of acct")));
+               " | Risk: ", DoubleToString(RiskPercent,2), "% of acct");
       return true;
      }
 
@@ -213,7 +215,12 @@ public:
       double finalLotSize = NormalizeLotSize(rawLotSize);
 
       if(finalLotSize < m_volumeMin) finalLotSize = m_volumeMin;
-      if(finalLotSize > m_volumeMax) finalLotSize = m_volumeMax;
+      if(finalLotSize > m_volumeMax)
+        {
+         if(EnableLogging)
+            Print("[RiskManager] Lot clamped to broker max: ", DoubleToString(m_volumeMax,2));
+         finalLotSize = m_volumeMax;
+        }
       if(finalLotSize <= 0) finalLotSize = m_volumeMin;
 
       // --- STRICT 0.25% ROUND-DOWN ANTI-OVERSHOOT (NEVER exceed risk) ---

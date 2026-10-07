@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.43"
+#property version   "5.44"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -738,7 +738,7 @@ private:
       if(!ValidateStopDistance(entryPrice, adjustedSL, isLong))
          adjustedSL = AdjustSLToMinimum(entryPrice, adjustedSL, isLong);
 
-      // Risk sizing (RiskPercent% or fixed $)
+      // Risk sizing (dynamic RiskPercent%)
       double lotSize = m_riskManager.CalculateLotSize(entryPrice, adjustedSL);
       if(lotSize <= 0)
         {

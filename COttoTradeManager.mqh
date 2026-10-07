@@ -4,7 +4,7 @@
 //|            OTTO EA - Cut / Cost-BE / ATR Trail / Pyramiding       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.43"
+#property version   "5.44"
 
 #ifndef __OTTO_TRADE_MANAGER__
 #define __OTTO_TRADE_MANAGER__
@@ -27,15 +27,6 @@ private:
    int                  m_breakevenTriggers;
    int                  m_trailActivations;
    int                  m_stopsHit;
-
-   // v5.31 -- smart-trim one-shot gate, in MEMORY only.
-   // The 0.90% floating-loss rule is re-tested on EVERY tick, so a trim that
-   // closed nothing (all legs still above the 70%-toward-SL bar) would re-run
-   // its symbol/magic position scan on every tick for as long as the basket
-   // stays under water. This mirrors the v5.30 block.priceAbortLogged gate:
-   // raised on the first breach, cleared as soon as the float is back under
-   // the cap, so each sustained breach reports once instead of per tick.
-   bool                 m_trimLogged;
 
    //+------------------------------------------------------------------+
    //| v5.32 — is the legacy "cut risk in half" rung LIVE?              |
@@ -136,112 +127,11 @@ private:
       return frictionPoints + (spread * 0.5);
      }
 
-   //+------------------------------------------------------------------+
-   //| v5.31 — SMART-TRIM WALK: one leg filter, two modes.              |
-   //|                                                                   |
-   //| Walks the broker's live position book rather than m_basket[]:     |
-   //| a tranche that opened between the last Update() and this call is  |
-   //| still seen, and a leg already closed is never counted. The scan   |
-   //| is filtered on BOTH POSITION_SYMBOL and POSITION_MAGIC, because   |
-   //| the magic 20240624 is shared by every OTTO chart in the account — |
-   //| a trim on EURUSD must never touch a GBPUSD tranche.               |
-   //|                                                                   |
-   //| Tranche 1 (the primary, == SActiveTrade.ticket) is excluded by     |
-   //| construction. It is the leg whose stop-loss defines the basket's   |
-   //| risk geometry and the leg the tracker keeps, so trimming it would  |
-   //| be an exit, not a trim. The ticket is read ONCE, before the walk:  |
-   //| ForceClose() clears the tracked-basket state on the last leg, so   |
-   //| re-reading it inside the loop would change the exclusion set       |
-   //| mid-walk.                                                          |
-   //|                                                                   |
-   //| A leg qualifies once it has travelled at least trimPct percent of  |
-   //| the way from its entry to its OWN stop, measured in that leg's     |
-   //| direction, so a leg still in profit scores 0 and is kept. Legs     |
-   //| whose stop has already been ratcheted to (or beyond) their entry   |
-   //| are PROTECTED at breakeven or better: their remaining risk is zero |
-   //| and "% of the way to the stop" is no longer meaningful, so they are |
-   //| skipped rather than trimmed -- trimming them would be taking a     |
-   //| profit/breakeven exit, not cutting a loser. Legs with no stop at   |
-   //| all are skipped for the same reason the geometry guard exists.     |
-   //|                                                                   |
-   //| The effective stop is the broker's, tightened toward the unified   |
-   //| session stop when that is nearer. A rejected ApplyUnifiedSL leaves  |
-   //| the live leg carrying the wider stop from its fill while           |
-   //| m_sessionSL holds the ratcheted basket stop, so taking the tighter |
-   //| of the two reports the leg's true progress instead of             |
-   //| under-reporting it and keeping a leg the basket has already moved  |
-   //| to breakeven. m_sessionSL is re-seeded by InitBasket() on every    |
-   //| new basket, so it can never describe a previous basket here.       |
-   //|                                                                   |
-   //| dryRun=true counts only. BOTH callers share this one filter on     |
-   //| purpose: a divergence between "what we counted" and "what we would |
-   //| close" would let the escalation decision rest on evidence the      |
-   //| trim never gathered.                                               |
-   //|                                                                   |
-   //| The walk runs DOWNWARD because the apply mode closes as it goes: a |
-   //| removal shifts every higher index down by one, so an ascending loop |
-   //| would skip the leg that slid into the freed slot.                 |
-   //+------------------------------------------------------------------+
-   int               WalkTrimLegs(double trimPct, bool dryRun, int &outClosed)
-     {
-      long  magic   = (long)MagicNumber;
-      ulong primary = m_orderManager.GetActiveTrade().ticket;
-      double sessionSL = m_orderManager.GetSessionSL();
-      int   qualified  = 0;
-      outClosed = 0;
-
-      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
-        {
-         if(PositionGetTicket(idx) <= 0) continue;
-         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if(PositionGetInteger(POSITION_MAGIC) != magic) continue;
-
-         ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
-         if(ticket == 0 || ticket == primary) continue;
-
-         bool   isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-         double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
-         double sl     = PositionGetDouble(POSITION_SL);
-
-         // No stop at all -> cannot measure "% of the way to the stop".
-         if(sl <= 0.0) continue;
-
-         if(sessionSL > 0.0)
-           {
-            if(isLong) sl = MathMax(sl, sessionSL);
-            else       sl = MathMin(sl, sessionSL);
-           }
-
-         double total = isLong ? (entry - sl) : (sl - entry);
-         if(total <= 0.0) continue;   // stop at/past entry (protected) or wrong side
-
-         double mark  = isLong ? SymbolInfoDouble(m_symbol, SYMBOL_BID)
-                              : SymbolInfoDouble(m_symbol, SYMBOL_ASK);
-         double moved = isLong ? (entry - mark) : (mark - entry);
-
-         if(moved < (trimPct / 100.0) * total) continue;
-         qualified++;
-
-         if(dryRun) continue;
-         if(m_orderManager.ForceClose(ticket))
-           {
-            outClosed++;
-            if(EnableLogging)
-               Print("[SmartTrim] Closed non-primary tranche ", ticket, " | ",
-                     DoubleToString(100.0 * moved / total, 1),
-                     "% of the way to its stop");
-           }
-        }
-
-      return qualified;
-     }
-
 public:
    COttoTradeManager(void)
      {
       m_symbol=""; m_riskManager=NULL; m_orderManager=NULL; m_blockManager=NULL;
       m_tradesManaged=0; m_halfRiskTriggers=0; m_breakevenTriggers=0; m_trailActivations=0; m_stopsHit=0;
-      m_trimLogged=false;
       // v5.32: pessimistic default. Initialize() resolves the real value from
       // the inputs; until then every half-risk rung is treated as inert, which
       // is the safe direction -- a rung that cannot assign must not count.
@@ -295,91 +185,6 @@ public:
                DoubleToString(InpCutRiskRR,2), "R (< breakeven ",
                DoubleToString(InpBreakEvenRR,2), "R) -> -0.5R floor is reachable");
       return true;
-     }
-
-   //+------------------------------------------------------------------+
-   //| v5.31 — SMART TRIM: closes only the non-primary tranches that    |
-   //| have travelled at least InpTrimLoserStopPct of the way to their  |
-   //| own stop, and reports whether the FULL basket close is still      |
-   //| required.                                                         |
-   //|                                                                   |
-   //| Returns TRUE only when the trim could not act, i.e. no leg was    |
-   //| past the bar. The caller then falls back to CloseEntireBasket(),   |
-   //| which is exactly the v5.30 fallback: the 0.90% cap is still       |
-   //| enforced when there is nothing to trim, and it is retried on each  |
-   //| tick while the float stays over the cap.                           |
-   //|                                                                   |
-   //| Returns FALSE when the trim DID act (the basket was relieved       |
-   //| leg-by-leg and the primary keeps running under its own stop) and   |
-   //| also when this breach has already been trimmed. Escalating on the  |
-   //| primary's survival would full-close on every trimmed breach and    |
-   //| make the trim a no-op, so it deliberately does not.                |
-   //|                                                                   |
-   //| The latch is one-shot PER BREACH rather than per call: OnTick()    |
-   //| re-tests the 0.90% cap every tick, so without it a basket that     |
-   //| stayed under water would be re-trimmed on every tick (the v5.30    |
-   //| priceAbortLogged pendulum). It is raised ONLY when the trim        |
-   //| actually closed something, so the "nothing to trim" path still     |
-   //| escalates every tick instead of silently giving up. Closing the    |
-   //| losing legs converts their float into a realised loss, which drops  |
-   //| the float under the cap and lets ClearTrimLatch() re-arm the trim   |
-   //| for the next excursion.                                            |
-   //+------------------------------------------------------------------+
-   bool            TrimHeavyLosers(double trimPct)
-     {
-      if(!m_orderManager.HasActiveTrade() && m_orderManager.CountOpenPositions() == 0)
-        {
-         m_trimLogged = false;
-         return false;
-        }
-
-      if(m_trimLogged) return false;   // already trimmed for this breach
-
-      int closed = 0;
-      int qualified = WalkTrimLegs(trimPct, false, closed);
-
-      if(closed == 0)
-        {
-         if(EnableLogging)
-            Print("[SmartTrim] nothing to trim | ", qualified,
-                  " leg(s) considered, none past ", DoubleToString(trimPct, 1),
-                  "% toward its stop — falling back to full basket close");
-         return true;   // nothing relieved -> caller does the full close
-        }
-
-      m_trimLogged = true;
-      if(EnableLogging)
-         Print("[SmartTrim] trimmed ", closed, " of ", qualified,
-               " qualifying tranche(s) | symbol=", m_symbol,
-               " | threshold=", DoubleToString(trimPct, 1),
-               "% toward stop — primary retained");
-      return false;
-     }
-
-   //+------------------------------------------------------------------+
-   //| v5.31 — clears the one-shot trim latch.                          |
-   //|                                                                   |
-   //| The latch must be released as soon as the float is back under the |
-   //| cap, otherwise it would survive into the NEXT basket and the first |
-   //| breach of that later basket would silently skip its trim. Called   |
-   //| from the non-breach path of the OnTick safety block, i.e. exactly  |
-   //| the "price is back inside the boundary" moment the v5.30 gate      |
-   //| uses. Cheap and idempotent, so it is safe to call every tick.      |
-   //+------------------------------------------------------------------+
-   void            ClearTrimLatch(void) { m_trimLogged = false; }
-
-   //+------------------------------------------------------------------+
-   //| v5.31 — read-only dry run of the smart-trim filter.              |
-   //| Counts the legs a trim WOULD close without touching the book, so  |
-   //| a status log or a probe can report the trim's exposure without    |
-   //| trading. Shares WalkTrimLegs(dryRun=true) with the live trim.     |
-   //+------------------------------------------------------------------+
-   int             CountTrimCandidates(double trimPct)
-     {
-      if(!m_orderManager.HasActiveTrade() && m_orderManager.CountOpenPositions() == 0)
-         return 0;
-      int closed = 0;   // unused in dry-run mode
-      return WalkTrimLegs(trimPct, true, closed);
      }
 
    void            Update(void)

@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                       OttoEA.mq5 |
 //|                    OTTO — Goat Funded Trader (GFT) Master Build    |
-//|                    Pine Script Master Build Port (v5.43)            |
+//|                    Pine Script Master Build Port (v5.44)            |
 //|                                    Institutional / Real-Money    |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.43"
+#property version   "5.44"
 #property description "OTTO EA â€” Goat Funded Trader (GFT) Master Build"
 #property description "Separation | Sizing | Front-Run | Near-Miss | Stale vetoes"
 #property description "Modules: News Shield | Risk | Block Manager | Order Mgmt | Trail"
@@ -79,12 +79,10 @@ datetime g_lastBarTime      = 0;
 
 // --- Prop Firm Safety State ---
 double   g_initialBalance      = 0;
-double   g_dailyResetBalance   = 0;  // v5.28: re-anchored at 17:00 New York (DST-aware)
+double   g_dailyResetBalance   = 0;  // Re-anchored at 00:00 MT5 server time (The5ers)
 // FIX (v5.24): single equity high-water mark. Trailing total DD previously
 // trailed the peak CLOSED balance in g_highWaterMarkBalance; it now trails
 // peak EQUITY, so the 5% trailing DD shares this one basis.
-// v5.28: the 1% floating rule is DECOUPLED from this HWM and now measures
-// (balance - equity), i.e. live basket float. See the OnTick safety block.
 double   g_equityHighWaterMark = 0;  // Tracks highest all-time EQUITY for Trailing Drawdown
 datetime g_lastMidnightCheck   = 0;
 bool     g_dailyDD_Paused      = false;
@@ -182,7 +180,7 @@ int OnInit(void)
    g_symbol = _Symbol;
 
    Print("==============================================================");
-   Print("  OTTO EA v5.43 — 28-Pair Institutional Master Build — INITIALIZING");
+   Print("  OTTO EA v5.44 — 28-Pair Institutional Master Build — INITIALIZING");
    Print("  Symbol: ", g_symbol, " | Magic: ", MagicNumber);
    Print("==============================================================");
 
@@ -324,7 +322,7 @@ int OnInit(void)
    // re-based the trailing limits downward -- "drawdown amnesia".
    //
    // The live trailing basis is g_equityHighWaterMark (single equity HWM, v5.24,
-   // shared by the 5% trailing DD and the 1% floating rule). The directive that
+   // shared by the 5% trailing DD). The directive that
    // requested this patch referred to a global named `g_highWaterMark`, which
    // does not exist in this build; persisting a separate new global under that
    // name would compile while leaving the REAL basis unpersisted, so the correct
@@ -333,28 +331,24 @@ int OnInit(void)
 
    double liveEquity = AccountInfoDouble(ACCOUNT_EQUITY);
 
-   // --- Daily reset anchor (3% daily DD basis) ---
-   // v5.28: anchored on the true New York 17:00 rollover rather than the
-   // broker's D1 candle open (see CheckDailyReset). Re-seeded when the stored
-   // anchor names a DIFFERENT session than the current one: a prop firm can
-   // RESET a challenge account on the same login, and carrying the old anchor
-   // across that reset would apply a stale (possibly already-breached) budget
-   // to a freshly-funded account.
-   datetime utcNow   = TimeGMT();
-   datetime nyAnchor = MostRecentNyRollover(utcNow);
-   g_lastMidnightCheck = (datetime)OttoGvLoadDouble("LastMid", (double)nyAnchor);
-   bool staleAnchor    = (nyAnchor != 0 && g_lastMidnightCheck != nyAnchor);
+   // --- Daily reset anchor (daily DD basis) ---
+   // Re-seeded when the stored anchor names a DIFFERENT session than the
+   // current one: a prop firm can RESET a challenge account on the same
+   // login, and carrying the old anchor across that reset would apply a
+   // stale (possibly already-breached) budget to a freshly-funded account.
+   datetime midAnchor  = MostRecentServerMidnight(TimeCurrent());
+   g_lastMidnightCheck = (datetime)OttoGvLoadDouble("LastMid", (double)midAnchor);
+   bool staleAnchor    = (midAnchor != 0 && g_lastMidnightCheck != midAnchor);
    double storedDaily  = OttoGvLoadDouble("DailyReset", 0);
-   // v5.28: the budget basis is the ACCOUNT BALANCE, matching the live
-   // (balance - equity) floating-loss measure. Seeding from equity here would
-   // import open-basket float into the daily floor on every cold start.
+   // The5ers computes its daily reset from EQUITY at 00:00 server time, so
+   // the cold-start seed matches the live measure (see CheckDailyReset).
    g_dailyResetBalance = (staleAnchor || storedDaily <= 0)
-                         ? AccountInfoDouble(ACCOUNT_BALANCE)
+                         ? AccountInfoDouble(ACCOUNT_EQUITY)
                          : storedDaily;
    if(g_dailyResetBalance <= 0)
-      g_dailyResetBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      g_dailyResetBalance = AccountInfoDouble(ACCOUNT_EQUITY);
 
-   // --- Trailing high-water mark (5% trailing DD + 1% floating basis) ---
+   // --- Trailing high-water mark (5% trailing DD basis) ---
    // A stored HWM BELOW current equity is simply stale history (the account has
    // since made new highs) and is superseded by live equity. A stored HWM far
    // ABOVE current equity is honoured as a genuine prior peak, because that is
@@ -384,17 +378,8 @@ int OnInit(void)
          " Halted=", g_totalDD_Halted ? "true" : "false",
          " | LastMidnight: ", TimeToString(g_lastMidnightCheck, TIME_DATE|TIME_MINUTES));
    Print("[Safety] Init Balance: ", DoubleToString(g_initialBalance, 2),
-         " | DailyDD: ", SafetyDailyDDLimit, "% | TotalDD(trailing): ", SafetyTotalDDLimit,
-         "% | Floating: ", SafetyMaxFloatingLoss, "%");
+         " | DailyDD: ", SafetyDailyDDLimit, "% | TotalDD(trailing): ", SafetyTotalDDLimit, "%");
    Print("[Safety] Daily reset anchor: ", TimeToString(g_lastMidnightCheck, TIME_DATE|TIME_MINUTES));
-   // v5.28 — surface the computed New York clock so the host's UTC basis can be
-   // verified at a glance on the VPS. If the third value is not -4/-5 hours the
-   // host clock (not this code) is wrong.
-   Print("[Safety] Time basis: UTC=", TimeToString(utcNow, TIME_DATE|TIME_MINUTES),
-         " | New York=", TimeToString(UtcToNewYork(utcNow), TIME_DATE|TIME_MINUTES),
-         " | offset=", IntegerToString(NewYorkUtcOffsetSeconds(utcNow) / 3600), "h",
-         " | next rollover in ",
-         IntegerToString((int)((MostRecentNyRollover(utcNow) + 86400 - utcNow) / 60)), " min");
 
    // --- Market-day counter init (mirrors ta.change(time("D"))) ---
    g_lastDailyBarTime = iTime(_Symbol, PERIOD_D1, 0);
@@ -439,8 +424,7 @@ int OnInit(void)
 
    Print("==============================================================");
    Print("  OTTO EA INITIALIZED SUCCESSFULLY");
-   Print("  Risk: ", (InpFixedRiskUSD > 0 ? ("$" + DoubleToString(InpFixedRiskUSD,2))
-                                          : (DoubleToString(RiskPercent,2) + "%")),
+   Print("  Risk: ", DoubleToString(RiskPercent,2), "% dynamic equity"
          " | DailyDD: ", SafetyDailyDDLimit, "% | TotalDD: ", SafetyTotalDDLimit, "%");
    Print("==============================================================");
 
@@ -505,138 +489,48 @@ void OnDeinit(const int reason)
   }
 
 //+------------------------------------------------------------------+
-//| US Eastern (New York) civil time, computed manually (v5.28).       |
-//|                                                                   |
-//| MQL5 has NO TimeDaylightSavings() helper, and TimeGMTOffset()      |
-//| reports the offset of the PC's timezone -- not New York's. So the   |
-//| DST rule is hard-coded: DST begins the 2nd Sunday of March at      |
-//| 02:00 EST (07:00 UTC) and ends the 1st Sunday of November at       |
-//| 02:00 EDT (06:00 UTC). These UTC instants are what make the calc    |
-//| independent of the host's own DST state.                            |
-//|                                                                   |
-//| NOTE: in the Strategy Tester TimeGMT() is forced to server time,    |
-//| so this is exact on a correctly-zoned live host only. OnInit logs   |
-//| the computed value so it can be eyeballed on the VPS.               |
+//| Daily reset clock: 00:00 MT5 server time (The5ers).               |
+//| No New York / UTC conversion -- server time is the basis.         |
 //+------------------------------------------------------------------+
 
-//| True when the given UTC instant falls in US Eastern DST.          |
-bool IsUsEasternDST(const datetime utcTime)
+//| Most recent 00:00 MT5 server-time boundary (server instant).     |
+datetime MostRecentServerMidnight(const datetime serverNow)
   {
-   MqlDateTime dt;
-   TimeToStruct(utcTime, dt);
-
-   if(dt.mon < 3 || dt.mon > 11)
-      return false;              // Jan/Feb/Dec: always EST
-   if(dt.mon > 3 && dt.mon < 11)
-      return true;               // Apr..Oct: always EDT
-
-   // Day-of-week of the 1st of this month, to find the first Sunday.
-   MqlDateTime first;
-   ZeroMemory(first);
-   first.year = dt.year;
-   first.mon  = dt.mon;
-   first.day  = 1;
-   MqlDateTime probe;
-   TimeToStruct(StructToTime(first), probe);
-   int firstSunday = 1 + ((7 - probe.day_of_week) % 7);
-
-   if(dt.mon == 3)
-     {
-      int secondSunday = firstSunday + 7;
-      // 02:00 EST == 07:00 UTC on the transition date.
-      return (dt.day > secondSunday)
-             || (dt.day == secondSunday && dt.hour >= 7);
-     }
-
-   // November: DST is over from 02:00 EDT == 06:00 UTC on the 1st Sunday.
-   return (dt.day < firstSunday)
-          || (dt.day == firstSunday && dt.hour < 6);
-  }
-
-//| UTC offset of New York, in seconds, at the given UTC instant.     |
-int NewYorkUtcOffsetSeconds(const datetime utcTime)
-  {
-   return IsUsEasternDST(utcTime) ? -14400 : -18000;   // EDT : EST
-  }
-
-//| Convert a UTC instant to New York civil time.                     |
-datetime UtcToNewYork(const datetime utcTime)
-  {
-   return (datetime)((long)utcTime + NewYorkUtcOffsetSeconds(utcTime));
-  }
-
-//| Most recent 17:00 New York boundary, returned as a UTC instant.    |
-//|                                                                   |
-//| The offset is resolved AT the boundary rather than from `utcNow`:  |
-//| within the 24h after a DST switch the two differ, and using the     |
-//| current offset would land the anchor one hour off -- i.e. exactly   |
-//| the class of bug this helper exists to remove. Two refinement       |
-//| passes are enough (the offset can only flip once).                  |
-datetime MostRecentNyRollover(const datetime utcNow)
-  {
-   datetime nyNow = UtcToNewYork(utcNow);
-
    MqlDateTime d;
-   TimeToStruct(nyNow, d);
+   TimeToStruct(serverNow, d);
    d.hour = 0;
    d.min  = 0;
    d.sec  = 0;
-   datetime nyBoundary = StructToTime(d) + 17 * 3600;   // 17:00 New York
-   if(nyNow < nyBoundary)
-      nyBoundary -= 86400;                              // roll back one day
-
-   datetime utcBoundary = (datetime)((long)nyBoundary - NewYorkUtcOffsetSeconds(utcNow));
-   for(int i = 0; i < 2; i++)
-      utcBoundary = (datetime)((long)nyBoundary - NewYorkUtcOffsetSeconds(utcBoundary));
-   return utcBoundary;
+   return StructToTime(d);
   }
 
 
 //+------------------------------------------------------------------+
-//| Checks the daily balance reset at the 17:00 New York close.       |
+//| Checks the daily reset at 00:00 MT5 server time (The5ers).        |
 //+------------------------------------------------------------------+
 void CheckDailyReset(void)
   {
-   // v5.28 — TRUE New York 5:00 PM rollover, DST-aware.
-   // FIX (v5.23) made this a stable timestamp rather than a per-tick one,
-   // but it anchored on iTime(PERIOD_D1,0), which is the BROKER's daily
-   // candle open. That equals 17:00 New York only if the server stamps D1
-   // in US Eastern time; on a GMT+2/+3 server it lands at 16:00-17:00 New
-   // York on a DIFFERENT DST schedule, so the daily budget was re-anchored
-   // at the wrong instant (and moved by an hour twice a year).
-   // The helper computes the boundary from UTC directly, so it no longer
-   // depends on the broker's server timezone at all.
-   datetime utcNow   = TimeGMT();
-   datetime boundary = MostRecentNyRollover(utcNow);
+   datetime serverNow = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(serverNow, dt);
+   dt.hour = 0;
+   dt.min  = 0;
+   dt.sec  = 0;
+   datetime midnightServer = StructToTime(dt);
 
-   // A 0 boundary means the conversion produced nothing usable; skip rather
-   // than trip a spurious reset (matches the v5.23 iTime==0 guard).
-   if(boundary == 0 || boundary == g_lastMidnightCheck)
+   if(midnightServer == 0 || midnightServer == g_lastMidnightCheck)
       return;
 
-   g_dailyResetBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
-   g_lastMidnightCheck  = boundary;
-   g_dailyDD_ResumeTime = 0;   // pause window ended with the session
-
+   g_dailyResetBalance  = AccountInfoDouble(ACCOUNT_EQUITY); // The5ers uses Equity at midnight
+   g_lastMidnightCheck  = midnightServer;
+   g_dailyDD_ResumeTime = 0;
    if(g_dailyDD_Paused)
      {
       g_dailyDD_Paused = false;
       if(EnableLogging)
-         Print("[Safety] New day (5:00 PM New York) — daily DD pause LIFTED");
+         Print("[Safety] New day (00:00 MT5 Server Time) — daily DD pause LIFTED");
      }
-
-   // FIX (v5.25): persist the new session baselines. Without this the
-   // GlobalVariables would still hold yesterday's anchor, and a restart
-   // after the rollover would restore a stale daily basis.
-   // NOTE: g_totalDD_Halted is deliberately NOT cleared here. The 5% trailing
-   // breach is permanent for the life of the account; only the daily pause is
-   // a per-session state. Clearing the halt on rollover would let a breached
-   // account resume trading at the next midnight.
    PersistSafetyState();
-
-   if(EnableLogging)
-      Print("[Safety] NY 17:00 rollover — daily DD budget re-anchored to ",
-            DoubleToString(g_dailyResetBalance, 2));
   }
 
 //+------------------------------------------------------------------+
@@ -774,12 +668,11 @@ void OnTick(void)
    if(!g_dailyDD_Paused && !g_totalDD_Halted)
      {
       double equity         = AccountInfoDouble(ACCOUNT_EQUITY);
-      double balance        = AccountInfoDouble(ACCOUNT_BALANCE);
 
       // FIX (v5.24): single equity high-water mark. The trailing total-DD limit
       // previously trailed the peak CLOSED balance; it now trails peak EQUITY,
-      // matching GFT's all-time-equity trailing drawdown and sharing one basis
-      // with the 1% floating rule. Only ratchets UP, never down.
+      // matching GFT's all-time-equity trailing drawdown. Only ratchets UP,
+      // never down.
       // FIX (v5.25): each new peak is persisted immediately, so a restart while
       // the account is down from its high resumes from the TRUE peak instead of
       // re-basing the trailing floor to the depressed live equity.
@@ -791,70 +684,6 @@ void OnTick(void)
 
       double dailyDD = (g_dailyResetBalance > 0) ? 100.0 * (g_dailyResetBalance - equity) / g_dailyResetBalance : 0;
       double totalDD = (g_equityHighWaterMark > 0) ? 100.0 * (g_equityHighWaterMark - equity) / g_equityHighWaterMark : 0;
-      // v5.28: (balance - equity) IS the live basket float. The previous
-      // peak-equity give-back measure fired whenever equity sat below its own
-      // high-water mark -- including with NO losing position open -- and then
-      // latched g_totalDD_Halted, killing the EA permanently on a normal tick.
-      // A float measure is the correct reading for a "max floating loss" rule:
-      // it is 0 whenever nothing is open, regardless of where the HWM sits.
-      double floatingLoss = (balance > 0 && equity < balance)
-                            ? 100.0 * (balance - equity) / balance
-                            : 0.0;
-
-      // v5.31: SMART TRIM before the full teardown. Closing only the
-      // non-primary tranches that are already >= 70% of the way to their own
-      // stop removes the legs that are nearest to hitting it anyway, without
-      // dumping the whole basket at the worst possible price. The primary is
-      // deliberately spared: it carries the basket's risk geometry and is the
-      // leg the trail manager is tracking.
-      // TrimHeavyLosers() returns true only when it could NOT act (no
-      // non-primary leg was past the threshold), in which case the full sweep
-      // below still runs and the 0.90% cap keeps being enforced every tick.
-      // When a tranche is trimmed the primary is deliberately left running
-      // under its own stop, so no full close follows -- closing everything
-      // anyway would make the trim pointless.
-      if(floatingLoss >= SafetyMaxFloatingLoss)
-        {
-         g_orderManager.CancelAllPendingOrders();
-         // Close the WHOLE basket: hedging-mode pyramid tranches are separate
-         // positions and must not survive the breach.
-         if(g_orderManager.HasActiveTrade() || g_orderManager.CountOpenPositions() > 0)
-           {
-            bool needFullClose = true;
-            if(InpTrimLoserStopPct > 0.0 && InpTrimLoserStopPct < 100.0)
-               needFullClose = g_tradeManager.TrimHeavyLosers(InpTrimLoserStopPct);
-
-            if(needFullClose)
-               g_orderManager.CloseEntireBasket("1% Max Floating Loss Breach");
-           }
-
-         Print("==============================================================");
-         Print("  [Safety] MAX FLOATING LOSS REACHED — SMART TRIM APPLIED");
-         Print("  Balance: ", DoubleToString(balance, 2),
-               " | Equity: ", DoubleToString(equity, 2),
-               " | Floating Loss: ", DoubleToString(floatingLoss, 2), "% >= ",
-               DoubleToString(SafetyMaxFloatingLoss, 2), "%");
-         Print("==============================================================");
-         // v5.28: return for THIS tick only. No halt latch is set, so scanning
-         // resumes on the next tick. Returning here (rather than falling
-         // through) prevents the same tick from immediately re-placing the
-         // orders just cancelled; by the next tick equity ~= balance once the
-         // basket is flat, so floatingLoss reads 0 and normal work continues.
-         // v5.31 NOTE: a partial trim leaves a live position and therefore a
-         // non-zero float, so this branch CAN legitimately re-enter on a later
-         // tick. TrimHeavyLosers() is latched one-shot per breach, so the
-         // re-entry neither re-trims nor re-logs; it returns false and the
-         // trimmed basket keeps running under its own stop. The latch clears
-         // as soon as the float is back under the cap (ClearTrimLatch below),
-         // which re-arms the trim for the NEXT excursion.
-         return;
-        }
-
-      // v5.31: float is back under the cap (or nothing was open at all), so
-      // release the smart-trim one-shot latch. Without this the latch would
-      // outlive its breach and the first breach of a LATER basket would skip
-      // its trim. Mirrors the v5.30 priceAbortLogged reset on the clear path.
-      g_tradeManager.ClearTrimLatch();
 
       // 3% Max Daily Drawdown (soft breach: pause new orders only)
       if(dailyDD >= SafetyDailyDDLimit)

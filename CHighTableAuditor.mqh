@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.43"
+#property version   "5.44"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -70,10 +70,8 @@ private:
    //| condition is observed healthy again -- so one incident produces   |
    //| exactly one email, and the NEXT incident emails again.            |
    //+------------------------------------------------------------------+
-   bool              m_alertSent_TrimFailure;        // smart trim could not act
    bool              m_alertSent_DailyDDBreach;      // daily DD soft breach
    bool              m_alertSent_TotalDDBreach;      // total DD hard breach
-   bool              m_alertSent_FloatingLossCap;    // floating-loss cap hit
    bool              m_alertSent_Halt;               // permanent halt latched
    bool              m_alertSent_OrderRejectSpike;   // broker reject burst
    bool              m_alertSent_StopModifyFailure;  // SL modify rejected
@@ -266,140 +264,6 @@ private:
       return false;
      }
 
-   //+------------------------------------------------------------------+
-   //| Primary-leg identification (read-only, comment-derived).          |
-   //|                                                                   |
-   //| The auditor cannot ask COttoOrderManager which ticket is the      |
-   //| primary, but it does not need to: BuildOrderComment() appends     |
-   //| "_T<n>" ONLY for n > 1 (COttoOrderManager.mqh:419). The primary   |
-   //| tranche is therefore exactly the leg whose comment carries no     |
-   //| "_T" suffix -- a free, stable, read-only identifier that requires |
-   //| no new state and no new field on SActiveTrade.                    |
-   //|                                                                   |
-   //| FAIL-SAFE DIRECTION: if the format ever changes so that NO leg    |
-   //| looks like a primary, every leg is treated as primary and the     |
-   //| trim check finds nothing to have missed -- it under-reports       |
-   //| rather than inventing a TrimFailure.                              |
-   //+------------------------------------------------------------------+
-   bool              CommentHasTrancheSuffix(const string c) const
-     {
-      int len = StringLen(c);
-      if(len < 3) return false;               // too short to end in "_T<n>"
-      // Scan back over the trailing digits, then require the literal "_T"
-      // immediately before them. "_T" must be a real suffix: a bare 'T' in
-      // the middle of an ID (e.g. "...-BLKT3") must not match.
-      int i = len - 1;
-      int digits = 0;
-      while(i >= 0)
-        {
-         ushort ch = (ushort)StringGetCharacter(c, i);
-         if(ch < '0' || ch > '9') break;
-         digits++;
-         i--;
-        }
-      if(digits < 1) return false;
-      if(i < 1) return false;
-      if(StringGetCharacter(c, i)     != 'T') return false;
-      if(StringGetCharacter(c, i - 1) != '_') return false;
-      return true;
-     }
-
-   bool              IsPrimaryLeg(void) const
-     {
-      string c = PositionGetString(POSITION_COMMENT);
-      return !CommentHasTrancheSuffix(c);
-     }
-
-   //+------------------------------------------------------------------+
-   //| A pure-function mirror of COttoTradeManager's trim filter.        |
-   //|                                                                   |
-   //| This is a DELIBERATE, documented duplication of the qualification |
-   //| maths in WalkTrimLegs() (COttoTradeManager.mqh:134-186). The      |
-   //| auditor cannot call that method -- WalkTrimLegs is private and    |
-   //| taking a COttoTradeManager reference would breach the no-pointer  |
-   //| contract -- so the filter is mirrored here and must be kept in    |
-   //| step by hand. The constant that matters is referenced by NAME     |
-   //| (the live InpTrimLoserStopPct input, not a hardcoded 70.0), so a  |
-   //| retune moves both copies at once and only a change to the         |
-   //| STRUCTURE of the formula could ever cause drift.                  |
-   //|                                                                   |
-   //| Counts legs that are (a) ours, (b) not the primary, (c) have a    |
-   //| usable stop, and (d) have travelled >= trimPct% of the way to     |
-   //| that stop. That count is what tells the auditor whether the       |
-   //| trim had something it COULD have closed.                          |
-   //|                                                                   |
-   //| KNOWN LIMITATION (accepted): the real filter also clamps each     |
-   //| leg's stop against the basket's session SL, which is private to   |
-   //| the order manager and unknown here. An unclamped comparison can   |
-   //| only ever UNDER-count qualified legs -- so this may miss a        |
-   //| TrimFailure after a rejected ApplyUnifiedSL, but it can never     |
-   //| raise a false one. Under-reporting is the safe direction.         |
-   //|                                                                   |
-   //| FALLBACK: the primary leg is identified by the pushed ticket      |
-   //| (the same identifier WalkTrimLegs uses). Only before the first    |
-   //| push arrives does this fall back to the comment-suffix rule,      |
-   //| which is itself fail-safe: an unrecognised comment format makes   |
-   //| every leg look primary, so nothing qualifies and the count is 0.  |
-   //+------------------------------------------------------------------+
-   int               CountTrimmableLegs(double trimPct) const
-     {
-      int qualified = 0;
-      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
-        {
-         if(PositionGetTicket(idx) <= 0) continue;
-         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
-
-         // Exclude the primary exactly as WalkTrimLegs does: it skips
-         // `ticket == m_orderManager.GetActiveTrade().ticket`, and that
-         // ticket is pushed to us verbatim. Using the SAME identifier is
-         // what keeps this mirror faithful -- a comment-derived primary
-         // could disagree with the manager's belief and quietly skew the
-         // count in either direction.
-         ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
-         if(m_trackedPrimary > 0)
-           {
-            if(ticket == 0 || ticket == m_trackedPrimary) continue;
-           }
-         else if(IsPrimaryLeg()) continue;   // no push yet: see fallback note
-
-         bool   isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-         double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
-         double sl     = PositionGetDouble(POSITION_SL);
-         if(sl <= 0.0) continue;
-
-         double total = isLong ? (entry - sl) : (sl - entry);
-         if(total <= 0.0) continue;
-
-         double mark  = isLong ? SymbolInfoDouble(m_symbol, SYMBOL_BID)
-                               : SymbolInfoDouble(m_symbol, SYMBOL_ASK);
-         double moved = isLong ? (entry - mark) : (mark - entry);
-         if(moved < (trimPct / 100.0) * total) continue;
-         qualified++;
-        }
-      return qualified;
-     }
-
-   //+------------------------------------------------------------------+
-   //| Drawdown measures, in PERCENT units, matching otto.mq5 exactly.   |
-   //|                                                                   |
-   //| otto.mq5:734-736 computes 100.0*(balance-equity)/balance against  |
-   //| SafetyMaxFloatingLoss (0.90), and :726-727 compute the daily and  |
-   //| trailing-total measures against SafetyDailyDDLimit (3.0) and      |
-   //| SafetyTotalDDLimit (5.0). All three are PERCENT values. The       |
-   //| 0.0090-fraction idiom belongs to a different rule shape; mixing   |
-   //| the two units here would make the auditor disagree with the EA    |
-   //| about the very breach it is reporting on, so the comparisons      |
-   //| below deliberately use the percent form throughout.               |
-   //+------------------------------------------------------------------+
-   double            FloatingLossPct(void) const
-     {
-      double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
-      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      if(balance <= 0.0 || equity >= balance) return 0.0;
-      return 100.0 * (balance - equity) / balance;
-     }
-
    double            DailyDDPct(void) const
      {
       double equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -441,10 +305,8 @@ public:
       m_equityHwm              = 0.0;
       m_totalHalted            = false;
       m_haveBaseline           = false;
-      m_alertSent_TrimFailure        = false;
       m_alertSent_DailyDDBreach      = false;
       m_alertSent_TotalDDBreach      = false;
-      m_alertSent_FloatingLossCap    = false;
       m_alertSent_Halt               = false;
       m_alertSent_OrderRejectSpike   = false;
       m_alertSent_StopModifyFailure  = false;
@@ -544,9 +406,9 @@ public:
    //| v5.33 adoptsManual: TRUE when the primary is a magic-0 position the  |
    //| operator opened by hand and the order layer adopted. This matters    |
    //| because EVERY book read in this class is magic-scoped -- see         |
-   //| CountBookLegs(), BookHasTicket() and CountTrimmableLegs(), each of   |
-   //| which requires POSITION_MAGIC == m_magic. An adopted leg carries     |
-   //| magic 0, so it is invisible to all three by construction. The flag   |
+   //| CountBookLegs() and BookHasTicket(), each of which requires         |
+   //| POSITION_MAGIC == m_magic. An adopted leg carries magic 0, so the    |
+   //| book reads are blind to it by construction. The flag                  |
    //| is therefore the ONLY way the phantom test can distinguish "the      |
    //| trail is managing a ticket that no longer exists" from "the trail is |
    //| managing a live manual leg the book is not allowed to count".        |
@@ -676,8 +538,7 @@ public:
      {
       if(!m_ready) return;
 
-      AuditTrimHealth();        // PART 2 - smart-trim outcome
-      AuditDrawdown();          // PART 2 - daily / total / floating DD
+      AuditDrawdown();          // PART 2 - daily / total DD
       AuditOrderHealth();       // PART 2 - rejects + SL modify failures
       AuditStateConsistency();  // PART 2 - book vs tracked basket
 
@@ -689,7 +550,7 @@ public:
    datetime          GetLastAudit(void)        const { return m_lastAudit; }
 
    //+------------------------------------------------------------------+
-   //| PART 2 - the four observation bodies.                             |
+   //| PART 2 - the three observation bodies.                            |
    //|                                                                   |
    //| Each body is self-contained, purely observational, and dispatches |
    //| at most one LATCHED alert. The latch lifecycle is uniform: raise  |
@@ -697,52 +558,12 @@ public:
    //| healthy again, so one incident produces exactly one email and the |
    //| next incident emails again.                                       |
    //|                                                                   |
-   //| Every threshold is the LIVE input, never a literal, and all three |
-   //| drawdown comparisons are in PERCENT units to match otto.mq5.      |
+   //| Every threshold is the LIVE input, never a literal, and the daily |
+   //| and trailing-total comparisons are in PERCENT units to match      |
+   //| otto.mq5.                                                         |
    //+------------------------------------------------------------------+
-   void              AuditTrimHealth(void)
-     {
-      // The breach that arms the smart trim, read exactly as otto.mq5
-      // reads it (percent, against the live 0.90% cap).
-      double floatingLoss = FloatingLossPct();
-      if(floatingLoss < SafetyMaxFloatingLoss)
-        {
-         ClearLatch(m_alertSent_TrimFailure);
-         return;
-        }
-
-      // The cap is breached and otto.mq5 has run TrimHeavyLosers() on this
-      // very tick. Any non-primary leg still standing that the trim's own
-      // filter would have qualified is therefore a leg the trim TRIED and
-      // FAILED to close -- the whole point of the 0.90% cap is that those
-      // legs do not survive it.
-      int trimmable = CountTrimmableLegs(InpTrimLoserStopPct);
-      if(trimmable > 0)
-         DispatchAlertOnce(m_alertSent_TrimFailure,
-                           "HighTable: smart trim could not act",
-                           "Floating loss " + DoubleToString(floatingLoss, 2) +
-                           "% >= cap " + DoubleToString(SafetyMaxFloatingLoss, 2) +
-                           "% and " + IntegerToString(trimmable) +
-                           " non-primary leg(s) remain past " +
-                           DoubleToString(InpTrimLoserStopPct, 1) +
-                           "% of the way to their stop. The trim could not close them.");
-      else
-         ClearLatch(m_alertSent_TrimFailure);
-     }
-
    void              AuditDrawdown(void)
      {
-      // --- Floating-loss cap (no baseline needed: it is a balance/equity
-      //     ratio, readable on any tick, exactly as otto.mq5 reads it) ---
-      double floatingLoss = FloatingLossPct();
-      if(floatingLoss >= SafetyMaxFloatingLoss)
-         DispatchAlertOnce(m_alertSent_FloatingLossCap,
-                           "HighTable: floating-loss cap breached",
-                           "Floating loss " + DoubleToString(floatingLoss, 2) +
-                           "% >= " + DoubleToString(SafetyMaxFloatingLoss, 2) + "%");
-      else
-         ClearLatch(m_alertSent_FloatingLossCap);
-
       // --- Permanent halt. PUSHED, because the halt flag can survive a
       //     restart in a GlobalVariable and be set before OnTick ever
       //     reaches the safety block. DELIBERATELY NEVER CLEARED: the halt
