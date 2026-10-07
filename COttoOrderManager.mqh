@@ -318,7 +318,13 @@ private:
          attempts++;
          request.deviation = MaxSlippage;
          request.magic     = MagicNumber;
-         request.comment   = BuildOrderComment(0, 0);   // v5.27: session ID, clamped to 31
+         // v5.37 -- preserve a caller-supplied comment instead of
+         // unconditionally overwriting it. The virtual engine now stamps an
+         // N/R phase tag plus session ID on its request before calling here,
+         // and OrderSend() reads this field on every retry of the loop, so the
+         // guard must live inside the loop. Only a blank comment is defaulted.
+         if(request.comment == "")
+            request.comment = BuildOrderComment(0, 0);
          request.type_filling = GetFillingMode();   // dynamic FOK/IOC/RETURN
          ResetLastError();
          if(OrderSend(request, result))
@@ -1890,6 +1896,21 @@ public:
          if(!SentimentPasses(blocks[bi])) continue;
          if(m_blockManager.IsBlockedByPrimary(bi)) continue;
 
+         // v5.37 -- N/R PHASE TAG. A block serial executes at most twice: its
+         // FIRST fill (touches == 0) is the Phase 1 "N"ormal bounce, its
+         // SECOND (touches >= 1) the Phase 2 "R"eversal. The one-letter marker
+         // rides in the broker comment, and the SAME session ID names the
+         // journal file, so the terminal row, the journal and the emailed log
+         // all share a single identifier. Minted HERE (before the send) so the
+         // comment and the journal cannot disagree if the fill path re-mints.
+         string phaseType = (blocks[bi].touches == 0) ? "N" : "R";
+         MqlDateTime ntm;
+         TimeToStruct(TimeCurrent(), ntm);
+         string newSessionId = StringFormat("#OTTO-%s-%04d%02d%02d-%02d%02d%02d-BLK%d",
+                                            m_symbol, ntm.year, ntm.mon, ntm.day,
+                                            ntm.hour, ntm.min, ntm.sec, blocks[bi].serial);
+         if(m_journal != NULL) m_journal.SetSessionID(newSessionId);
+
          // --- Build the MARKET request (DEAL, not PENDING) ---
          MqlTradeRequest request;
          MqlTradeResult  result;
@@ -1904,7 +1925,10 @@ public:
          request.tp        = 0;                     // NO TP - Pine trail-only exits
          request.deviation = MaxSlippage;
          request.magic     = MagicNumber;
-         request.comment   = BuildOrderComment(0, 0);
+         // N/R + session marker, clamped to the MT5 31-char limit. The same
+         // string is already the journal session ID set above, so the terminal
+         // row and the journal agree without a second source of truth.
+         request.comment   = ClampOrderComment(newSessionId + "_" + phaseType);
 
          // Optimistic one-shot lock (mirrors PlaceLimitOrder). Prevents a
          // concurrent tick or a requote retry from firing this order twice.
@@ -1914,6 +1938,20 @@ public:
 
          if(!SendOrderWithRetry(request, result))
            {
+            // v5.37 -- BROKER REJECTION LOG. SendOrderWithRetry() has already
+            // bumped m_ordersRejected and printed the retcode for this fatal
+            // path; this adds the full broker context (raw result.comment,
+            // symbol, side, price and stop) so a rejected virtual trigger can
+            // be diagnosed from the journal alone. The one-shot latch below is
+            // left SET (see the FIX note) -- keep this print side-effect-free.
+            if(EnableLogging)
+               Print("[OrderManager] VIRTUAL REJECTED phase=", phaseType,
+                     " session=", newSessionId,
+                     " retcode=", result.retcode, " (", GetTradeRetcodeString(result.retcode), ")",
+                     " broker=", result.comment,
+                     " sym=", m_symbol, " side=", (isLong ? "LONG" : "SHORT"),
+                     " price=", DoubleToString(request.price, _Digits),
+                     " sl=", DoubleToString(request.sl, _Digits));
             // FIX (v5.37): keep the one-shot latch SET. Clearing it here made
             // the still-armed block eligible for PlaceLimitOrder(), whose only
             // duplicate guard is "if(block.hasPlacedOrder) return false;" - so
@@ -1991,17 +2029,10 @@ public:
          if(block.touches == 1)
             m_blockManager.SyncReversalCluster(bi);
 
-         // Journal the entry under its own session ID, then seed the basket.
-         if(m_journal != NULL)
-           {
-            MqlDateTime ptm;
-            TimeToStruct(TimeCurrent(), ptm);
-            string pts = StringFormat("%04d%02d%02d-%02d%02d%02d",
-                                      ptm.year, ptm.mon, ptm.day,
-                                      ptm.hour, ptm.min, ptm.sec);
-            m_journal.SetSessionID(StringFormat("#OTTO-%s-%s-BLK%d",
-                                                m_symbol, pts, block.serial));
-           }
+         // The session ID was minted before the send (so the N/R comment and
+         // the journal agreed); SeedActiveTradeFromBlock() -> InitBasket()
+         // reuses it via the m_journal lookup, so no re-mint is needed here.
+         if(m_journal != NULL) m_journal.SetSessionID(newSessionId);
 
          SeedActiveTradeFromBlock(block, result.order);
          m_ordersFilled++;

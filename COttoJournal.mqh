@@ -192,6 +192,12 @@ public:
       W("    - Separation  : " + (blk.vetoReason==VETO_NO_SEPARATION?"FAILED":"PASSED"));
       W("================================================================");
       CloseHandle();
+      // v5.37 -- email the entry log, mirroring LogExit()/LogCancellation().
+      // Without this the entry record was written to disk but never sent, so
+      // the [ACTIVE] entry email that the exit email refers back to never
+      // arrived. SendMailFromFile() picks the subject from line[0] and falls
+      // back to the CANCELLED_<name> payload when the session was renamed.
+      SendMailFromFile();
      }
 
    void              LogPyramid(int tranche, ulong ticket, double entry, double size, double riskPct, double groupSL)
