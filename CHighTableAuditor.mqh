@@ -84,6 +84,7 @@ private:
    // here, next to its peers, where the constructor assignment binds to
    // the member it names.
    bool              m_alertSent_StateInconsistency; // book vs tracked state
+   bool              m_alertSent_RiskBreach;        // position risk exceeded allowance
 
    //+------------------------------------------------------------------+
    //| PART 2 - pushed observation state.                                |
@@ -311,6 +312,7 @@ public:
       m_alertSent_OrderRejectSpike   = false;
       m_alertSent_StopModifyFailure  = false;
       m_alertSent_StateInconsistency = false;
+      m_alertSent_RiskBreach         = false;
      }
                     ~CHighTableAuditor(void) { }
 
@@ -541,6 +543,7 @@ public:
       AuditDrawdown();          // PART 2 - daily / total DD
       AuditOrderHealth();       // PART 2 - rejects + SL modify failures
       AuditStateConsistency();  // PART 2 - book vs tracked basket
+      AuditRiskExposure();      // PART 2 - dynamic position risk audit
 
       m_lastAudit = TimeCurrent();
      }
@@ -550,7 +553,7 @@ public:
    datetime          GetLastAudit(void)        const { return m_lastAudit; }
 
    //+------------------------------------------------------------------+
-   //| PART 2 - the three observation bodies.                            |
+   //| PART 2 - the four observation bodies.                             |
    //|                                                                   |
    //| Each body is self-contained, purely observational, and dispatches |
    //| at most one LATCHED alert. The latch lifecycle is uniform: raise  |
@@ -718,6 +721,75 @@ public:
                                    " total above; the ticket itself is gone from"
                                    " the symbol book."
                                  : ""));
+     }
+
+   //+------------------------------------------------------------------+
+   //| AuditRiskExposure - independent position risk audit.              |
+   //|                                                                   |
+   //| Reads the terminal book directly, never the order layer, so it    |
+   //| measures the risk that ACTUALLY exists rather than the risk the   |
+   //| sizing code believes it wrote. That gap is the whole point: the   |
+   //| dynamic sizer targets RiskPercent% of live equity, but volume-step|
+   //| rounding, a minimum-lot clamp or a stale stop can leave a leg     |
+   //| carrying materially more than the target.                        |
+   //|                                                                   |
+   //| 35% tolerance absorbs volume-step / tick quantization: a single   |
+   //| tick is the smallest quantum in both the distance and the money   |
+   //| conversion, so a legitimate leg can read a few percent high and   |
+   //| must not be reported as a breach.                                 |
+   //+------------------------------------------------------------------+
+   void              AuditRiskExposure(void)
+     {
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(equity <= 0.0) return;
+
+      double tickSize  = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+      double tickValue = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_VALUE);
+      if(tickSize <= 0.0 || tickValue <= 0.0) return;
+
+      // Allow a 35% tolerance buffer over RiskPercent to absorb volume step / tick quantization
+      double maxAllowedRiskPct = RiskPercent * 1.35;
+      double peakRiskPct = 0.0;
+      ulong  peakTicket  = 0;
+
+      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
+        {
+         if(PositionGetTicket(idx) <= 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
+
+         double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+         double sl    = PositionGetDouble(POSITION_SL);
+         double vol   = PositionGetDouble(POSITION_VOLUME);
+
+         if(sl <= 0.0) continue;
+
+         double distPts     = MathAbs(entry - sl) / tickSize;
+         double moneyAtRisk = distPts * tickValue * vol;
+         double posRiskPct  = (moneyAtRisk / equity) * 100.0;
+
+         if(posRiskPct > peakRiskPct)
+           {
+            peakRiskPct = posRiskPct;
+            peakTicket  = (ulong)PositionGetInteger(POSITION_TICKET);
+           }
+        }
+
+      if(peakRiskPct > maxAllowedRiskPct)
+        {
+         DispatchAlertOnce(m_alertSent_RiskBreach,
+                           "HighTable: position risk breach",
+                           "Ticket #" + IntegerToString((long)peakTicket) +
+                           " risk is " + DoubleToString(peakRiskPct, 2) +
+                           "% of equity, exceeding allowance " +
+                           DoubleToString(maxAllowedRiskPct, 2) + "% (Target: " +
+                           DoubleToString(RiskPercent, 2) + "%).",
+                           HT_SEV_WARN);
+        }
+      else
+        {
+         ClearLatch(m_alertSent_RiskBreach);
+        }
      }
   };
 #endif  // __OTTO_HIGH_TABLE_AUDITOR__
