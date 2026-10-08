@@ -118,7 +118,8 @@ private:
      }
 
    // Emails the whole session file (line[0] = subject).
-   // After a cancellation rename, the payload lives under the CANCELLED_ prefix.
+   // Called ONLY by LogExit(): cancellation no longer emails, so the
+   // CANCELLED_ fallback read below is retained but no longer reached.
    void              SendMailFromFile(void)
      {
       if(!m_ready) return;
@@ -183,8 +184,8 @@ public:
       CloseHandle();
       // v5.42: NO email here. Arming a setup is an intermediate lifecycle
       // stage, not a session endpoint, so this write stays silent on disk.
-      // Only LogExit() and LogCancellation() ship the aggregated session
-      // file; every earlier append simply accumulates into it.
+      // Only LogExit() ships the aggregated session file; every earlier
+      // append simply accumulates into it.
      }
    void              LogEntry(ulong ticket, ENUM_TRADE_DIRECTION dir, double entryPrice, double slPrice, double lotSize, double riskMoney, const SSniperBlock &blk)
      {
@@ -218,7 +219,7 @@ public:
       CloseHandle();
       // v5.42: NO email here. A fill is an intermediate lifecycle stage, not
       // a session endpoint, so this write stays silent on disk. Only
-      // LogExit() and LogCancellation() ship the aggregated session file.
+      // LogExit() ships the aggregated session file.
      }
 
    void              LogPyramid(int tranche, ulong ticket, double entry, double size, double riskPct, double groupSL)
@@ -322,13 +323,16 @@ public:
          Print("[Journal] FileMove FAILED (err=", err, ") for ", fname, " -> ", cancelledName);
         }
 
-      SendMailFromFile();
+      // NO email here: routine block vetoes and setup cancels would otherwise
+      // spam the operator's mailbox; the full detail is already preserved on
+      // disk under the CANCELLED_ prefix above. Only a closed trade exit
+      // (LogExit) ships a Trade Summary email.
      }
 
    //+----------------------------------------------------------------+
    //| LOG CONVERSION (v5.36) - Phase 1 dropped for Phase 2 Reversal  |
    //| Appends a conversion notice to the session journal. v5.42: no  |
-   //| longer emails -- only LogExit()/LogCancellation() send mail.   |
+   //| longer emails -- LogExit() is the only sender.                 |
    //| Unlike LogCancellation() this does NOT rename the session file |
    //| to CANCELLED_ : the setup is still live, merely re-phased.     |
    //+----------------------------------------------------------------+
@@ -348,7 +352,7 @@ public:
       W("================================================================");
       CloseHandle();
       // v5.42: NO email here. A re-phase is an intermediate lifecycle stage,
-      // not a session endpoint -- only LogExit() and LogCancellation() ship
+      // not a session endpoint -- LogExit() is the only writer that ships
       // the aggregated session file.
      }
   };

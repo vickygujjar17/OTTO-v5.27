@@ -6,10 +6,12 @@ session-file email per trade, sent only at a terminal lifecycle moment. Every
 intermediate stage writes to disk silently and accumulates into the same
 journal file that the terminal writer ships.
 
-  1. EXACTLY TWO SENDERS. COttoJournal::SendMailFromFile() is called from
-     exactly two places -- LogExit() and LogCancellation() -- and nowhere else
-     in the shipped sources. The count is pinned so a future edit that
-     reintroduces an intermediate mail fails the build gate.
+  1. EXACTLY ONE SENDER. COttoJournal::SendMailFromFile() is called from
+     exactly one place -- LogExit() -- and nowhere else in the shipped
+     sources. Cancellation no longer emails: routine block vetoes and setup
+     cancels preserve their full detail on disk under the CANCELLED_ prefix
+     but must not reach the operator's mailbox. The count is pinned so a
+     future edit that reintroduces a non-exit mail fails the build gate.
 
   2. INTERMEDIATE WRITERS STAY SILENT. LogSetupArmed() (the arm snapshot) and
      LogEntry() (the fill record) still write their SUBJECT + body and close
@@ -19,9 +21,10 @@ journal file that the terminal writer ships.
      reversal) writes its notice but does NOT email -- it is a re-phase, not a
      session endpoint.
 
-  4. TERMINAL WRITERS STILL SEND, AFTER CloseHandle(). Both LogExit() and
-     LogCancellation() keep the SendMailFromFile() call positioned after
-     CloseHandle(), so the read-back never races a writer holding the lock.
+  4. THE TERMINAL WRITER STILL SENDS, AFTER CloseHandle(). LogExit() keeps
+     the SendMailFromFile() call positioned after CloseHandle(), so the
+     read-back never races a writer holding the lock. LogCancellation() keeps
+     its rename-after-close order but deliberately ships no mail.
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -98,14 +101,14 @@ CONV = func_body(JRN_T, r"void\s+LogConversion\s*\(")
 
 
 # ----------------------------------------------------------------------
-# 1. Exactly two senders, both terminal
+# 1. Exactly one sender, and it is terminal
 # ----------------------------------------------------------------------
-print("\n-- Exactly two terminal senders --")
+print("\n-- Exactly one terminal sender --")
 
 # Count call sites (the trailing ';') across the whole journal, so the
 # definition line ('...SendMailFromFile(void)') is not counted.
 calls = len(re.findall(r"SendMailFromFile\s*\(\s*\)\s*;", JRN_T))
-check("journal has exactly two SendMailFromFile() call sites", calls == 2,
+check("journal has exactly one SendMailFromFile() call site", calls == 1,
       "found %d" % calls)
 
 # ...and none anywhere else in the tree.
@@ -116,8 +119,8 @@ check("no SendMailFromFile() call outside COttoJournal.mqh", other == 0,
 
 check("LogExit() is a sender",
       EXIT is not None and "SendMailFromFile();" in EXIT)
-check("LogCancellation() is a sender",
-      CANCEL is not None and "SendMailFromFile();" in CANCEL)
+check("LogCancellation() is NOT a sender (no cancellation email spam)",
+      CANCEL is not None and "SendMailFromFile" not in CANCEL)
 
 
 # ----------------------------------------------------------------------
@@ -147,16 +150,16 @@ check("LogConversion() does NOT email", CONV is not None and "SendMailFromFile" 
 
 
 # ----------------------------------------------------------------------
-# 4. Terminal sends happen after CloseHandle()
+# 4. The terminal send happens after CloseHandle()
 # ----------------------------------------------------------------------
-print("\n-- Terminal sends after CloseHandle() --")
+print("\n-- Terminal send after CloseHandle() --")
 
 if EXIT is not None:
     check("LogExit() sends after CloseHandle()",
           EXIT.find("CloseHandle();") < EXIT.find("SendMailFromFile();"))
 if CANCEL is not None:
-    check("LogCancellation() sends after CloseHandle()",
-          CANCEL.find("CloseHandle();") < CANCEL.find("SendMailFromFile();"))
+    check("LogCancellation() still closes the handle before the rename",
+          CANCEL.find("CloseHandle();") < CANCEL.find("FileMove("))
 
 
 # ----------------------------------------------------------------------

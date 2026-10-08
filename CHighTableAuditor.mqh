@@ -30,6 +30,14 @@
 // than inlined so the threshold is greppable and tunable in one place.
 #define HT_REJECT_BURST  3
 
+// A single SHARED cooldown caps the mailbox, not any one incident. Every
+// email actually sent on EITHER dispatch path pushes the next permitted
+// message 1800s out, so a burst of DISTINCT violations landing on one audit
+// cycle produces one email plus a set of CSV rows -- never one email each.
+// Zero emails are sent while the system is healthy, because a healthy cycle
+// raises no alert in the first place.
+#define HT_EMAIL_COOLDOWN_SECONDS  1800 // 30 minutes
+
 //+------------------------------------------------------------------+
 //| CHighTableAuditor                                                 |
 //|                                                                   |
@@ -59,6 +67,7 @@ private:
    long              m_dispatched;      // alerts actually raised (post-latch)
    long              m_suppressed;      // repeats absorbed by a live latch
    datetime          m_lastAudit;       // last completed audit cycle
+   datetime          m_lastEmailSent;   // cooldown tracker for error emails
 
    //+------------------------------------------------------------------+
    //| One-shot incident latches.                                        |
@@ -288,6 +297,10 @@ public:
       m_dispatched = 0;
       m_suppressed = 0;
       m_lastAudit  = 0;
+      // Mailbox cooldown stamp. Deliberately NOT reset by Initialize(): a
+      // timeframe or parameter reload must not reopen the window and let a
+      // still-parked violation mail a second time.
+      m_lastEmailSent = 0;
       // Part 2 pushed state. Every counter starts at zero so the FIRST
       // pushed fact is always observed as a delta from a known baseline,
       // and the "seen" values start AT zero so the very first cycle does
@@ -457,12 +470,20 @@ public:
    //+------------------------------------------------------------------+
    void              DispatchAlert(string subject, string message)
      {
+      bool canEmail = (TimeCurrent() - m_lastEmailSent >= HT_EMAIL_COOLDOWN_SECONDS);
       bool emailed = false;
       if(!(bool)MQLInfoInteger(MQL_TESTER))
         {
-         emailed = SendMail(subject, message);
-         if(!emailed)
-            Print("[HighTable] SendMail FAILED err=", GetLastError(), " subj=", subject);
+         if(canEmail)
+           {
+            emailed = SendMail(subject, message);
+            if(emailed)
+               m_lastEmailSent = TimeCurrent();
+            else
+               Print("[HighTable] SendMail FAILED err=", GetLastError(), " subj=", subject);
+           }
+         else if(EnableLogging)
+            Print("[HighTable] email throttled (<30m since last email; CSV only): ", subject);
         }
       else if(EnableLogging)
          Print("[HighTable] tester mode - email suppressed (CSV only): ", subject);
@@ -494,6 +515,12 @@ public:
    void              DispatchAlertOnce(bool &latch, string subject, string message,
                                        string severity = HT_SEV_CRITICAL)
      {
+      // Global 30-minute cooldown, evaluated BEFORE the latch branch: the
+      // throttle is a property of the MAILBOX, not of any one incident. A
+      // burst of DISTINCT violations landing on one audit cycle therefore
+      // produces one email plus CSV rows -- never one email each.
+      bool canEmail = (TimeCurrent() - m_lastEmailSent >= HT_EMAIL_COOLDOWN_SECONDS);
+
       if(latch)
         {
          m_suppressed++;
@@ -508,9 +535,16 @@ public:
       bool emailed = false;
       if(!(bool)MQLInfoInteger(MQL_TESTER))
         {
-         emailed = SendMail(subject, message);
-         if(!emailed)
-            Print("[HighTable] SendMail FAILED err=", GetLastError(), " subj=", subject);
+         if(canEmail)
+           {
+            emailed = SendMail(subject, message);
+            if(emailed)
+               m_lastEmailSent = TimeCurrent();
+            else
+               Print("[HighTable] SendMail FAILED err=", GetLastError(), " subj=", subject);
+           }
+         else if(EnableLogging)
+            Print("[HighTable] email throttled (<30m since last email; CSV only): ", subject);
         }
       else if(EnableLogging)
          Print("[HighTable] tester mode - email suppressed (CSV only): ", subject);
