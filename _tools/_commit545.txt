@@ -1,0 +1,51 @@
+545: version stamp — bump all release stamps to 5.45
+
+Standing rule: EVERY source change bumps the release stamp. The previous
+commit (c6a0c54, "throttle error emails to 30 min cooldown and remove
+cancellation email spam") changed shipped behaviour without touching the
+version, so the tree was still advertising v5.44 while running code the
+v5.44 stamp never described. This commit closes that gap.
+
+No logic changes. A pure release stamp, so the 5.44 -> 5.45 boundary lines
+up with the throttle/silence change that landed in c6a0c54.
+
+20 human-facing version rows rewritten across 12 files:
+
+  * #property version   "5.44" -> "5.45"  (otto.mq5 + all 10 .mqh headers)
+  * otto.mq5 file banner  "Pine Script Master Build Port (v5.44)"
+  * otto.mq5 startup      Print("  OTTO EA v5.44 ... INITIALIZING")
+  * OttoDefines.mqh       module banner "OTTO EA v5.44 ..."
+  * OttoDefines.mqh       #property description "OTTO v5.44 ..."
+  * OttoDefines.mqh       input groups [9] [10] [11] [12] release stamps
+  * README.md             "**Current base: v5.45**"
+
+TOOLING
+
+_tools/_bump_version.py is a NEW generic replacement for the per-release
+_bumpNNN.py scripts. Instead of hardcoding the from/to pair it auto-detects
+the live release from OttoDefines.mqh, so the anchors can never rot into dead
+strings, and it exits non-zero while ANY old-release literal survives in the
+shipped sources or docs -- a partial bump is worse than no bump.
+
+Historical annotations naming the release a feature LANDED in (`// v5.3x:`
+notes, `FIX (vX)` markers) are deliberately untouched: any line containing
+`FIX (` is skipped outright and every pattern is anchored on a human-facing
+prefix rather than on the version number alone.
+
+VERIFICATION
+
+  * build_check.ps1 -Source <repo> : 0 errors / 0 warnings, gate PASSED,
+    headers verified from the staging tree. (The .ex5 byte count is NOT a
+    fingerprint -- it varies run to run on identical builds.)
+  * git diff: exactly 20 insertions / 20 deletions across 12 files. No
+    collateral reformatting, no whole-file rewrite.
+  * Non-ASCII integrity: U+2014 (em-dash) byte counts compared HEAD blob vs
+    working tree for all 11 sources -- identical per file (160 total, 0
+    mismatches), proving the bump rewrote only the version rows.
+  * Line endings: 9187 CRLF / 0 LF-only, no mixed-ending file.
+  * Probes: test_v545_throttle 28/28, test_v542_email 21/21,
+    test_v539_rejection 24/24, test_v540_hybrid 41/41,
+    test_v533_adoptmanual 230/230, test_v543_session 29/29,
+    test_v541_sarfix 14/14. test_v532_hightable remains 125/135 with the
+    10 failures byte-identical to the pre-existing baseline (all trim /
+    dead-code) and none of them version-related.
