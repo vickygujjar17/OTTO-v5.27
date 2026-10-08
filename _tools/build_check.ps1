@@ -8,13 +8,24 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File build_check.ps1
 
 param(
-    [string]$Source = "C:\Users\vivek\Downloads\OTTO-v5.00 v5.27",
+    [string]$Source = "",
     [string]$MetaEditor = "C:\Program Files\Five Percent Online MetaTrader 5\MetaEditor64.exe",
     [string]$Entry = "otto.mq5",
     [switch]$NoDeploy
 )
 
 $ErrorActionPreference = "Stop"
+
+# Default source = the checkout this script lives in. Resolved from
+# $PSScriptRoot so the gate is runnable from any clone without editing the
+# script. The previous hardcoded absolute path ("C:\Users\vivek\Downloads\
+# OTTO-v5.00 v5.27") went stale once that folder was removed, so a bare
+# invocation died in Copy-Item before it ever reached the compiler and the
+# documented command silently stopped validating anything. An explicit
+# -Source still wins.
+if ([string]::IsNullOrWhiteSpace($Source)) {
+    $Source = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
 
 $buildRoot = Join-Path $env:TEMP "otto_build"
 $experts   = Join-Path $buildRoot "MQL5\Experts"

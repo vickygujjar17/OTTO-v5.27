@@ -1,7 +1,7 @@
 # OTTO EA
 
 MetaTrader 5 Expert Advisor — MQL5 port of the Pine Script `prop_guard_tester.pine`
-master build. **Current base: v5.45**
+master build. **Current base: v5.46**
 
 ## Layout
 
@@ -30,6 +30,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _tools\build_check.ps1
 ```
 
 The gate is only passed on **0 errors, 0 warnings**.
+
+`-Source` defaults to the checkout the script lives in (`$PSScriptRoot\..`), so
+the command above needs no editing after a fresh clone; pass
+`-Source <dir>` to gate a different tree.
 
 ## Line endings
 

@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.45"
+#property version   "5.46"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -771,6 +771,29 @@ public:
    //| tick is the smallest quantum in both the distance and the money   |
    //| conversion, so a legitimate leg can read a few percent high and   |
    //| must not be reported as a breach.                                 |
+   //|                                                                   |
+   //| v5.46 - two correctness guarantees that the MathAbs form could not|
+   //| express:                                                          |
+   //|                                                                   |
+   //|   1. LOSS-SIDE ISOLATION. Capital at risk is only the stop        |
+   //|      distance on the LOSING side of entry. MathAbs(entry - sl)    |
+   //|      folded both sides together, so once the unified trail        |
+   //|      ratcheted a stop to break-even or into profit, the distance  |
+   //|      was still positive and the leg reported a risk percentage it |
+   //|      could no longer lose -- a false CRITICAL against a trade that|
+   //|      was already risk-free. The signed test below yields <= 0 for |
+   //|      a stop on the profit side, so such a leg contributes nothing.|
+   //|                                                                   |
+   //|   2. ADOPTED LEG VISIBILITY. Every other book read in this class  |
+   //|      is magic-scoped, which makes an adopted magic-0 leg invisible|
+   //|      by construction -- correct for the desync test, but it also  |
+   //|      excluded the adopted primary from the risk audit entirely, so |
+   //|      the one leg the operator did NOT size was the one leg never  |
+   //|      checked. The magic filter is therefore widened by exactly one|
+   //|      ticket: the tracked primary while m_trackedAdopted is set.   |
+   //|      The exception is keyed to the EXACT tracked ticket, so an     |
+   //|      unrelated manual or foreign-EA magic-0 leg still cannot be    |
+   //|      counted -- the blast radius stays one position.              |
    //+------------------------------------------------------------------+
    void              AuditRiskExposure(void)
      {
@@ -790,22 +813,38 @@ public:
         {
          if(PositionGetTicket(idx) <= 0) continue;
          if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
 
-         double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-         double sl    = PositionGetDouble(POSITION_SL);
-         double vol   = PositionGetDouble(POSITION_VOLUME);
+         ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+         long  magic  = PositionGetInteger(POSITION_MAGIC);
+
+         // v5.46 - magic-scoped, with ONE exception: the tracked primary while
+         // it is an ADOPTED magic-0 manual leg. Keyed to the exact ticket, so
+         // an unrelated manual / foreign-EA leg is still excluded.
+         if(magic != (long)m_magic)
+           {
+            if(!m_trackedAdopted || ticket != m_trackedPrimary) continue;
+           }
+
+         bool   isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+         double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
+         double sl     = PositionGetDouble(POSITION_SL);
+         double vol    = PositionGetDouble(POSITION_VOLUME);
 
          if(sl <= 0.0) continue;
 
-         double distPts     = MathAbs(entry - sl) / tickSize;
+         // v5.46 - LOSS-SIDE ONLY. A stop at or beyond break-even sits on the
+         // profit side, where lossDist is <= 0 and the leg carries no risk.
+         double lossDist = isLong ? (entry - sl) : (sl - entry);
+         if(lossDist <= 0.0) continue;
+
+         double distPts     = lossDist / tickSize;
          double moneyAtRisk = distPts * tickValue * vol;
          double posRiskPct  = (moneyAtRisk / equity) * 100.0;
 
          if(posRiskPct > peakRiskPct)
            {
             peakRiskPct = posRiskPct;
-            peakTicket  = (ulong)PositionGetInteger(POSITION_TICKET);
+            peakTicket  = ticket;
            }
         }
 
