@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.46"
+#property version   "5.47"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -334,7 +334,18 @@ private:
          // guard must live inside the loop. Only a blank comment is defaulted.
          if(request.comment == "")
             request.comment = BuildOrderComment(0, 0);
-         request.type_filling = GetFillingMode();   // dynamic FOK/IOC/RETURN
+         // FIX (v5.47): filling mode is only meaningful for a MARKET Deal.
+         // A TRADE_ACTION_PENDING limit carries no executable price at send
+         // time, so a dynamic FOK/IOC -- read from SYMBOL_FILLING_MODE, which
+         // advertises what DEALS may use -- is structurally invalid on a
+         // strict venue and is rejected outright. It never enters the retry
+         // ladder below either, because TRADE_RETCODE_INVALID_FILL is not in
+         // the retry set, so the limit is silently never placed. Pending
+         // orders therefore take RETURN, the only mode MT5 defines for them.
+         if(request.action == TRADE_ACTION_DEAL)
+            request.type_filling = GetFillingMode();
+         else
+            request.type_filling = ORDER_FILLING_RETURN;
          ResetLastError();
          if(OrderSend(request, result))
            {

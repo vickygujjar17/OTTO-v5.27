@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.46"
+#property version   "5.47"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -772,8 +772,8 @@ public:
    //| conversion, so a legitimate leg can read a few percent high and   |
    //| must not be reported as a breach.                                 |
    //|                                                                   |
-   //| v5.46 - two correctness guarantees that the MathAbs form could not|
-   //| express:                                                          |
+   //| FIX (v5.46): two correctness guarantees the MathAbs form could    |
+   //| not express:                                                      |
    //|                                                                   |
    //|   1. LOSS-SIDE ISOLATION. Capital at risk is only the stop        |
    //|      distance on the LOSING side of entry. MathAbs(entry - sl)    |
@@ -817,8 +817,8 @@ public:
          ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
          long  magic  = PositionGetInteger(POSITION_MAGIC);
 
-         // v5.46 - magic-scoped, with ONE exception: the tracked primary while
-         // it is an ADOPTED magic-0 manual leg. Keyed to the exact ticket, so
+         // FIX (v5.46): magic-scoped, with ONE exception - the tracked primary
+         // while it is an ADOPTED magic-0 leg. Keyed to the exact TICKET, so
          // an unrelated manual / foreign-EA leg is still excluded.
          if(magic != (long)m_magic)
            {
@@ -832,7 +832,7 @@ public:
 
          if(sl <= 0.0) continue;
 
-         // v5.46 - LOSS-SIDE ONLY. A stop at or beyond break-even sits on the
+         // FIX (v5.46): LOSS-SIDE ONLY. A stop at or past break-even is on the
          // profit side, where lossDist is <= 0 and the leg carries no risk.
          double lossDist = isLong ? (entry - sl) : (sl - entry);
          if(lossDist <= 0.0) continue;

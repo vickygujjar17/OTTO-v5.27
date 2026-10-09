@@ -17,11 +17,13 @@ What is bumped:
   * README '**Current base: vX.Y**'       -- the documented base release
 
 What is deliberately NOT bumped: historical annotations naming the release a
-feature LANDED in -- the many '// v5.3x:' notes and 'FIX (vX)' markers. Any
-line containing 'FIX (' is skipped outright, and every remaining pattern is
-anchored on a specific human-facing prefix rather than on the version number
-alone, so no comment can be rewritten by accident. The one non-prefixed form is
-the versioned INPUT GROUP label, which a comment can never satisfy.
+feature LANDED in -- the many '// v5.3x:' notes and 'FIX (vX)' markers. The
+bump pass skips any line containing 'FIX (' outright, and every remaining
+pattern is anchored on a specific human-facing prefix rather than on the
+version number alone, so no comment can be rewritten by accident. The one
+non-prefixed form is the versioned INPUT GROUP label, which a comment can never
+satisfy. The post-bump staleness census applies the same 'FIX (' exemption, so
+a historical marker is never reported as stale.
 
 Every em-dash inside an anchored banner is matched with a single '.' so the
 script is agnostic to how the dash is encoded.
@@ -29,6 +31,9 @@ script is agnostic to how the dash is encoded.
 Usage:
     python _tools/_bump_version.py            # auto: current -> next minor
     python _tools/_bump_version.py 5.46       # current -> explicit release
+
+Passing the current release explicitly is a harmless no-op; the bare form always
+advances one minor, so use an explicit target for an idempotent bump-then-verify.
 """
 
 import io
@@ -114,7 +119,13 @@ def bump(path, patterns):
 
 
 def census(old):
-    """Every surviving literal `old` in the shipped sources + docs."""
+    """Every surviving literal `old` in the shipped sources + docs.
+
+    Mirrors the bump() exemption above: a line carrying a historical
+    'FIX (vX)' annotation LEGITIMATELY names the release the fix landed in, so
+    it is not stale. Without this the guard fires on exactly the markers the
+    bump pass was written to preserve.
+    """
     hits = []
     for path in FILES + DOC_FILES:
         full = os.path.join(ROOT, path)
@@ -123,7 +134,7 @@ def census(old):
         for i, line in enumerate(io.open(full, encoding="utf-8",
                                          errors="replace", newline="").read()
                                  .split("\n"), 1):
-            if old in line:
+            if old in line and "FIX (" not in line:
                 hits.append("%s:%d: %s" % (path, i, line.strip()))
     return hits
 
@@ -139,7 +150,11 @@ def main():
         new = "%d.%d" % (major, minor + 1)
 
     if new == old:
-        raise SystemExit("ABORT: target %s is already the current release" % new)
+        # Idempotent, not fatal: re-running the bump on an already-bumped tree
+        # must be a harmless no-op, so a scripted bump-then-verify sequence
+        # cannot be broken by its own second invocation.
+        print("no-op: %s is already the current release" % old)
+        return 0
 
     print("=" * 74)
     print("v%s -> v%s VERSION BUMP" % (old, new))

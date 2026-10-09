@@ -194,6 +194,14 @@ check("the ticket read still ends in `continue` only if invalid",
 check("a clean cycle still re-arms the latch",
       re.search(r"ClearLatch\(m_alertSent_RiskBreach\)", CODE) is not None)
 
+check("the distance in points is built from lossDist, not from entry-sl directly",
+      re.search(r"distPts\s*=\s*lossDist\s*/\s*tickSize", CODE) is not None)
+
+# The money conversion itself must be untouched by this release.
+check("the money-at-risk conversion is unchanged",
+      re.search(r"moneyAtRisk\s*=\s*distPts\s*\*\s*tickValue\s*\*\s*vol\s*;", CODE) is not None)
+
+
 # ----------------------------------------------------------------------
 # 5. RELEASE STAMP
 # ----------------------------------------------------------------------
@@ -204,8 +212,11 @@ for f in ALL_FILES:
         stamps.append(m.group(1))
 check("all %d shipped sources carry a version stamp" % len(ALL_FILES),
       len(stamps) == len(ALL_FILES), "found %d" % len(stamps))
-check("every shipped source is stamped 5.46",
-      bool(stamps) and set(stamps) == {"5.46"}, "stamps=%s" % sorted(set(stamps)))
+# Release-agnostic on purpose: this probe pins the LOGIC that landed in 5.46,
+# not the release number, so a later bump must not break it. What it still
+# enforces is the bump invariant -- every shipped source on ONE release.
+check("every shipped source carries the SAME release stamp",
+      bool(stamps) and len(set(stamps)) == 1, "stamps=%s" % sorted(set(stamps)))
 
 
 # ----------------------------------------------------------------------
@@ -232,10 +243,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-check("the distance in points is built from lossDist, not from entry-sl directly",
-      re.search(r"distPts\s*=\s*lossDist\s*/\s*tickSize", CODE) is not None)
-
-# The money conversion itself must be untouched by this release.
-check("the money-at-risk conversion is unchanged",
-      re.search(r"moneyAtRisk\s*=\s*distPts\s*\*\s*tickValue\s*\*\s*vol\s*;", CODE) is not None)
