@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.47"
+#property version   "5.48"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -1472,11 +1472,20 @@ private:
    //+------------------------------------------------------------------+
    //| Fills SActiveTrade from a FILLED BLOCK (Pine: active_* = b.local_*)|
    //+------------------------------------------------------------------+
-   void                    SeedActiveTradeFromBlock(const SSniperBlock &block, ulong positionTicket)
+   void                    SeedActiveTradeFromBlock(const SSniperBlock &block, ulong positionTicket,
+                                                     ENUM_TRADE_DIRECTION overrideDir = DIR_NONE)
      {
       if(!PositionSelectByTicket(positionTicket)) return;
       m_activeTrade.ticket       = positionTicket;
-      m_activeTrade.direction    = GetDirectionForBlock(block);
+      // v5.48 -- the direction this basket is seeded with. Deriving it from the
+      // block's phase (touches) is the correct basis for a PHYSICAL fill,
+      // because that path seeds BEFORE it consumes the touch. A VIRTUAL fill
+      // consumes the touch first, so it hands the arm-time side in explicitly
+      // (overrideDir); otherwise GetDirectionForBlock() would flip the basket to
+      // the OPPOSITE of the MARKET order that just filled, desyncing the trail,
+      // the 1R basis, the journal and the High Table mirror for that whole leg.
+      m_activeTrade.direction    = (overrideDir != DIR_NONE) ? overrideDir
+                                                             : GetDirectionForBlock(block);
       m_activeTrade.entryPrice   = block.localEntry;
       m_activeTrade.initialSL    = block.localSL;
       m_activeTrade.initialSLDistance = MathAbs(block.localEntry - block.localSL);
@@ -2192,6 +2201,9 @@ public:
                // then adopts it verbatim and the whole basket logs to the ONE
                // file the arm created.
                if(blocks[i].sessionId != "") m_sessionID = blocks[i].sessionId;
+               // v5.48 -- physical fills seed BEFORE the touch increment below,
+               // so the block's own phase is already the fill's phase; DIR_NONE
+               // keeps SeedActiveTradeFromBlock() deriving the side as before.
                SeedActiveTradeFromBlock(blocks[i], newTicket);
                m_ordersFilled++;
                if(EnableLogging)
@@ -2300,6 +2312,13 @@ public:
            { RemoveVirtualOrderAt(v); continue; }
 
          bool isLong = (vo.direction == DIR_LONG);
+         // v5.48 -- the side THIS fill actually executes. Captured from the
+         // arm-time virtual order BEFORE the touch below is consumed, because
+         // that increment promotes the block to Phase 2, where
+         // GetDirectionForBlock() reports the S/R-FLIPPED direction. The seed
+         // must describe the order that was sent, not the block's new phase, so
+         // this stale-free value is threaded into SeedActiveTradeFromBlock().
+         ENUM_TRADE_DIRECTION seedDir = isLong ? DIR_LONG : DIR_SHORT;
 
          // THE CROSS TEST. A MARKET condition, not a resting price: a LONG
          // fires once the market has traded DOWN to (or through) the level,
@@ -2500,7 +2519,11 @@ public:
          m_sessionID = newSessionId;
          if(m_journal != NULL) m_journal.SetSessionID(m_sessionID);
 
-         SeedActiveTradeFromBlock(block, result.order);
+         // v5.48 -- seed the basket from the side the MARKET order actually
+         // executed (seedDir, captured above), NOT from the block's phase: the
+         // touch was consumed a few lines up, so GetDirectionForBlock() would now
+         // report the flipped Phase 2 side and desync the basket from the fill.
+         SeedActiveTradeFromBlock(block, result.order, seedDir);
          m_ordersFilled++;
 
          // The virtual order is now consumed - drop it from the engine.

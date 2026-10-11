@@ -217,8 +217,15 @@ for f in ALL_FILES:
         stamps.append(m.group(1))
 check("all %d shipped sources carry a version stamp" % len(ALL_FILES),
       len(stamps) == len(ALL_FILES), "found %d" % len(stamps))
-check("every shipped source is stamped 5.47",
-      bool(stamps) and set(stamps) == {"5.47"}, "stamps=%s" % sorted(set(stamps)))
+# v5.48 -- bump-tolerant, matching the house convention in v5.40/v5.42/...:
+# assert the sources agree on ONE common stamp and that it is at least the
+# release this probe shipped with. The previous literal `== {"5.47"}` made the
+# probe fail on every later bump, which is a probe defect, not a code defect.
+RELEASE = sorted(set(stamps))[0] if stamps else "?"
+parts = tuple(int(x) for x in RELEASE.split(".")) if stamps else (0, 0)
+check("all shipped sources stamp one common release, v5.47 or later",
+      len(set(stamps)) == 1 and parts >= (5, 47),
+      "stamps=%s" % sorted(set(stamps)))
 
 
 # ----------------------------------------------------------------------
