@@ -16,6 +16,18 @@
 #include "COttoJournal.mqh"
 
 //+------------------------------------------------------------------+
+//| v5.48 — HOURLY FILE-TO-EMAIL STATUS REPORT                       |
+//|                                                                  |
+//| The operator gets one periodic snapshot of this symbol's state   |
+//| an hour, on top of the per-trade exit email the journal already   |
+//| ships. It is deliberately NOT routed through COttoJournal:       |
+//| SendMailFromFile() there is pinned to exactly ONE call site      |
+//| (LogExit) by the v5.42 and v5.45 probes, so the hourly report     |
+//| owns its own file and its own SendMail call instead.             |
+//+------------------------------------------------------------------+
+#define OTTO_HOURLY_REPORT_SECONDS  3600 // 1 hour
+
+//+------------------------------------------------------------------+
 //| COttoOrderManager class                                         |
 //| Translates the Pine strategy.entry limit orders into MT5         |
 //| OrderSend TRADE_ACTION_PENDING calls. Reimplements Pine gates:   |
@@ -88,6 +100,13 @@ private:
 
    // --- Physical OrderSend throttle ---
    datetime                m_lastOrderTime;
+
+   // --- Reporting (v5.48) ---------------------------------------------
+   //| Timestamp of the last hourly file-to-email status report. Zeroed by
+   //| the constructor and re-stamped in Initialize() so a re-init starts a
+   //| fresh hour instead of inheriting a stale stamp (the same reason
+   //| m_manualNoSLWarnTick is reset there).
+   datetime                m_lastHourlyReport;
 
    // --- PYRAMID BASKET (unified group stop) ---
    SPyramidTranche         m_basket[];        // active scaling tranches
@@ -1665,6 +1684,205 @@ private:
       ArrayResize(m_virtualOrders, m_virtualCount, 3);
      }
 
+   //+------------------------------------------------------------------+
+   //| v5.48 — HOURLY STATUS REPORT (gate)                              |
+   //|                                                                  |
+   //| Once an hour this symbol's state is written to a plain-text file  |
+   //| and emailed. The gate is a pure timestamp comparison against the  |
+   //| stamp Initialize() arms, so it is safe to call every tick: the    |
+   //| per-tick cost on an idle tick is one subtraction.                 |
+   //|                                                                  |
+   //| TimeCurrent() (broker clock), NOT TimeLocal(): TimeLocal() reads  |
+   //| the OPERATOR's clock, so a report would land at the wrong wall    |
+   //| time on a weekend, or on a VPS in another time zone. Comparisons  |
+   //| are unsigned-safe -- a broker clock that steps backwards cannot   |
+   //| produce a negative delta against a later stamp.                   |
+   //+------------------------------------------------------------------+
+   void                    EmitHourlyStatusReportIfDue(void)
+     {
+      datetime now = TimeCurrent();
+      if(now - m_lastHourlyReport < OTTO_HOURLY_REPORT_SECONDS) return;
+      // Advance the stamp BEFORE sending. Should SendMail() or the file I/O
+      // fail, the next attempt is a full hour away rather than on the very
+      // next tick, so a rejected report cannot become a per-tick mail storm.
+      m_lastHourlyReport = now;
+      SendHourlyStatusReport();
+     }
+
+   //+------------------------------------------------------------------+
+   //| v5.48 — HOURLY STATUS REPORT (file -> email)                     |
+   //|                                                                  |
+   //| Builds the report as a normal FLAT .txt so the operator can open  |
+   //| it directly from the terminal's Files folder, then re-opens that  |
+   //| exact file and mails its bytes -- the same file-to-email contract |
+   //| the per-session journal uses, so the artifact a human reads and   |
+   //| the body of the email are the same thing.                        |
+   //|                                                                  |
+   //| Nothing is deleted afterwards on purpose: the file left behind is |
+   //| the audit trail the operator asked for. FileClose() releases the  |
+   //| write handle first, so the re-open sees a complete, flushed file. |
+   //|                                                                  |
+   //| SendMail() is suppressed in the Strategy Tester, which cannot     |
+   //| dispatch mail; the file is still written, so a tester run still   |
+   //| produces the artifact. Mirrors CHighTableAuditor::DispatchAlert(). |
+   //+------------------------------------------------------------------+
+   void                    SendHourlyStatusReport(void)
+     {
+      string fname = m_symbol + "_HourlyReport.txt";
+
+      // --- 1. WRITE the artifact ------------------------------------
+      int fh = FileOpen(fname, FILE_TXT | FILE_WRITE);
+      if(fh == INVALID_HANDLE)
+        {
+         if(EnableLogging)
+            Print("[OrderManager] Hourly report: cannot write ", fname,
+                  " err=", GetLastError());
+         return;
+        }
+      // Line 0 IS the email subject, exactly as the per-session journal's
+      // header line is -- one convention for a file that is also a message.
+      FileWriteString(fh, "SUBJECT: [STATUS] " + m_symbol + " | " +
+                      TimeToString(TimeCurrent()) + "\n");
+      FileWriteString(fh, ReportBody());
+      FileClose(fh);
+
+      // --- 2. RE-OPEN and read the bytes we just wrote --------------
+      string lines[];
+      int c = 0;
+      int rh = FileOpen(fname, FILE_TXT | FILE_READ | FILE_SHARE_READ);
+      if(rh != INVALID_HANDLE)
+        {
+         string tmp[];
+         while(!FileIsEnding(rh))
+           {
+            string l = FileReadString(rh);
+            if(l == "") break;
+            ArrayResize(tmp, c + 1);
+            tmp[c] = l;
+            c++;
+           }
+         FileClose(rh);
+         ArrayResize(lines, c);
+         for(int i = 0; i < c; i++) lines[i] = tmp[i];
+        }
+      if(c == 0)
+        {
+         if(EnableLogging)
+            Print("[OrderManager] Hourly report: wrote ", fname,
+                  " but could not read it back");
+         return;
+        }
+
+      string subject = lines[0];
+      string body    = "";
+      for(int i = 0; i < c; i++)
+        {
+         body += lines[i];
+         if(i < c - 1) body += "\n";
+        }
+
+      // --- 3. SHIP (never inside the Strategy Tester) ---------------
+      if(!(bool)MQLInfoInteger(MQL_TESTER))
+        {
+         if(SendMail(subject, body))
+           {
+            if(EnableLogging)
+               Print("[OrderManager] Hourly report emailed: ", subject);
+           }
+         else
+            Print("[OrderManager] Hourly report SendMail FAILED err=",
+                  GetLastError(), " subj=", subject);
+        }
+      else if(EnableLogging)
+         Print("[OrderManager] Hourly report file written, email suppressed ",
+               "in tester: ", fname);
+     }
+
+   //+------------------------------------------------------------------+
+   //| v5.48 — HOURLY STATUS REPORT (body)                              |
+   //|                                                                  |
+   //| Pure formatting: no side effects, no sends, so the report can be  |
+   //| tested by inspection. Every field is a live read taken at the      |
+   //| moment of the report; nothing is cached across hours.             |
+   //+------------------------------------------------------------------+
+   string                  ReportBody(void)
+     {
+      string s = "";
+      s += "HOURLY STATUS REPORT\n";
+      s += "================================================================\n";
+      s += "Symbol            : " + m_symbol + "\n";
+      s += "Time              : " + TimeToString(TimeCurrent()) + "\n";
+      s += "================================================================\n";
+
+      // --- Book state -----------------------------------------------
+      s += "[BOOK]\n";
+      s += "  Active basket   : " + (m_hasActiveTrade ? "YES" : "NO") + "\n";
+      if(m_hasActiveTrade)
+        {
+         s += "    Ticket        : #" + IntegerToString((int)m_activeTrade.ticket) + "\n";
+         s += "    Direction     : " +
+              (m_activeTrade.direction == DIR_LONG ? "BUY / LONG" : "SELL / SHORT") + "\n";
+         s += "    Entry         : " + DoubleToString(m_activeTrade.entryPrice, _Digits) + "\n";
+         s += "    Working Stop  : " + DoubleToString(m_activeTrade.currentTrailSL, _Digits) + "\n";
+         s += "    1R (risk)     : " + DoubleToString(m_activeTrade.initialRiskAmount, 2) + "\n";
+         s += "    Adopted manual: " + (m_adoptedManual ? "YES" : "NO") + "\n";
+        }
+      s += "  Open pendings   : " + IntegerToString(CountMyPendingOrders()) +
+           " (broker + virtual)\n";
+      s += "  Armed blocks    : " + IntegerToString(CountArmedBlocks()) + "\n";
+      s += "  Basket tranches : " + IntegerToString(m_basketCount) + "\n";
+      s += "  Session         : " + (m_sessionID == "" ? "(flat)" : m_sessionID) + "\n";
+
+      // --- Counters since initialization ----------------------------
+      s += "[COUNTERS]\n";
+      s += "  Orders placed   : " + IntegerToString(m_ordersPlaced) + "\n";
+      s += "  Orders filled   : " + IntegerToString(m_ordersFilled) + "\n";
+      s += "  Orders rejected : " + IntegerToString(m_ordersRejected) + "\n";
+      s += "  Stop failures   : " + IntegerToString(m_stopModifyFailures) + "\n";
+      s += "  Reversals       : " + IntegerToString(m_reversalsExecuted) + "\n";
+      s += "  Retries         : " + IntegerToString(m_retryCount) + "\n";
+
+      // --- Risk -----------------------------------------------------
+      s += "[RISK]\n";
+      s += "  Equity          : " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "\n";
+      s += "  Balance         : " + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "\n";
+      s += "  Floating P/L    : " + DoubleToString(AccountInfoDouble(ACCOUNT_PROFIT), 2) + "\n";
+      s += "  Free margin     : " + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2) + "\n";
+
+      // --- Market ---------------------------------------------------
+      s += "[MARKET]\n";
+      s += "  Bid / Ask       : " + DoubleToString(GetBid(), _Digits) + " / " +
+           DoubleToString(GetAsk(), _Digits) + "\n";
+      s += "  Spread          : " + DoubleToString(GetCurrentSpread(), 1) + " pts\n";
+      s += "  ATR             : " + DoubleToString(m_blockManager.GetATR(), _Digits) + "\n";
+      s += "================================================================\n";
+      return s;
+     }
+
+   //+------------------------------------------------------------------+
+   //| v5.48 — Count of blocks currently armed and awaiting execution.  |
+   //|                                                                  |
+   //| A block is ARMED when it has passed its gates and is waiting on   |
+   //| price -- but NOT once it is vetoed, triggered or already retired. |
+   //| This is the "how many live setups do I have" number, which the    |
+   //| pending-order count alone cannot answer: a virtual order is armed |
+   //| before it ever produces a broker row, and a physical one keeps a  |
+   //| row that already exists. Counted here rather than read off        |
+   //| CountMyPendingOrders() so the two agree by construction.          |
+   //+------------------------------------------------------------------+
+   int                     CountArmedBlocks(void)
+     {
+      int armed = 0;
+      int total = m_blockManager.GetBlockCount();
+      for(int i = 0; i < total; i++)
+        {
+         SSniperBlock b;
+         if(!m_blockManager.GetBlockAt(i, b)) continue;
+         if(b.isArmed && !b.isVetoed && !b.isTriggered && !b.hasExited) armed++;
+        }
+      return armed;
+     }
+
 
 public:
    //+------------------------------------------------------------------+
@@ -1689,6 +1907,7 @@ public:
       m_reversalInProgress = false;
       m_reversalStartTime = 0;
       m_lastOrderTime     = 0;
+      m_lastHourlyReport  = 0;
       ZeroMemory(m_activeTrade);
       ArrayResize(m_basket, 0, 3);
       m_basketCount    = 0;
@@ -1726,6 +1945,10 @@ public:
       // a re-init or a fresh no-SL refusal would be swallowed by a stale stamp.
       m_adoptedManual      = false;
       m_manualNoSLWarnTick = 0;
+      // v5.48: arm the hourly report clock now, so the first status email
+      // lands one hour into this session rather than on the first tick or
+      // -- worse -- on a stamp left over from the session before.
+      m_lastHourlyReport   = TimeCurrent();
       SyncActiveTrade();
       if(EnableLogging)
          Print("[OrderManager] Initialized for ", m_symbol, " | Magic: ", MagicNumber);
@@ -2046,11 +2269,16 @@ public:
      }
 
    //+------------------------------------------------------------------+
-   //| Main update — reversal completion + physical fill scan + virtual  |
-   //| trigger.                                                          |
+   //| Main update — hourly report + reversal completion + physical fill |
+   //| scan + virtual trigger.                                          |
    //+------------------------------------------------------------------+
    void              Update(void)
      {
+      // v5.48: FIRST, so the hourly report describes the state at the top of
+      // the tick -- before CompleteReversal() and the two fill scans mutate
+      // the book underneath it. The gate is a timestamp comparison, so this
+      // costs nothing on the ticks that are not due.
+      EmitHourlyStatusReportIfDue();
       CompleteReversal();
       // v5.40: the PHYSICAL route rests a real broker limit, so a fill is a
       // broker event, not a memory trigger — scan for it first. Recovers the
