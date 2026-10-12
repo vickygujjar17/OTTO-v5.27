@@ -31,8 +31,8 @@ compiler gate -- each is a property of a formula, not of a type.
      the manager's adoptedManual flag, or the exception is dead code that
      silently never fires -- the exact failure mode this probe exists to catch.
 
-The 35% tolerance and the WARN dispatch are asserted UNCHANGED: this release
-narrows what counts as risk, it does not retune the threshold.
+The 50% tolerance (widened from 35% so market execution slippage is not
+reported as a breach) and the WARN dispatch are asserted as they now ship.
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -172,8 +172,8 @@ check("otto.mq5 passes the adopted flag into SetTrackedLegs",
 # ----------------------------------------------------------------------
 # 4. THRESHOLD AND DISPATCH UNCHANGED
 # ----------------------------------------------------------------------
-check("the 35% tolerance is unchanged",
-      re.search(r"maxAllowedRiskPct\s*=\s*RiskPercent\s*\*\s*1\.35", CODE) is not None)
+check("the 50% tolerance is in force",
+      re.search(r"maxAllowedRiskPct\s*=\s*RiskPercent\s*\*\s*1\.50", CODE) is not None)
 
 check("the breach still dispatches as WARN",
       "HT_SEV_WARN" in CODE

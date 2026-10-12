@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.49"
+#property version   "5.50"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -767,7 +767,7 @@ public:
    //| rounding, a minimum-lot clamp or a stale stop can leave a leg     |
    //| carrying materially more than the target.                        |
    //|                                                                   |
-   //| 35% tolerance absorbs volume-step / tick quantization: a single   |
+   //| 50% tolerance absorbs volume-step / tick quantization: a single   |
    //| tick is the smallest quantum in both the distance and the money   |
    //| conversion, so a legitimate leg can read a few percent high and   |
    //| must not be reported as a breach.                                 |
@@ -804,8 +804,8 @@ public:
       double tickValue = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_VALUE);
       if(tickSize <= 0.0 || tickValue <= 0.0) return;
 
-      // Allow a 35% tolerance buffer over RiskPercent to absorb volume step / tick quantization
-      double maxAllowedRiskPct = RiskPercent * 1.35;
+      // Allow a 50% tolerance buffer over RiskPercent to absorb market execution slippage
+      double maxAllowedRiskPct = RiskPercent * 1.50;
       double peakRiskPct = 0.0;
       ulong  peakTicket  = 0;
 

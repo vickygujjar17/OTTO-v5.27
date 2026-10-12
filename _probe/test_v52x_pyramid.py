@@ -68,8 +68,13 @@ def check(name, cond, detail=""):
 
 
 def num_input(text, name):
-    """Default of a top-level `input double NAME = <value>;` declaration."""
-    m = re.search(r"^\s*input\s+double\s+" + re.escape(name) +
+    """Default of a top-level `input double NAME = <value>;` declaration.
+
+    RiskPercent is deliberately a `const` (terminal-override lock) while every
+    other risk rung stays an `input`, so the qualifier is matched either way --
+    this probe locates the DECLARATION, it does not police its storage class.
+    """
+    m = re.search(r"^\s*(?:input|const)\s+double\s+" + re.escape(name) +
                   r"\s*=\s*([0-9]*\.?[0-9]+)\s*;", text, re.M)
     return float(m.group(1)) if m else None
 

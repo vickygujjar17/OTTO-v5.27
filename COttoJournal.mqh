@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.49"
+#property version   "5.50"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -176,7 +176,11 @@ public:
       W("  Trigger Price     : " + FmtPrice(entryPrice));
       W("  Initial SL        : " + FmtPrice(slPrice));
       W("  Volume            : " + DoubleToString(lotSize,2));
-      W("  Block Polarity    : " + (btype==BLOCK_SUPPORT?"SUPPORT":"RESISTANCE"));
+      string actionDesc = (btype == BLOCK_SUPPORT)
+                          ? "SUPPORT zone held - price rejected upward, BUY the bounce"
+                          : "RESISTANCE zone held - price rejected downward, SELL the bounce";
+      W("  Logic             : " + actionDesc);
+      W("  Block Top/Bottom  : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom));
       W("  Wick 1 (Anchor)   : " + TimeToString(blk.wick1Time) + " H=" + FmtPrice(blk.wick1.highPrice) + " L=" + FmtPrice(blk.wick1.lowPrice));
       W("  Wick 2 (Retest)   : " + TimeToString(blk.wick2Time) + " H=" + FmtPrice(blk.wick2.highPrice) + " L=" + FmtPrice(blk.wick2.lowPrice));
       W("  Separation        : " + (blk.vetoReason==VETO_NO_SEPARATION?"FAILED":"PASSED"));
@@ -207,7 +211,10 @@ public:
       W("  Initial Stop Loss : " + FmtPrice(slPrice) + " | 1R = " + FmtPrice(blk.rrUnit));
       W("  Volume & Sizing   : " + DoubleToString(lotSize,2) + " Lots | Risk: $" + DoubleToString(riskMoney,2));
       W("  S/R Block:");
-      W("    - Polarity  : " + (blk.type==BLOCK_SUPPORT?"SUPPORT":"RESISTANCE"));
+      string actionDesc = (blk.type == BLOCK_SUPPORT)
+                          ? "SUPPORT zone held - price rejected upward, BUY the bounce"
+                          : "RESISTANCE zone held - price rejected downward, SELL the bounce";
+      W("    - Logic     : " + actionDesc);
       W("    - Zone      : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom));
       if(blk.wick1Time > 0 && blk.wick2Time > 0)
         {
