@@ -46,6 +46,19 @@ def read(p):
                    newline="").read().replace("\r\n", "\n")
 
 
+def _rel_parts(stamps):
+    """Numeric (major, minor) of the common release stamp; [] -> (0, 0).
+
+    Bump-tolerant, matching the v5.47 probe convention: assert the sources
+    AGREE on one stamp that is AT LEAST the release this probe shipped with,
+    rather than pinning a literal that fails on every later bump (a probe
+    defect, not a code defect)."""
+    if not stamps:
+        return (0, 0)
+    major, minor = sorted(set(stamps))[0].split(".")
+    return (int(major), int(minor))
+
+
 def strip_comments(code):
     """Drop // comments, respecting string literals (see v5.32 probe)."""
     out = []
@@ -251,8 +264,9 @@ for f in ALL_FILES:
         stamps.append(m.group(1))
 check("all %d shipped sources carry a version stamp" % len(ALL_FILES),
       len(stamps) == len(ALL_FILES), "found %d" % len(stamps))
-check("every shipped source is stamped 5.48",
-      bool(stamps) and set(stamps) == {"5.48"}, "stamps=%s" % sorted(set(stamps)))
+check("every shipped source is stamped 5.48 or later",
+      len(set(stamps)) == 1 and _rel_parts(stamps) >= (5, 48),
+      "stamps=%s" % sorted(set(stamps)))
 
 
 # ----------------------------------------------------------------------

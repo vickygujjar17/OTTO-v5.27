@@ -4,7 +4,7 @@
 //|              OTTO EA — Institutional risk manager                |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.48"
+#property version   "5.49"
 
 #ifndef __OTTO_RISK_MANAGER__
 #define __OTTO_RISK_MANAGER__
@@ -16,6 +16,8 @@
 //| Calculates lot size for an exact risk amount from a dynamic      |
 //| RiskPercent% of LIVE ACCOUNT EQUITY (Forex & Gold).              |
 //| Strict 1% dynamic-equity model - no fixed-dollar override.       |
+//| v5.49: BELOW-MIN SIZING ABORTS (returns 0.0 -> caller suppresses) |
+//| instead of clamping up to a fixed min lot; shared overshoot factor.|
 //+------------------------------------------------------------------+
 class COttoRiskManager
   {
@@ -119,9 +121,10 @@ public:
       double steps  = MathFloor(rawLot / m_volumeStep + 1e-8);
       double lot    = steps * m_volumeStep;
 
-      // Hard safety: never exceed target risk even after clamping up
+      // Hard safety: never exceed target risk even after clamping up. Headroom
+      // factor is shared (OttoDefines) with CalculateLotSize()/FromPoints().
       double actualRiskMoney = lot * slPoints * m_tickValue;
-      if(actualRiskMoney > (riskMoney * 1.05) && lot > m_volumeMin)
+      if(actualRiskMoney > (riskMoney * OTTO_RISK_OVERSHOOT_MULT) && lot > m_volumeMin)
          lot -= m_volumeStep;
 
       if(lot > m_volumeMax)
@@ -186,7 +189,7 @@ public:
    double            CalculateLotSize(double entryPrice, double stopLossPrice)
      {
       if(!RefreshSymbolProperties())
-         return m_volumeMin;
+         return 0.0;   // v5.49: property fault -> ABORT (was m_volumeMin fixed lot)
 
       double riskMoney = GetRiskMoney();
       double slDistancePrice  = MathAbs(entryPrice - stopLossPrice);
@@ -195,7 +198,7 @@ public:
       if(slDistancePoints <= 0)
         {
          Print("[RiskManager] ERROR: SL distance is zero or negative!");
-         return m_volumeMin;
+         return 0.0;   // v5.49: unmeasurable risk -> ABORT (was m_volumeMin)
         }
 
       double tickValuePerLot = m_tickValue;
@@ -207,26 +210,37 @@ public:
          else
            {
             Print("[RiskManager] FATAL: Cannot determine tick value");
-            return m_volumeMin;
+            return 0.0;   // v5.49: no risk model -> ABORT (was m_volumeMin)
            }
         }
 
       double rawLotSize = riskMoney / (slDistancePoints * tickValuePerLot);
+
+      // v5.49: STRICT MIN-LOT ABORT (the legacy fixed-risk override this branch
+      // carried). Below the broker minimum the target risk cannot be expressed,
+      // so return 0.0 and let the caller ABORT -- exactly what RiskPctLotSize()
+      // already does. The old `= m_volumeMin` clamp silently substituted a FIXED
+      // lot, defeating the dynamic-equity model. Testing the RAW lot (pre
+      // NormalizeLotSize min-clamp) is deliberate; no third epsilon-floor here.
+      if(rawLotSize < m_volumeMin) return 0.0;
+
       double finalLotSize = NormalizeLotSize(rawLotSize);
 
-      if(finalLotSize < m_volumeMin) finalLotSize = m_volumeMin;
+      // --- STRICT ROUND-DOWN ANTI-OVERSHOOT (NEVER exceed risk) ---
+      // Headroom factor is shared via OttoDefines so the sizer can never drift
+      // from the value it was tuned against. NormalizeLotSize() already rounds
+      // DOWN, so this branch is a belt-and-braces re-check.
+      double actualRiskMoney = finalLotSize * slDistancePoints * tickValuePerLot;
+      if(actualRiskMoney > (riskMoney * OTTO_RISK_OVERSHOOT_MULT) && finalLotSize > m_volumeMin)
+         finalLotSize -= m_volumeStep;
+
       if(finalLotSize > m_volumeMax)
         {
          if(EnableLogging)
             Print("[RiskManager] Lot clamped to broker max: ", DoubleToString(m_volumeMax,2));
          finalLotSize = m_volumeMax;
         }
-      if(finalLotSize <= 0) finalLotSize = m_volumeMin;
-
-      // --- STRICT 0.25% ROUND-DOWN ANTI-OVERSHOOT (NEVER exceed risk) ---
-      double actualRiskMoney = finalLotSize * slDistancePoints * tickValuePerLot;
-      if(actualRiskMoney > (riskMoney * 1.05) && finalLotSize > m_volumeMin)
-         finalLotSize -= m_volumeStep;
+      if(finalLotSize < m_volumeMin) return 0.0;   // v5.49: never fall back to a fixed lot
 
       m_lastRiskAmount = riskMoney;
       m_lastLotSize    = finalLotSize;
@@ -241,7 +255,13 @@ public:
    double            CalculateLotSizeFromPoints(double slDistancePoints)
      {
       if(!RefreshSymbolProperties())
-         return m_volumeMin;
+         return 0.0;   // v5.49: property fault -> ABORT (was m_volumeMin fixed lot)
+
+      if(slDistancePoints <= 0.0)
+        {
+         Print("[RiskManager] ERROR: SL distance is zero or negative!");
+         return 0.0;   // v5.49: unmeasurable risk -> ABORT (was m_volumeMin)
+        }
 
       double riskMoney = GetRiskMoney();
       double tickValuePerLot = m_tickValue;
@@ -252,9 +272,25 @@ public:
         }
 
       double rawLotSize = riskMoney / (slDistancePoints * tickValuePerLot);
+
+      // v5.49: STRICT MIN-LOT ABORT -- no fixed-lot fallback (see CalculateLotSize).
+      if(rawLotSize < m_volumeMin) return 0.0;
+
       double finalLotSize = NormalizeLotSize(rawLotSize);
-      finalLotSize = MathMax(m_volumeMin, MathMin(m_volumeMax, finalLotSize));
-      if(finalLotSize <= 0) finalLotSize = m_volumeMin;
+
+      // Never exceed the target risk (shared headroom, OttoDefines). The old form
+      // carried no anti-overshoot at all; added here for one consistent contract.
+      double actualRiskMoney = finalLotSize * slDistancePoints * tickValuePerLot;
+      if(actualRiskMoney > (riskMoney * OTTO_RISK_OVERSHOOT_MULT) && finalLotSize > m_volumeMin)
+         finalLotSize -= m_volumeStep;
+
+      if(finalLotSize > m_volumeMax)
+        {
+         if(EnableLogging)
+            Print("[RiskManager] Lot clamped to broker max: ", DoubleToString(m_volumeMax,2));
+         finalLotSize = m_volumeMax;
+        }
+      if(finalLotSize < m_volumeMin) return 0.0;   // v5.49: never fall back to a fixed lot
       return finalLotSize;
      }
 

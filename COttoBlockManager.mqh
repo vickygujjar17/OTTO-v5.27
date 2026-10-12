@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.48"
+#property version   "5.49"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -464,6 +464,11 @@ private:
    //| Runs once per new bar (calc_on_every_tick=false mirror). Order  |
    //| per Pine: deletion -> hasExited -> Stale(45) -> Front-Run(InpMaxRR)|
    //| -> Near-Miss(6D) -> Arming -> Break/Flip -> Momentum/FVG.       |
+   //|                                                                  |
+   //| v5.49 -- the state machine is PHASE-AWARE: hasExited, arming and |
+   //| break/flip read block.touches and INVERT their geometry for a    |
+   //| Phase 2 reversal, so a reclaimed S/R flip is measured against    |
+   //| its OWN trade side, not the Phase 1 bounce it replaced.          |
    //+------------------------------------------------------------------+
    void                    ProcessBlocks(int marketDay)
      {
@@ -489,12 +494,21 @@ private:
          double high1  = iHigh(m_symbol, PERIOD_CURRENT, 1);
          double low1   = iLow(m_symbol, PERIOD_CURRENT, 1);
 
-         // --- hasExited: price left the zone on a wick basis ---
+         // --- hasExited: price left the zone on a wick basis (phase-aware) ---
          if(!b.hasExited)
            {
-            if((b.type == BLOCK_SUPPORT && low1 > b.top) ||
-               (b.type == BLOCK_RESISTANCE && high1 < b.bottom))
-               b.hasExited = true;
+            if(b.touches == 0)   // Phase 1 (bounce) - a wick away from the zone
+              {
+               if((b.type == BLOCK_SUPPORT && low1 > b.top) ||
+                  (b.type == BLOCK_RESISTANCE && high1 < b.bottom))
+                  b.hasExited = true;
+              }
+            else                 // Phase 2 (reversal) - a wick through the near side
+              {
+               if((b.type == BLOCK_SUPPORT && low1 < b.bottom) ||
+                  (b.type == BLOCK_RESISTANCE && high1 > b.top))
+                  b.hasExited = true;
+              }
            }
 
          // --- STALE VETO (45 market days from W1) ---
@@ -589,14 +603,32 @@ private:
                continue;          // cannot arm while an older active primary is in range
               }
 
-            if((b.type == BLOCK_SUPPORT && close1 > b.top + InpArmATR * atrNow) ||
-               (b.type == BLOCK_RESISTANCE && close1 < b.bottom - InpArmATR * atrNow))
-               b.isArmed = true;
+            if(b.touches == 0)   // Phase 1 (bounce) - arm on a close out the far side
+              {
+               if((b.type == BLOCK_SUPPORT && close1 > b.top + InpArmATR * atrNow) ||
+                  (b.type == BLOCK_RESISTANCE && close1 < b.bottom - InpArmATR * atrNow))
+                  b.isArmed = true;
+              }
+            else                 // Phase 2 (reversal) - arm on a close out the near side
+              {
+               if((b.type == BLOCK_SUPPORT && close1 < b.bottom - InpArmATR * atrNow) ||
+                  (b.type == BLOCK_RESISTANCE && close1 > b.top + InpArmATR * atrNow))
+                  b.isArmed = true;
+              }
            }
 
-         // --- BREAK / FLIP ---
-         bool isBroken = (b.type == BLOCK_SUPPORT && close1 < b.bottom - ATRBufferBreak * atrNow) ||
-                         (b.type == BLOCK_RESISTANCE && close1 > b.top + ATRBufferBreak * atrNow);
+         // --- BREAK / FLIP (phase-aware: a break is the edge the trade cannot use) ---
+         bool isBroken = false;
+         if(b.touches == 0)   // Phase 1: a close through the zone's own far edge
+           {
+            isBroken = (b.type == BLOCK_SUPPORT && close1 < b.bottom - ATRBufferBreak * atrNow) ||
+                       (b.type == BLOCK_RESISTANCE && close1 > b.top + ATRBufferBreak * atrNow);
+           }
+         else                 // Phase 2: the flipped setup breaks out the opposite edge
+           {
+            isBroken = (b.type == BLOCK_SUPPORT && close1 > b.top + ATRBufferBreak * atrNow) ||
+                       (b.type == BLOCK_RESISTANCE && close1 < b.bottom - ATRBufferBreak * atrNow);
+           }
          if(isBroken)
            {
             if((high1 - low1) > (2.0 * atrNow))

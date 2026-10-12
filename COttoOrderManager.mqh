@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.48"
+#property version   "5.49"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -290,6 +290,44 @@ private:
       string tName = BasketGvName("BASKETT");
       if(GlobalVariableCheck(name))  GlobalVariableDel(name);
       if(GlobalVariableCheck(tName)) GlobalVariableDel(tName);
+     }
+
+   //+------------------------------------------------------------------+
+   //| v5.49 — CROSS-CHART VIRTUAL ARM LOCK (Part 3).                   |
+   //|                                                                  |
+   //| ROUTE A (physical) is already cross-chart safe: a resting broker  |
+   //| limit is a shared, visible artefact, so two instances cannot both |
+   //| rest one at the same price. ROUTE B (virtual) is NOT — the armed  |
+   //| order lives only in this instance's m_virtualOrders[], so two     |
+   //| charts on the same symbol would each arm and fire the SAME setup. |
+   //|                                                                  |
+   //| The lock is published into the terminal's GlobalVariable store,   |
+   //| which every EA instance on the terminal shares. Keying it on      |
+   //| symbol + block.serial follows the BasketGvName() convention so all |
+   //| OTTO globals remain greppable under the OTTO_ prefix. The value   |
+   //| carries the trigger price for diagnostics only; presence of the   |
+   //| name is what gates the arm.                                      |
+   //|                                                                  |
+   //| The lock MUST be released on every path that retires a virtual    |
+   //| order or empties the book, otherwise a stale name would silently  |
+   //| suppress the next session's block of the same serial. Release happens |
+   //| in RemoveVirtualOrderAt() (all eight element-removal sites) and in |
+   //| ReleaseAllVirtualArmLocks() (the ArrayResize(...,0) paths).        |
+   //+------------------------------------------------------------------+
+   string                  VirtualArmGvName(int blockSerial)
+     {
+      return "OTTO_V_ARM_" + m_symbol + "_" + IntegerToString(blockSerial);
+     }
+
+   //| Drops every arm lock held by the current book. Used by the paths  |
+   //| that empty m_virtualOrders[] wholesale (deinit / DD halt / basket |
+   //| close), which never call RemoveVirtualOrderAt() per element and so |
+   //| would otherwise orphan their global variables in the terminal.    |
+   void                    ReleaseAllVirtualArmLocks(void)
+     {
+      for(int v = 0; v < m_virtualCount; v++)
+         if(m_virtualOrders[v].blockSerial > 0)
+            GlobalVariableDel(VirtualArmGvName(m_virtualOrders[v].blockSerial));
      }
 
 
@@ -907,6 +945,30 @@ private:
         }
 
       // ---- ROUTE B: VIRTUAL — price already through the zone (or send refused)
+      // --- v5.49 CROSS-CHART VIRTUAL DUPLICATE SHIELD (Part 3) -----------
+      // ROUTE A is inherently cross-chart safe (a resting broker limit is a
+      // shared, visible artefact). A VIRTUAL arm is not: it lives only in this
+      // instance's memory, so a second chart on the same symbol would arm and
+      // fire the same zone in parallel. The terminal-wide GlobalVariable is
+      // that shared artefact for the virtual route. Checked AFTER ROUTE A has
+      // had its chance, so a physical send that succeeded above never reaches
+      // here and is never double-counted.
+      string virtualGvName = VirtualArmGvName(block.serial);
+      if(GlobalVariableCheck(virtualGvName))
+        {
+         if(EnableLogging)
+            Print("[OrderManager] Cross-Chart Shield: VIRTUAL arm for ", block.tradeId,
+                  " (serial ", block.serial, ") suppressed — another chart already holds ",
+                  virtualGvName, " @ ", DoubleToString(GlobalVariableGet(virtualGvName), _Digits));
+         // Mirror the duplicate shield: latch the block so this instance stops
+         // retrying it every tick, exactly as the hasPlacedOrder guard does.
+         block.hasPlacedOrder     = true;
+         block.limitOrderTicket   = 0;
+         block.pendingOrderCancel = false;
+         m_blockManager.SetBlockAt(blockIndex, block);
+         return false;
+        }
+
       SVirtualOrder vo;
       vo.blockIndex   = blockIndex;
       vo.blockSerial  = block.serial;
@@ -920,6 +982,11 @@ private:
       ArrayResize(m_virtualOrders, vIdx + 1);
       m_virtualOrders[vIdx] = vo;
       m_virtualCount = ArraySize(m_virtualOrders);
+
+      // v5.49 — publish the terminal-wide ARM LOCK for this zone. The stored
+      // value is the trigger price (diagnostics only). Set AFTER the book is
+      // committed so a lock is never held for an arm that failed to record.
+      GlobalVariableSet(virtualGvName, entryPrice);
 
       // Optimistic lock to prevent concurrent tick duplicate firing
       block.hasPlacedOrder     = true;
@@ -1674,10 +1741,19 @@ private:
    //| Removes a virtual order (v5.37 Part 2). Compacts the array in   |
    //| place, exactly as COttoBlockManager::RemoveBlock() does, so the |
    //| reverse-walk in CheckVirtualTriggers() stays index-safe.        |
+   //|                                                                  |
+   //| v5.49: also releases the zone's terminal-wide ARM LOCK. Doing it |
+   //| HERE rather than at each call site is deliberate — eight separate |
+   //| paths retire a virtual order, and a single missed release would   |
+   //| leave a stale global that silently suppresses the next session's  |
+   //| block of the same serial. The serial is read BEFORE the in-place  |
+   //| compaction below shifts it away.                                  |
    //+------------------------------------------------------------------+
    void                    RemoveVirtualOrderAt(int index)
      {
       if(index < 0 || index >= m_virtualCount) return;
+      if(m_virtualOrders[index].blockSerial > 0)
+         GlobalVariableDel(VirtualArmGvName(m_virtualOrders[index].blockSerial));
       for(int i = index; i < m_virtualCount - 1; i++)
          m_virtualOrders[i] = m_virtualOrders[i + 1];
       m_virtualCount--;
@@ -1920,12 +1996,21 @@ public:
       m_sessionSL      = 0.0;
       m_adoptedManual  = false;
       m_manualNoSLWarnTick = 0;
+      // v5.49: the book is about to be dropped wholesale, so release the
+      // cross-chart arm locks it holds before the descriptors vanish.
+      ReleaseAllVirtualArmLocks();
       m_virtualCount   = 0;
       ArrayResize(m_virtualOrders, 0);
 
      }
 
-                    ~COttoOrderManager(void) { }
+   // v5.49: true teardown. The book may still hold armed zones when the
+   // instance is torn down (parameter change / recompile), so their
+   // terminal-wide arm locks are released here. Left behind, a stale
+   // "OTTO_V_ARM_<sym>_<serial>" would suppress the next session's block of
+   // the same serial, because GVs outlive the EA and the serial counter
+   // reseeds at 0 on re-init.
+                    ~COttoOrderManager(void) { ReleaseAllVirtualArmLocks(); }
 
    //+------------------------------------------------------------------+
    //| Initialize                                                        |
@@ -3098,6 +3183,9 @@ public:
          if(OrderGetString(ORDER_SYMBOL) != m_symbol) continue;
          DeleteOrder(t);
         }
+      // v5.49: release the cross-chart arm locks this chart published before
+      // the in-memory book is emptied (deinit / DD halt path).
+      ReleaseAllVirtualArmLocks();
       ArrayResize(m_virtualOrders, 0, 3);
       m_virtualCount = 0;
      }
@@ -3485,6 +3573,8 @@ public:
      {
       ArrayResize(m_basket, 0, 3);
       m_basketCount = 0;
+      // v5.49: a closed basket takes its unconsumed arm locks with it.
+      ReleaseAllVirtualArmLocks();
       ArrayResize(m_virtualOrders, 0, 3);
       m_virtualCount = 0;
       m_nextTranche = 2;
