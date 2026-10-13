@@ -93,6 +93,7 @@ def func_body(code, sig):
 OM_T = read(OM)
 OM_C = strip_comments(OM_T)
 JRN_T = read(JRN)
+BM_C = read(os.path.join(ROOT, "COttoBlockManager.mqh"))
 
 RESULTS = []
 
@@ -228,6 +229,36 @@ check("CountArmedBlocks() consults the block book, not the pending book",
       (func_body(OM_C, r"int\s+CountArmedBlocks\s*\(") or ""))
 check("the body reports the hybrid pending count",
       BODY is not None and "CountMyPendingOrders()" in BODY)
+
+# ----------------------------------------------------------------------
+# 6b. v5.51 Part 3 -- the R/C phase label per ARMED setup
+# ----------------------------------------------------------------------
+# The report must name whether each armed setup is a Reversal (touches == 0)
+# or a Continuation (touches >= 1), reading the BLOCK rather than the order
+# comment so the phase is visible BEFORE the setup fills. This is the same
+# R/C vocabulary the arm/retag paths stamp on the live order (v5.41/v5.51),
+# rendered here from the live block book.
+print("\n-- R/C phase label per armed setup (v5.51 Part 3) --")
+
+check("the report walks the live virtual book (armed setups)",
+      BODY is not None and "m_virtualOrders" in BODY and "m_virtualCount" in BODY)
+check("it re-resolves each armed setup's block by SERIAL, not by index",
+      BODY is not None and "FindBlockIndexBySerial(" in BODY)
+check("it reads the block snapshot it just resolved",
+      BODY is not None and re.search(r"GetBlockAt\s*\(\s*bIdx\s*,", BODY) is not None)
+check("the R/C discriminator is the block's touch count",
+      BODY is not None and re.search(r"b\.touches\s*==\s*0", BODY) is not None)
+check("the Reversal label is spelled out",
+      BODY is not None and "R (S/R Reversal)" in BODY)
+check("the Continuation label is spelled out",
+      BODY is not None and "C (Continuation)" in BODY)
+check("an unresolved block degrades to a visible UNKNOWN, never a blank",
+      BODY is not None and "UNKNOWN" in BODY)
+check("the serial lookup helper exists with the pinned signature",
+      re.search(r"int\s+FindBlockIndexBySerial\s*\(\s*int\s+serial\s*\)",
+                BM_C) is not None)
+check("the serial lookup helper is keyed on block.serial",
+      re.search(r"m_blocks\[i\]\.serial\s*==\s*serial", BM_C) is not None)
 
 # ----------------------------------------------------------------------
 # 7. The journal's one-email-per-trade rule is NOT disturbed

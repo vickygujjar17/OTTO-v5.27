@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.50"
+#property version   "5.51"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -208,7 +208,7 @@ private:
       if(EnableLogging)
          Print("[Block] CONVERT #", b.serial,
                " (", (b.type == BLOCK_SUPPORT ? "SUP" : "RES"), ") ",
-               VetoReasonString(reason), " -> Touch 2 reversal");
+               VetoReasonString(reason), " -> Phase 2 continuation");
       return true;
      }
 
@@ -538,7 +538,7 @@ private:
             // v5.34 Part 2 - mirror the OrderManager's Phase 2 entry anchor so
             // this projection cannot veto a live reversal from the wrong price.
             // Once the order rests, b.localTP supersedes this below.
-            if(InpShiftReversalEntry && b.touches == 1)
+            if(InpShiftReversalEntry && b.touches >= 1)
                calcEntry = (b.type == BLOCK_RESISTANCE) ? (b.bottom - calcSLDist)
                                                         : (b.top + calcSLDist);
             double target = isLong ? calcEntry + tpRR * calcSLDist
@@ -720,7 +720,7 @@ private:
             bool   isLong = (BlockDirection(b) == DIR_LONG);
             // v5.34 Part 2 - same Phase 2 entry anchor as the Update() projector
             // above, so both intra-bar and bar-close vetoes judge one price.
-            if(InpShiftReversalEntry && b.touches == 1)
+            if(InpShiftReversalEntry && b.touches >= 1)
                calcEntry = (b.type == BLOCK_RESISTANCE) ? (b.bottom - calcSLDist)
                                                         : (b.top + calcSLDist);
             double target = isLong ? calcEntry + tpRR * calcSLDist
@@ -1198,7 +1198,7 @@ public:
          if(EnableLogging)
             Print("[Block] CLUSTER SYNC #", sib.serial,
                   " (", (sib.type == BLOCK_SUPPORT ? "SUP" : "RES"), ")",
-                  " -> Touch 2 reversal (origin #", origin.serial, ")");
+                  " -> Phase 2 continuation (origin #", origin.serial, ")");
          promoted++;
         }
       return promoted;

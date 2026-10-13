@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.50"
+#property version   "5.51"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -156,8 +156,8 @@ public:
    //| broker pending limit (price valid for a resting order) OR as an  |
    //| in-memory virtual order (price already through the zone). This   |
    //| CREATES the per-setup journal either way and stamps the two       |
-   //| facts the operator needs on the header: the N/R Phase (Normal    |
-   //| Touch-1 bounce vs Reversal Touch-2) and the Execution Mode       |
+   //| facts the operator needs on the header: the R/C Phase (touch     |
+   //| 1 = Reversal, touch 2+ = Continuation) and the Execution Mode    |
    //| (PHYSICAL vs VIRTUAL). The later entry/cancel/exit append into   |
    //| the same file; the email ships the full snapshot.                |
    //+--------------------------------------------------------------+
@@ -165,7 +165,7 @@ public:
      {
       if(!m_ready) return;
       if(!OpenWrite()) return;
-      string phase    = (blk.touches == 0) ? "N (Normal Bounce)" : "R (Reversal)";
+      string phase    = (blk.touches == 0) ? "R (Phase 1 - S/R Reversal Bounce)" : "C (Phase 2 - Trend Continuation)";
       string execMode = physical ? "PHYSICAL (Broker Limit Order)" : "VIRTUAL (In-Memory Arm)";
       W("SUBJECT: [ACTIVE] Session " + SubjectLine());
       W("================================================================");
@@ -176,9 +176,11 @@ public:
       W("  Trigger Price     : " + FmtPrice(entryPrice));
       W("  Initial SL        : " + FmtPrice(slPrice));
       W("  Volume            : " + DoubleToString(lotSize,2));
-      string actionDesc = (btype == BLOCK_SUPPORT)
-                          ? "SUPPORT zone held - price rejected upward, BUY the bounce"
-                          : "RESISTANCE zone held - price rejected downward, SELL the bounce";
+      string actionDesc = "";
+      if(btype == BLOCK_SUPPORT)
+         actionDesc = (dir == DIR_LONG) ? "SUPPORT (Buying the S/R Reversal)" : "SUPPORT (Selling the Trend Continuation / Breakdown)";
+      else
+         actionDesc = (dir == DIR_SHORT) ? "RESISTANCE (Selling the S/R Reversal)" : "RESISTANCE (Buying the Trend Continuation / Breakout)";
       W("  Logic             : " + actionDesc);
       W("  Block Top/Bottom  : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom));
       W("  Wick 1 (Anchor)   : " + TimeToString(blk.wick1Time) + " H=" + FmtPrice(blk.wick1.highPrice) + " L=" + FmtPrice(blk.wick1.lowPrice));
@@ -211,9 +213,11 @@ public:
       W("  Initial Stop Loss : " + FmtPrice(slPrice) + " | 1R = " + FmtPrice(blk.rrUnit));
       W("  Volume & Sizing   : " + DoubleToString(lotSize,2) + " Lots | Risk: $" + DoubleToString(riskMoney,2));
       W("  S/R Block:");
-      string actionDesc = (blk.type == BLOCK_SUPPORT)
-                          ? "SUPPORT zone held - price rejected upward, BUY the bounce"
-                          : "RESISTANCE zone held - price rejected downward, SELL the bounce";
+      string actionDesc = "";
+      if(blk.type == BLOCK_SUPPORT)
+         actionDesc = (dir == DIR_LONG) ? "SUPPORT (Buying the S/R Reversal)" : "SUPPORT (Selling the Trend Continuation / Breakdown)";
+      else
+         actionDesc = (dir == DIR_SHORT) ? "RESISTANCE (Selling the S/R Reversal)" : "RESISTANCE (Buying the Trend Continuation / Breakout)";
       W("    - Logic     : " + actionDesc);
       W("    - Zone      : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom));
       if(blk.wick1Time > 0 && blk.wick2Time > 0)
@@ -337,7 +341,7 @@ public:
      }
 
    //+----------------------------------------------------------------+
-   //| LOG CONVERSION (v5.36) - Phase 1 dropped for Phase 2 Reversal  |
+   //| LOG CONVERSION (v5.36): Phase 1 dropped -> Phase 2 Continuation|
    //| Appends a conversion notice to the session journal. v5.42: no  |
    //| longer emails -- LogExit() is the only sender.                 |
    //| Unlike LogCancellation() this does NOT rename the session file |
@@ -351,11 +355,11 @@ public:
          if(!OpenWrite()) return;   // no prior file -> create it
         }
       W("================================================================");
-      W("[CONVERTED TO REVERSAL] Session " + m_sessionID + " | " + m_symbol + " | " + TimeToString(TimeCurrent()));
+      W("[CONVERTED TO CONTINUATION] Session " + m_sessionID + " | " + m_symbol + " | " + TimeToString(TimeCurrent()));
       W("  Ticket Dropped    : #" + IntegerToString((int)ticket));
       W("  Block Polarity    : " + (btype == BLOCK_SUPPORT ? "SUPPORT" : "RESISTANCE"));
       W("  Trigger Event     : " + reason);
-      W("  Next Action       : Phase 1 order cancelled; Block upgraded to Phase 2 Reversal.");
+      W("  Next Action       : Phase 1 order cancelled; Block upgraded to Phase 2 Continuation.");
       W("================================================================");
       CloseHandle();
       // v5.42: NO email here. A re-phase is an intermediate lifecycle stage,

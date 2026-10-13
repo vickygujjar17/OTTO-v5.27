@@ -18,7 +18,7 @@ flow and side-effect properties of the shipped sources.
      pending count (CountMyPendingOrders) and the cancel sweeps all span BOTH
      the broker pending pool AND the in-memory virtual book.
 
-  4. N/R PHASE + EXECUTION MODE journal: COttoJournal::LogSetupArmed() stamps
+  4. R/C PHASE + EXECUTION MODE journal: COttoJournal::LogSetupArmed() stamps
      the Phase and Execution Mode on the arm header. v5.42: the arm no longer
      emails -- only LogExit()/LogCancellation() ship the session file.
 
@@ -187,15 +187,15 @@ check("cancel-all prunes physical pendings before emptying the book",
 
 
 # ----------------------------------------------------------------------
-# 4. N/R phase + execution-mode journal
+# 4. R/C phase + execution-mode journal
 # ----------------------------------------------------------------------
-print("\n-- N/R phase + execution mode journal --")
+print("\n-- R/C phase + execution mode journal --")
 
 check("LogSetupArmed located (LogVirtualOrderArmed is gone)",
       ARM_J is not None and "LogVirtualOrderArmed" not in JRN_T)
-check("arm journal stamps the N/R phase",
-      ARM_J is not None and "N (Normal Bounce)" in ARM_J and
-      "R (Reversal)" in ARM_J)
+check("arm journal stamps the R/C phase",
+      ARM_J is not None and "R (Phase 1 - S/R Reversal Bounce)" in ARM_J and
+      "C (Phase 2 - Trend Continuation)" in ARM_J)
 check("arm journal stamps the execution mode",
       ARM_J is not None and "PHYSICAL (Broker Limit Order)" in ARM_J and
       "VIRTUAL (In-Memory Arm)" in ARM_J)

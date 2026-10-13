@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.50"
+#property version   "5.51"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -386,7 +386,7 @@ private:
          request.magic     = MagicNumber;
          // v5.37 -- preserve a caller-supplied comment instead of
          // unconditionally overwriting it. The virtual engine now stamps an
-         // N/R phase tag plus session ID on its request before calling here,
+         // R/C phase tag plus session ID on its request before calling here,
          // and OrderSend() reads this field on every retry of the loop, so the
          // guard must live inside the loop. Only a blank comment is defaulted.
          if(request.comment == "")
@@ -756,7 +756,7 @@ private:
       // hoisted here because the shift below depends on it; both are
       // entry-independent, so snapping/shifting never changes the risk distance.
       double slDist     = CalcSLDistance(block, atr);
-      if(InpShiftReversalEntry && block.touches == 1)
+      if(InpShiftReversalEntry && block.touches >= 1)
         {
          // Phase 2 Reversal Outer Boundary Geometry:
          // Resistance-turned-Support (LONG): Entry is shifted BELOW the block bottom by slDist
@@ -765,7 +765,7 @@ private:
                                                            : (block.top + slDist);
          entryPrice = SnapToTick(shifted);   // re-snap: the shift may leave the grid
          if(EnableLogging)
-            Print("[OrderManager] SHIFTED REVERSAL ENTRY: block ", block.tradeId,
+            Print("[OrderManager] SHIFTED CONTINUATION ENTRY: block ", block.tradeId,
                   " touched=", block.touches,
                   " dir=", (GetDirectionForBlock(block) == DIR_LONG ? "LONG" : "SHORT"),
                   " entry=", DoubleToString(entryPrice, _Digits),
@@ -874,13 +874,13 @@ private:
          request.tp        = 0;   // NO TP — exact mirror of Pine (trail-only exits)
          request.deviation = MaxSlippage;
          request.magic     = MagicNumber;
-         // v5.41 -- N/R PHASE TAG (physical). Mirrors the virtual fill-time
+         // v5.41 -- R/C PHASE TAG (physical). Mirrors the virtual fill-time
          // marker so a resting broker row names its phase: a block's FIRST
-         // fill (touches == 0) is the Phase 1 "N"ormal bounce, its SECOND
-         // (touches >= 1) the Phase 2 "R"eversal. ClampOrderComment() already
-         // tail-preserves the "-BLK<n>" setup id, so the extra tag still fits
-         // the MT5 31-char limit.
-         string phaseType  = (block.touches == 0) ? "N" : "R";
+         // fill (touches == 0) is the Phase 1 "R"eversal (the S/R bounce),
+         // its SECOND and later (touches >= 1) the Phase 2 "C"ontinuation.
+         // ClampOrderComment() already tail-preserves the "-BLK<n>" setup id,
+         // so the extra tag still fits the MT5 31-char limit.
+         string phaseType  = (block.touches == 0) ? "R" : "C";
          request.comment   = ClampOrderComment(armSessionId + "_" + phaseType + "_P");
 
          if(request.volume < m_riskManager.GetVolumeMin() ||
@@ -1906,6 +1906,21 @@ private:
       s += "  Open pendings   : " + IntegerToString(CountMyPendingOrders()) +
            " (broker + virtual)\n";
       s += "  Armed blocks    : " + IntegerToString(CountArmedBlocks()) + "\n";
+      // v5.51 Part 3 -- R/C PHASE TAG (hourly report). Mirrors the R/C marker
+      // the arm and retag paths stamp on the live order, but reads the BLOCK
+      // instead, so the operator sees a setup's phase BEFORE it ever fills.
+      for(int v = 0; v < m_virtualCount; v++)
+        {
+         int vs   = m_virtualOrders[v].blockSerial;
+         int bIdx = m_blockManager.FindBlockIndexBySerial(vs);
+         SSniperBlock b;
+         string phaseLabel = "UNKNOWN";
+         if(bIdx >= 0 && m_blockManager.GetBlockAt(bIdx, b))
+            phaseLabel = (b.touches == 0) ? "R (S/R Reversal)" : "C (Continuation)";
+         s += "    Setup #" + IntegerToString(vs) + " " +
+              (m_virtualOrders[v].direction == DIR_LONG ? "LONG" : "SHORT") +
+              " | Phase : " + phaseLabel + "\n";
+        }
       s += "  Basket tranches : " + IntegerToString(m_basketCount) + "\n";
       s += "  Session         : " + (m_sessionID == "" ? "(flat)" : m_sessionID) + "\n";
 
@@ -2536,29 +2551,17 @@ public:
                   mod.touches += 1;
                   mod.limitOrderTicket   = 0;
                   mod.pendingOrderCancel = false;
-                  if(mod.touches >= 2)
-                    {
-                     mod.isTriggered     = true;
-                     mod.hasPlacedOrder  = true;
-                     mod.deleteOnBarTime = iTime(m_symbol, PERIOD_CURRENT, 0);
-                     m_blockManager.SetBlockAt(bi, mod);
-                     if(EnableLogging)
-                        Print("[OrderManager] REVERSAL FILLED: block ", mod.tradeId,
-                              " touches=2 -> retired");
-                    }
-                  else
-                    {
-                     mod.isTriggered     = false;
-                     mod.hasPlacedOrder  = false;
-                     mod.isArmed         = false;
-                     mod.hasExited       = false;
-                     mod.deleteOnBarTime = 0;
-                     m_blockManager.SetBlockAt(bi, mod);
+                  mod.isTriggered        = false;
+                  mod.hasPlacedOrder     = false;
+                  mod.isArmed            = false;
+                  mod.hasExited          = false;
+                  mod.deleteOnBarTime    = 0;
+                  m_blockManager.SetBlockAt(bi, mod);
+                  if(mod.touches == 1)
                      m_blockManager.SyncReversalCluster(bi);
-                     if(EnableLogging)
-                        Print("[OrderManager] TOUCH 1 CONSUMED: block ", mod.tradeId,
-                              " (prev=", prevTouch, ") -> Phase 2 reversal armed");
-                    }
+                  if(EnableLogging)
+                     Print("[OrderManager] TOUCH ", mod.touches, " CONSUMED: block ", mod.tradeId,
+                           " (prev=", prevTouch, ") -> Continuation phase active");
                  }
               }
            }
@@ -2666,15 +2669,15 @@ public:
          if(!SentimentPasses(blocks[bi])) continue;
          if(m_blockManager.IsBlockedByPrimary(bi)) continue;
 
-         // v5.38 -- N/R PHASE TAG + REUSE OF THE ARM SESSION. A block serial
-         // executes at most twice: its FIRST fill (touches == 0) is the Phase 1
-         // "N"ormal bounce, its SECOND (touches >= 1) the Phase 2 "R"eversal.
-         // The one-letter marker rides in the broker comment. The SESSION id is
-         // NOT re-minted here: it was minted when the setup was ARMED and is
-         // carried on the descriptor, so the arm snapshot, this fill and the
-         // later exit all resolve to ONE journal file. A fallback mint (only
-         // if a descriptor predates the field) keeps the identifier defined.
-         string phaseType = (blocks[bi].touches == 0) ? "N" : "R";
+         // v5.38 -- R/C PHASE TAG + REUSE OF THE ARM SESSION. A block serial
+         // executes repeatedly: its FIRST fill (touches == 0) is the Phase 1
+         // "R"eversal (the S/R bounce), each later fill (touches >= 1) the
+         // Phase 2 "C"ontinuation. The one-letter marker rides in the broker
+         // comment. The SESSION id is NOT re-minted here: it was minted when
+         // the setup was ARMED and is carried on the descriptor, so the arm
+         // snapshot, this fill and the later exit all resolve to ONE journal
+         // file, and a fallback mint keeps the identifier defined.
+         string phaseType = (blocks[bi].touches == 0) ? "R" : "C";
          string newSessionId = vo.sessionId;
          if(newSessionId == "")
            {
@@ -2706,7 +2709,7 @@ public:
          request.tp        = 0;                     // NO TP - Pine trail-only exits
          request.deviation = MaxSlippage;
          request.magic     = MagicNumber;
-         // N/R + session marker, clamped to the MT5 31-char limit. The same
+         // R/C + session marker, clamped to the MT5 31-char limit. The same
          // string is already the journal session ID set above, so the terminal
          // row and the journal agree without a second source of truth.
          request.comment   = ClampOrderComment(newSessionId + "_" + phaseType);
@@ -2801,20 +2804,11 @@ public:
          block.limitOrderTicket    = 0;
          block.pendingOrderCancel  = false;
          block.priceAbortLogged    = false;
-         if(block.touches >= 2)
-           {
-            block.isTriggered     = true;
-            block.hasPlacedOrder  = true;
-            block.deleteOnBarTime = iTime(m_symbol, PERIOD_CURRENT, 0);
-           }
-         else
-           {
-            block.isTriggered     = false;
-            block.hasPlacedOrder  = false;
-            block.isArmed         = false;
-            block.hasExited       = false;
-            block.deleteOnBarTime = 0;
-           }
+         block.isTriggered         = false;
+         block.hasPlacedOrder      = false;
+         block.isArmed             = false;
+         block.hasExited           = false;
+         block.deleteOnBarTime     = 0;
          m_blockManager.SetBlockAt(bi, block);
 
          // Cluster sync: any same-polarity Phase 1 sibling sharing this

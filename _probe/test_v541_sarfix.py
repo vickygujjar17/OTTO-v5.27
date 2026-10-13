@@ -12,10 +12,11 @@ properties of the shipped sources.
      m_activeDirection != newDir, mirroring the virtual trigger's by-construction
      reversal check.
 
-  2. N/R COMMENT TAG (physical). PlaceOrArmOrder() ROUTE A now stamps the
-     block's Phase marker ("N" = Phase 1 bounce / "R" = Phase 2 reversal) into
-     the resting broker limit's MT5 comment, so a terminal row names its phase
-     exactly as the virtual MARKET leg already does.
+  2. R/C COMMENT TAG (physical). PlaceOrArmOrder() ROUTE A now stamps the
+     block's Phase marker ("R" = Phase 1 S/R reversal bounce / "C" = Phase 2
+     trend continuation) into the resting broker limit's MT5 comment, so a
+     terminal row names its phase exactly as the virtual MARKET leg already
+     does.
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -127,23 +128,23 @@ check("newDir is resolved to a concrete direction before the guard",
 
 
 # ----------------------------------------------------------------------
-# 2. N/R phase tag on the resting PHYSICAL limit comment
+# 2. R/C phase tag on the resting PHYSICAL limit comment
 # ----------------------------------------------------------------------
-print("\n-- Physical route N/R comment tag --")
+print("\n-- Physical route R/C comment tag --")
 
 check("PlaceOrArmOrder located", ROUTER is not None)
 
 # The phase local must be derived from the block's touch count: a block's
-# FIRST fill (touches == 0) is the Phase 1 "N"ormal bounce, its SECOND
-# (touches >= 1) the Phase 2 "R"eversal.
+# FIRST fill (touches == 0) is the Phase 1 "R"eversal (S/R bounce), each
+# later fill (touches >= 1) the Phase 2 "C"ontinuation.
 check("phase local is derived from block.touches",
       ROUTER is not None and
       re.search(r'string\s+phaseType\s*=\s*\(\s*block\.touches\s*==\s*0\s*\)'
-                r'\s*\?\s*"N"\s*:\s*"R"\s*;', ROUTER) is not None)
+                r'\s*\?\s*"R"\s*:\s*"C"\s*;', ROUTER) is not None)
 
 # The physical comment must carry the phase marker between the session id and
 # the "_P" (physical) flag.
-check("physical comment embeds the N/R phase tag",
+check("physical comment embeds the R/C phase tag",
       ROUTER is not None and
       'ClampOrderComment(armSessionId + "_" + phaseType + "_P")' in ROUTER)
 

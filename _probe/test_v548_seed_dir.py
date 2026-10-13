@@ -2,10 +2,10 @@
 v5.48a static verification probe - VIRTUAL-FIRE PHASE-2 SEED DIRECTION.
 
 A block carries two phases in one integer: touches == 0 is the PHASE 1
-"N"ormal bounce (support -> LONG, resistance -> SHORT), touches == 1 is the
-PHASE 2 "R"eversal, where the setup trades the reclaimed zone as an S/R FLIP
-(support -> SHORT, resistance -> LONG). GetDirectionForBlock() is the single
-place that decides which side a block is on, and it reads that integer.
+"R"eversal bounce (support -> LONG, resistance -> SHORT), touches >= 1 is the
+PHASE 2 "C"ontinuation, where the setup trades the reclaimed zone as an S/R
+FLIP (support -> SHORT, resistance -> LONG). GetDirectionForBlock() is the
+single place that decides which side a block is on, and it reads that integer.
 
 Both fill paths seed the live basket with SeedActiveTradeFromBlock(), which
 historically derived its direction from GetDirectionForBlock() -- correct only
