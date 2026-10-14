@@ -563,27 +563,27 @@ void UpdateMarketDay(void)
 //+------------------------------------------------------------------+
 //| MAPPED direction of a zone for the portfolio bias vote.         |
 //|                                                                 |
-//| A Support / Resistance zone is DISCOVERED polarity, NOT trade    |
-//| direction. HiveMind publishes a LONG / SHORT consensus into the  |
-//| correlation matrix, and the conflict tie-breaker does not merely  |
-//| prefer one of two opposing zones -- it DELETES the losing         |
-//| polarity and vetoes its live orders. Reading the raw zone here    |
-//| would therefore publish the EXACT OPPOSITE bias to how every      |
-//| entry is mapped, so the hive mind would systematically veto       |
-//| exactly the setups this build now takes.                          |
-//|                                                                  |
-//| Byte-identical twin of COttoOrderManager::GetDirectionForBlock()  |
-//| and COttoBlockManager::BlockDirection() (both private): the       |
-//| standard two-phase mapping is PHASE-AWARE -- a fresh zone          |
-//| (touches == 0) is a PHASE 1 BOUNCE (Support -> DIR_LONG) and a    |
-//| zone that has consumed Touch 1 (touches >= 1) is a PHASE 2        |
-//| REVERSAL that trades the S/R flip (Support -> DIR_SHORT).          |
+//| A Support / Resistance zone is DISCOVERED polarity, NOT trade   |
+//| direction. HiveMind publishes a LONG / SHORT consensus into the |
+//| correlation matrix, and the conflict tie-breaker does not merely|
+//| prefer one of two opposing zones -- it DELETES the losing       |
+//| polarity and vetoes its live orders. Reading the raw zone here  |
+//| would therefore publish the EXACT OPPOSITE bias to how every    |
+//| entry is mapped, so the hive mind would systematically veto     |
+//| exactly the setups this build now takes.                        |
+//|                                                                 |
+//| Twin of COttoOrderManager::GetDirectionForBlock() and           |
+//| COttoBlockManager::BlockDirection() (both private). v5.52 PURE  |
+//| CONTINUATION: the mapping is UNCONDITIONAL and reads no phase --|
+//| a RESISTANCE zone trades DIR_LONG (a breakout above it) and a   |
+//| SUPPORT zone trades DIR_SHORT (a breakdown below it), which is  |
+//| exactly Pine's can_place gate. All three copies must stay in    |
+//| lockstep or this vote would oppose the entries it is meant to   |
+//| arbitrate.                                                      |
 //+------------------------------------------------------------------+
 ENUM_TRADE_DIRECTION MappedZoneDirection(const SSniperBlock &b)
   {
-   if(b.touches >= 1)
-      return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Phase 2 — reversal (S/R flip)
-   return (b.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;      // Phase 1 — normal bounce
+   return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Support -> SHORT, Resistance -> LONG
   }
 
 //+------------------------------------------------------------------+
@@ -605,21 +605,26 @@ void HiveMind(void)
       else if(allBlocks[b].type == BLOCK_RESISTANCE)
          resistanceVote++;
       // Each live zone votes with the direction it would actually TRADE,
-      // not with the polarity it was discovered as: the two-phase mapping
-      // is PHASE-AWARE, so the vote uses the helper rather than the type.
+      // not with the polarity it was discovered as, so the vote uses the
+      // helper rather than the raw type.
       mappedVote += (MappedZoneDirection(allBlocks[b]) == DIR_LONG) ? 1 : -1;
      }
 
    int myBias = 0;
    // The tie-breaker DELETES the zone whose MAPPED direction LOST the vote.
-   // Both DeleteBlockType arguments below carry an identical
-   // "supportVote > 0 ? Long : Short" discriminator:
-   //   in a two-polarity conflict (supportVote > 0) it picks polarity-vs-polarity;
-   //   with only a resistance zone live (supportVote == 0) it picks the polled
-   //   winner as a zone, so a resistance-only field cannot be deleted.
-   // Log lines and myBias are unchanged:
-   //   resolution == +1 -> peers Long  -> the SHORT-mapped zone is deleted
-   //   resolution == -1 -> peers Short -> the LONG-mapped  zone is deleted
+   // Under v5.52 an unconditional mapping is in force -- RESISTANCE -> LONG,
+   // SUPPORT -> SHORT -- and the two a-priori branches below read it straight:
+   //   mappedVote > 0 -> peers Long  -> the SHORT-mapped (Support) side goes.
+   //   mappedVote < 0 -> peers Short -> the LONG-mapped (Resistance) side goes.
+   // The else branch is unchanged from the two-phase build.
+   //
+   // PRE-EXISTING, deliberately NOT touched here: the two DeleteBlockType()
+   // arguments inside the ResolveBidirectionalConflict() branches below look
+   // INVERTED against this comment and against their own 'kept Support' /
+   // 'kept Resistance' log lines (they pass BLOCK_RESISTANCE where a Long
+   // resolution implies Support and vice versa). The inversion predates this
+   // pivot -- it is a property of how a zone maps, which is not what changed --
+   // so it is recorded rather than fixed in a continuation-mechanism commit.
    if(mappedVote > 0 && resistanceVote == 0)
       myBias = 1;
    else if(mappedVote < 0 && supportVote == 0)
@@ -774,11 +779,11 @@ void OnTick(void)
    // ================================================================
    if(!g_newsFilter.IsInNewsBlackout() && !g_dailyDD_Paused)
      {
-      // Every armed block - Phase 1 (touches==0) and Phase 2 (touches==1)
-      // alike - now routes through the single in-memory virtual engine:
-      // PlaceOrdersForArmedBlocks() ARMS the order and the order manager's
-      // CheckVirtualTriggers() FIRES the MARKET leg once the level trades
-      // through. The old per-phase execution split is gone.
+      // Every armed block routes through the single hybrid engine:
+      // PlaceOrdersForArmedBlocks() ARMS the order -- a resting broker limit
+      // when the price permits one, else an in-memory virtual order -- and the
+      // order manager's CheckVirtualTriggers() FIRES the MARKET leg once the
+      // continuation level trades through. v5.52 has no per-phase split.
       g_orderManager.PlaceOrdersForArmedBlocks();
      }
 

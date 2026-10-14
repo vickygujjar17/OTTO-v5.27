@@ -17,16 +17,17 @@
 
 // Block polarity as DISCOVERED by the pattern engine. Support/Resistance here
 // describe the ZONE, NOT the trade direction. The zone -> direction mapping is
-// owned by COttoOrderManager::GetDirectionForBlock() and is PHASE-AWARE per the
-// two-phase lifecycle: a fresh zone (touches == 0) is a PHASE 1 BOUNCE
-// (Support -> BUY, Resistance -> SELL); a zone that has consumed Touch 1
-// (touches >= 1) is a PHASE 2 REVERSAL that trades the S/R flip
-// (Support -> SELL, Resistance -> BUY). Enum VALUES are persisted and compared,
-// so they must never be renumbered.
+// owned by COttoOrderManager::GetDirectionForBlock() and is UNCONDITIONAL in
+// v5.52's PURE CONTINUATION engine: a RESISTANCE zone trades LONG (a breakout
+// above it) and a SUPPORT zone trades SHORT (a breakdown below it), which is
+// exactly what Pine's can_place gate states (long & resistance, short &
+// support). The old two-phase fade -- the first fill a bounce, only a reclaimed
+// zone the flip -- is retired, so this mapping no longer reads block.touches.
+// Enum VALUES are persisted and compared, so they must never be renumbered.
 enum ENUM_BLOCK_TYPE
   {
-   BLOCK_RESISTANCE = 0,  // Resistance zone (Phase 1 -> SELL, Phase 2 -> BUY)
-   BLOCK_SUPPORT    = 1   // Support zone    (Phase 1 -> BUY,  Phase 2 -> SELL)
+   BLOCK_RESISTANCE = 0,  // Resistance zone (-> LONG: breakout above it)
+   BLOCK_SUPPORT    = 1   // Support zone    (-> SHORT: breakdown below it)
   };
 
 enum ENUM_TRADE_DIRECTION
@@ -135,9 +136,13 @@ struct SSniperBlock
    datetime          creationTime;     // when the block was formed
    int               creationBarSerial;// Bars() serial at creation (diagnostics)
    int               serial;           // unique block id (for trade_id + visuals)
-   // v5.34: two-phase lifecycle counter. 0 = fresh/unarmed, 1 = Touch 1 (the
-   // normal entry) consumed, 2 = Touch 2 (the shifted reversal) consumed. It is
-   // zeroed by ZeroMemory() at every block-creation site (see COttoBlockManager).
+   // v5.34: lifecycle counter of FILLS CONSUMED on this block: 0 = never filled,
+   // 1 = the single continuation entry has filled, 2+ = a duplicate fill, which
+   // the v5.28 one-tranche-per-block shield refuses. v5.52: the two-phase engine
+   // this counter once encoded is gone, but the field is KEPT because that shield
+   // reads it -- retiring it would let one block fill a SECOND tranche. It no
+   // longer influences direction; see COttoOrderManager::GetDirectionForBlock().
+   // Zeroed by ZeroMemory() at every block-creation site (COttoBlockManager).
    int               touches;
    // v5.36: why this zone was promoted to a Phase 2 reversal — the convertible
    // veto that triggered the conversion. VETO_NONE when the block reached
@@ -258,11 +263,14 @@ input double   InpTrailATRMultiplier = 1.5;   // Dynamic trail ATR multiplier (P
 input group "══════════════════════════════════════════════════"
 input group "  [4] EXECUTION SETTINGS (Pine entry/arm)"
 input group "══════════════════════════════════════════════════"
-input ENUM_ENTRY_STYLE InpEntryStyle = ENTRY_MIDPOINT;  // Midpoint or Front Edge
+input ENUM_ENTRY_STYLE InpEntryStyle = ENTRY_FRONT_EDGE; // Midpoint or Front Edge
 input double   InpArmATR          = 0.0;      // Arming distance (ATR) — 0 = instant arm
-// v5.34: Shift Reversal entry. When true, Touch 2 of a zone is entered from its
-// OUTER boundary instead of the midpoint (the "shifted reversal" geometry).
-input bool     InpShiftReversalEntry = true;  // Shift Reversal (Touch 2) Entry to Outer Boundary
+// v5.34: Shift Reversal entry -- the Touch 2 outer-boundary geometry.
+// v5.52: RETIRED. The pure-continuation engine has no Touch 2 (a continuation
+// is a single breakout/breakdown entry), so no consumer remains in the tree.
+// Kept as a DECLARED NO-OP so an old .set file still loads without an unknown-
+// input error; it changes no behaviour.
+input bool     InpShiftReversalEntry = false; // RETIRED (v5.52) - no-op, kept for .set compatibility
 input bool     InpPyramidEnable   = true;     // Enable 4-tranche pyramiding (unified group SL)
 // v5.29: Tranche 1 risk continues to flow through RiskPercent in group [6]
 // (1.0%), so there is NO separate InpRiskT1Pct input. The v5.27 declaration of
@@ -394,21 +402,22 @@ input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual
 
 //+------------------------------------------------------------------+
 input group "══════════════════════════════════════════════════"
-input group "  [12] VETO REVERSAL CONVERSIONS — v5.52"
+input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.52"
 input group "══════════════════════════════════════════════════"
-// v5.34: the old [12] "INVERTED S/R + VIRTUAL ORDERS" experiment block was
-// retired. The zone -> direction mapping is now the standard PHASE-AWARE
-// two-phase lifecycle (see ENUM_BLOCK_TYPE and GetDirectionForBlock) and the
-// virtual-order engine was deleted. These five flags let a vetoed setup
-// be re-used as a REVERSAL candidate instead of being discarded. They are now
-// consumed by v5.34 Part 2: a convertible veto on a Phase 1 block (touches==0)
-// advances it to Touch 2 via COttoBlockManager::TryConvertToReversal instead of
-// deleting the zone outright.
-input bool     InpRevFrontRun = true;   // Convert Front-Run Veto to Phase 2 Reversal
-input bool     InpRevNearMiss = true;   // Convert Near-Miss Veto to Phase 2 Reversal
-input bool     InpRevStale    = true;   // Convert Stale Veto to Phase 2 Reversal
-input bool     InpRevMom      = true;   // Convert Momentum Veto to Phase 2 Reversal
-input bool     InpRevFvg      = true;   // Convert FVG Veto to Phase 2 Reversal
+// v5.34 built five switches that let a vetoed Phase 1 setup be re-used as a
+// Phase 2 REVERSAL instead of being discarded.
+//
+// v5.52 RETIRES that machinery. The pure CONTINUATION engine has no second
+// phase to promote a block INTO, so COttoBlockManager::TryConvertToReversal()
+// and SyncReversalCluster() are gone and a convertible veto is now simply a
+// veto. The five inputs are KEPT as DECLARED NO-OPS rather than deleted, so an
+// old .set file from a two-phase build still loads instead of aborting on an
+// unknown input. Nothing in the tree reads them any longer.
+input bool     InpRevFrontRun = false;  // RETIRED (v5.52) - no-op, kept for .set compatibility
+input bool     InpRevNearMiss = false;  // RETIRED (v5.52) - no-op, kept for .set compatibility
+input bool     InpRevStale    = false;  // RETIRED (v5.52) - no-op, kept for .set compatibility
+input bool     InpRevMom      = false;  // RETIRED (v5.52) - no-op, kept for .set compatibility
+input bool     InpRevFvg      = false;  // RETIRED (v5.52) - no-op, kept for .set compatibility
 //| Global Constants                                                 |
 //+------------------------------------------------------------------+
 #define MAX_BLOCKS        50        // Max concurrent S/R blocks (memory safety)
