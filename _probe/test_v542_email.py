@@ -17,9 +17,11 @@ journal file that the terminal writer ships.
      LogEntry() (the fill record) still write their SUBJECT + body and close
      the handle, but they do NOT email.
 
-  3. CONVERSION STAYS SILENT. LogConversion() (Phase 1 dropped for Phase 2
-     reversal) writes its notice but does NOT email -- it is a re-phase, not a
-     session endpoint.
+  3. CONVERSION IS GONE (v5.52). LogConversion() (Phase 1 dropped -> Phase 2
+     reversal) no longer exists anywhere in the tree: the pure-continuation
+     engine has no phase to move a block between, so there is no conversion
+     left to write or to silence. Asserting a sender census over it would only
+     pin dead code, so the checks were removed with the method.
 
   4. THE TERMINAL WRITER STILL SENDS, AFTER CloseHandle(). LogExit() keeps
      the SendMailFromFile() call positioned after CloseHandle(), so the
@@ -96,7 +98,6 @@ EXIT = func_body(JRN_T, r"void\s+LogExit\s*\(")
 CANCEL = func_body(JRN_T, r"void\s+LogCancellation\s*\(")
 ARM = func_body(JRN_T, r"void\s+LogSetupArmed\s*\(")
 ENTRY = func_body(JRN_T, r"void\s+LogEntry\s*\(")
-CONV = func_body(JRN_T, r"void\s+LogConversion\s*\(")
 
 
 
@@ -140,13 +141,11 @@ check("LogEntry() does NOT email", ENTRY is not None and "SendMailFromFile" not 
 
 
 # ----------------------------------------------------------------------
-# 3. Conversion stays silent
+# 3. Conversion is gone (v5.52) -- see the module docstring
 # ----------------------------------------------------------------------
-print("\n-- Conversion stays silent --")
-
-check("LogConversion() located", CONV is not None)
-check("LogConversion() closes the handle", CONV is not None and "CloseHandle();" in CONV)
-check("LogConversion() does NOT email", CONV is not None and "SendMailFromFile" not in CONV)
+# LogConversion() was removed with the two-phase engine, so there is no
+# conversion writer left to census. (Deliberately no check here: re-adding one
+# would pin a method this engine is never supposed to have back.)
 
 
 # ----------------------------------------------------------------------

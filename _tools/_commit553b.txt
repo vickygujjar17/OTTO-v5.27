@@ -1,0 +1,51 @@
+fix: harmonize comments and probes with pure continuation edge logic
+
+The v5.52 pivot flipped which zone edge the Front-Edge entry sits on, but left
+the prose behind: the block/order managers still described the entry as the
+NEAR edge the price APPROACHES FROM, with stop-style inversion and Phase 1/2
+branches that no longer exist. The code has been
+`(DIR_LONG) ? b.top : b.bottom` throughout, so a Resistance LONG is entered at
+resistance.top and a Support SHORT at support.bottom -- the FAR edge the
+breakout crosses THROUGH. Every "near edge / resistance.bottom / support.top"
+note was therefore inverted, not merely stale.
+
+SOURCE (comment-only; zero behavioural change):
+  * OttoDefines.mqh -- ENTRY_FRONT_EDGE now names the FAR edge the breakout
+    crosses and the correct support/resistance mapping; conversionReason marked
+    VESTIGIAL (it has no writer and no reader left); VETO_FVG expanded to the
+    full "Fair Value Gap (FVG)" label.
+  * COttoBlockManager.mqh -- BlockEntryPrice() header rewritten around the FAR
+    edge; both veto-funnel projection notes drop the dead "Phase 2
+    outer-boundary" anchor; the arming/break notes corrected (their near/far
+    wording was right, but they still called the entry a resting limit);
+    section-comment indentation fixed.
+  * COttoOrderManager.mqh -- CalcEntryPrice(), the PlaceOrArmOrder() header and
+    its CONTINUATION NOTE, the VIRTUAL arm notes, the v5.48 seed notes and the
+    SVirtualOrder comment all re-stated against the FAR-edge continuation.
+    The live reversal machinery (InitiateReversal/CompleteReversal) is
+    deliberately untouched -- m_reversalInProgress proves it still runs.
+  * COttoJournal.mqh -- LogConversion()'s retired tombstone reworded to the
+    constant continuation vocabulary.
+
+PROBES (re-anchored on the shipped vocabulary):
+  * test_v542_email.py -- drop the three LogConversion() checks and the dead
+    func_body probe: the method is deleted, so the census pinned nothing.
+  * test_v540_hybrid.py -- fill-scanner check now asserts the one-shot block
+    retirement; arm-journal check asserts the constant
+    "C (Pure Trend Continuation)" label instead of the R/C pair.
+  * test_v541_sarfix.py -- asserts the physical "_C_P" literal and that the
+    touches-derived phase local is gone.
+  * test_v548_hourly.py -- asserts the constant "C (Continuation)" label and
+    the absence of the touch-count discriminator.
+  * test_v548_seed_dir.py -- retitled FILL-TIME SEED DIRECTION; pins the
+    surviving seed contract (overrideDir/DIR_NONE precedence, fill-time capture
+    ordering, two-argument physical seed, call-site census) and the ABSENCE of
+    the retired touch counter, instead of the deleted two-phase mechanics.
+
+Verification: build_check.ps1 GATE PASSED (0 errors, 0 warnings, 11 modules);
+verify_integrity.py 11/11 with strict CRLF; all five touched probes green
+(142/142 checks). The edited modules are proven code-identical to HEAD once
+comments are stripped. Five probes remain red for pre-existing reasons
+(three frozen v5.5x files that assert symbols removed in v5.52/v5.53, plus the
+deliberate v5.28 -> v5.52 migration deltas in test_v52x_pyramid.py and
+test_v543_session.py); none is affected by this change.

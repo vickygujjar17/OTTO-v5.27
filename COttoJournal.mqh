@@ -347,8 +347,8 @@ public:
    //+----------------------------------------------------------------+
    //| LOG CONVERSION — REMOVED (v5.52).                               |
    //|                                                                 |
-   //| A conversion notice ('Phase 1 dropped -> Phase 2 Continuation') |
-   //| has no meaning without the two-phase engine: no block is ever   |
+   //| The old notice ('Phase 1 dropped -> Phase 2 Continuation') has  |
+   //| no meaning without the two-phase engine: no block is ever       |
    //| re-phased, so this method had no writer. Deleted rather than left|
    //| inert so the next reader is not misled into thinking a conversion|
    //| path still exists. A vetoed setup is now simply cancelled and   |

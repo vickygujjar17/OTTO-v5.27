@@ -59,8 +59,10 @@ private:
    datetime                m_manualNoSLWarnTick;
 
    // --- Virtual Order Engine (v5.37 Part 1) ---------------------------
-   // Phase 1/2 setups are held in memory and executed as MARKET orders
-   // when price reaches the zone, bypassing broker pending-price rules.
+   // Armed setups are held in memory and executed as MARKET orders when price
+   // crosses the continuation level, bypassing broker pending-price rules.
+   // v5.52 makes this the ORDINARY path: the FRONT-EDGE continuation entry is
+   // a breakout (STOP-style), which a broker limit cannot legitimately rest.
    struct SVirtualOrder
      {
       int                  blockIndex;
@@ -515,7 +517,7 @@ private:
       // The v5.34 two-phase fade -- the first fill a bounce, only a reclaimed
       // zone the flip -- is retired.
       //
-      // This is the single chokepoint every consumer reads (front edge, SL,
+      // This is the single chokepoint every consumer reads (entry edge, SL,
       // TP, basket seed, correlation gate), so the mapping stays coherent.
       // COttoBlockManager::BlockDirection() and otto.mq5's MappedZoneDirection()
       // are identical twins and must be kept in lockstep, or the
@@ -654,12 +656,14 @@ private:
      {
       if(InpEntryStyle == ENTRY_MIDPOINT)
          return block.midpoint;
-      // The front edge is the edge the price APPROACHES FROM. v5.52 keys it
-      // straight off the unconditional mapped direction, so a Resistance LONG
-      // is entered at resistance.bottom and a Support SHORT at support.top --
-      // the NEAR edge of the zone, which price crosses on its way through it.
-      // Twin of COttoBlockManager::BlockEntryPrice(); they must stay identical
-      // or the Front-Run veto would judge a different price from the order's.
+      // The front edge is the edge the breakout crosses THROUGH, i.e. the FAR
+      // edge of the zone relative to price. v5.52 keys it straight off the
+      // unconditional mapped direction, so a Resistance LONG is entered at
+      // resistance.top (broken out ABOVE) and a Support SHORT at
+      // support.bottom (broken down BELOW) -- the FAR edge, which the price
+      // crosses on its way out of the zone. Twin of
+      // COttoBlockManager::BlockEntryPrice(); they must stay identical or the
+      // Front-Run veto would judge a different price from the order's.
       return (GetDirectionForBlock(block) == DIR_LONG) ? block.top : block.bottom;
      }
 
@@ -686,13 +690,12 @@ private:
    //| the Front-Run veto). A physical fill is caught by                |
    //| CheckPendingOrderFills(); a virtual arm fires its MARKET leg in  |
    //| CheckVirtualTriggers() on the cross.                             |
-   //|                                                                  |
-   //| v5.52 CONTINUATION: with InpEntryStyle = ENTRY_FRONT_EDGE the    |
-   //| entry is STOP-style (see the CONTINUATION NOTE at the routing    |
-   //| tail), so the VIRTUAL arm is the ordinary path and a physical    |
-   //| rest is the pullback case. Either way the trigger is a MARKET    |
-   //| deal when the continuation level is crossed.                     |
    //+------------------------------------------------------------------+
+   // v5.52 CONTINUATION: with InpEntryStyle = ENTRY_FRONT_EDGE the entry is
+   // the FAR edge the breakout crosses (a buy-stop above resistance / a
+   // sell-stop below support), so the VIRTUAL arm is the ordinary path and a
+   // physical rest is the pullback case. Either way the trigger is a MARKET
+   // deal when the level is crossed.
    bool                    PlaceOrArmOrder(int blockIndex, SSniperBlock &block)
      {
       if(block.isVetoed || block.isTriggered || block.hasPlacedOrder)
@@ -749,7 +752,7 @@ private:
       // The shift moved a Touch-1 block's entry to the OUTER boundary by one
       // full stop distance, to order the reversal beyond the extreme that
       // rejected the Phase 1 bounce. With the two-phase engine gone there is
-      // no Phase 2 to shift, so the entry is the single front edge from
+      // no Phase 2 to shift, so the entry is the single mapped edge from
       // CalcEntryPrice() and InpShiftReversalEntry is a declared no-op.
       // slDist stays hoisted here: SL/TP below are entry-relative and reuse it.
       double slDist     = CalcSLDistance(block, atr);
@@ -761,11 +764,11 @@ private:
       // itself (a legal price becomes a real broker limit, an illegal one arms
       // virtually), so it can never dispatch a resting order the server refuses.
 
-      // slDist was HOISTED above the shifted Phase 2 entry (v5.34 Part 3): the
-      // shift consumes it, so it is computed once and reused here. SL/TP/isLong
-      // all key off the MAPPED direction
-      // (isLong below) so each phase stops and targets on the correct side,
-      // and the Phase 2 mapping carries straight through.
+      // slDist was HOISTED above the v5.34 Part 3 shifted Phase 2 entry, which
+      // consumed it; that shift is gone but the hoist stays: it is computed once
+      // and reused by SL/TP below. SL/TP/isLong all key off the MAPPED
+      // direction (isLong below), so the single continuation entry stops and
+      // targets on the correct side of the breakout.
       bool   isLong     = (GetDirectionForBlock(block) == DIR_LONG);
       double stopLoss   = isLong ? entryPrice - slDist : entryPrice + slDist;
       // v5.31: the take-profit projection is InpMaxRR (default 4.0R).
@@ -822,9 +825,10 @@ private:
       // and let CheckVirtualTriggers() fire it as a MARKET deal on the cross.
       //
       // v5.52 CONTINUATION NOTE. With InpEntryStyle = ENTRY_FRONT_EDGE the
-      // entry is the zone edge price CROSSES -- a Resistance LONG is entered at
-      // resistance.bottom and a Support SHORT at support.top -- so the trigger
-      // is STOP-style, not limit-style. That is handled by the two routes below
+      // entry is the FAR edge the breakout crosses -- a Resistance LONG is
+      // entered at resistance.top (broken out above) and a Support SHORT at
+      // support.bottom (broken down below) -- so the trigger is STOP-style
+      // (breakout), not limit-style. That is handled by the two routes below
       // rather than by a new order type: while the price has NOT yet crossed,
       // the entry sits on the non-limit side of the market, this test is false,
       // and the setup arms VIRTUALLY and fires a MARKET deal on the cross. A
@@ -2622,12 +2626,12 @@ public:
            { RemoveVirtualOrderAt(v); continue; }
 
          bool isLong = (vo.direction == DIR_LONG);
-         // v5.48 -- the side THIS fill actually executes. Captured from the
-         // arm-time virtual order BEFORE the touch below is consumed, because
-         // that increment promotes the block to Phase 2, where
-         // GetDirectionForBlock() reports the S/R-FLIPPED direction. The seed
-         // must describe the order that was sent, not the block's new phase, so
-         // this stale-free value is threaded into SeedActiveTradeFromBlock().
+         // v5.48 -- the side THIS fill actually executes, captured from the
+         // arm-time virtual order and threaded into SeedActiveTradeFromBlock().
+         // The seed must describe the order that was SENT, never a value
+         // re-derived from a mutable block. v5.52's derived mapping is
+         // unconditional, so this is now belt-and-braces (see the seed's own
+         // note) -- kept because the virtual fire knows the exact side it sent.
          ENUM_TRADE_DIRECTION seedDir = isLong ? DIR_LONG : DIR_SHORT;
 
          // THE CROSS TEST. A MARKET condition, not a resting price: a LONG
@@ -2780,7 +2784,7 @@ public:
          // --- Commit the filled state ---
          // rrUnit is recomputed from the block's OWN geometry (not the broker-
          // adjusted stop) so SeedActiveTradeFromBlock() rebuilds exactly the
-         // basket 1R math a resting Phase 1 limit fill would have produced.
+         // basket 1R math a resting physical limit fill would have produced.
          double atr    = m_blockManager.GetATR();
          double slDist = (atr > 0) ? CalcSLDistance(block, atr)
                                    : MathAbs(vo.triggerPrice - vo.stopLoss);
@@ -2817,9 +2821,10 @@ public:
          if(m_journal != NULL) m_journal.SetSessionID(m_sessionID);
 
          // v5.48 -- seed the basket from the side the MARKET order actually
-         // executed (seedDir, captured above), NOT from the block's phase: the
-         // touch was consumed a few lines up, so GetDirectionForBlock() would now
-         // report the flipped Phase 2 side and desync the basket from the fill.
+         // executed (seedDir, captured above), NOT by re-deriving it: a fill
+         // commits the block and the seed should describe the order that was
+         // SENT. v5.52's derived mapping is unconditional now, so this override
+         // is belt-and-braces rather than a desync fix.
          SeedActiveTradeFromBlock(block, result.order, seedDir);
          m_ordersFilled++;
 

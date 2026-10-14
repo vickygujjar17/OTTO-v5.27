@@ -103,13 +103,13 @@ private:
    //| cannot reach (both veto funnel projections), so the same mapping |
    //| is mirrored rather than guessed.                                 |
    //|                                                                  |
-//| v5.52 PURE CONTINUATION: the mapping is UNCONDITIONAL and reads  |
-//| no phase and no lifecycle counter. Pine's can_place gate is      |
-//| 'flat OR (long & resistance) OR (short & support)', so a         |
-//| RESISTANCE zone is traded LONG (a breakout above it) and a       |
-//| SUPPORT zone is traded SHORT (a breakdown below it). The v5.34   |
-//| two-phase fade -- the first fill a bounce, only a reclaimed zone |
-//| the flip -- is retired with the counter that encoded it.         |
+   //| v5.52 PURE CONTINUATION: the mapping is UNCONDITIONAL and reads  |
+   //| no phase and no lifecycle counter. Pine's can_place gate is      |
+   //| 'flat OR (long & resistance) OR (short & support)', so a         |
+   //| RESISTANCE zone is traded LONG (a breakout above it) and a       |
+   //| SUPPORT zone is traded SHORT (a breakdown below it). The v5.34   |
+   //| two-phase fade -- the first fill a bounce, only a reclaimed zone |
+   //| the flip -- is retired with the counter that encoded it.         |
    //|                                                                  |
    //| The two implementations deliberately sit side by side in review: |
    //| they must stay IDENTICAL or the Front-Run veto would project its |
@@ -124,17 +124,20 @@ private:
 
    //+------------------------------------------------------------------+
    //| BlockEntryPrice — Pine entry price for a block, honouring        |
-   //| InpEntryStyle. The front edge is the edge price APPROACHES FROM, |
-   //| which follows the mapped direction: for a LONG it is             |
-   //| resistance.bottom / support.top, mirrored for a SHORT.           |
-   //|                                                                  |
-   //| This is the exact twin of COttoOrderManager::CalcEntryPrice().   |
-   //| v5.52: with the unconditional continuation mapping the front edge|
-   //| is the NEAR edge of the zone, so a Resistance LONG is entered at |
-   //| resistance.bottom and a Support SHORT at support.top. The order  |
-   //| waits at the zone and the price crosses that edge on its way     |
-   //| THROUGH it, which makes the entry a STOP-style trigger.          |
-   //+------------------------------------------------------------------+
+   //| InpEntryStyle.                                                   |
+   // The front edge is the edge the breakout crosses THROUGH, i.e. the FAR
+   // edge of the zone relative to price: for a LONG that is b.top (a
+   // resistance zone is broken out ABOVE), for a SHORT b.bottom (a support
+   // zone is broken down BELOW).
+   //
+   // This is the exact twin of COttoOrderManager::CalcEntryPrice(); the two
+   // must stay identical or the Front-Run veto would judge a different price
+   // from the order's.
+   //
+   // v5.52: the unconditional continuation mapping keys the edge off the
+   // direction alone -- (DIR_LONG) ? b.top : b.bottom -- so the order rests at
+   // the FAR edge the breakout crosses, which makes the entry a STOP-style
+   // (breakout) trigger.
    double                  BlockEntryPrice(const SSniperBlock &b) const
      {
       if(InpEntryStyle == ENTRY_MIDPOINT) return b.midpoint;
@@ -513,8 +516,9 @@ private:
             bool   isLong = (BlockDirection(b) == DIR_LONG);
             // v5.34 Part 2 used to re-anchor this projection to the Phase 2
             // outer-boundary entry. v5.52 has no Phase 2: the projection is
-            // taken straight from BlockEntryPrice(), the single front edge.
-            // Once the order rests, b.localTP supersedes this below.
+            // taken straight from BlockEntryPrice(), the single mapped edge
+            // (a resistance LONG projects from b.top, a support SHORT from
+            // b.bottom). Once the order rests, b.localTP supersedes this below.
             double target = isLong ? calcEntry + tpRR * calcSLDist
                                    : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
@@ -575,8 +579,9 @@ private:
 
             // ARMED once price has CLOSED clear of the zone on the NEAR edge --
             // for a SUPPORT zone a close ABOVE it, for a RESISTANCE zone a close
-            // BELOW it. The entry that follows rests back at the zone, so arming
-            // is the PRE-CONDITION, not the trigger.
+            // BELOW it. The continuation entry that follows triggers at the
+            // MAPPED edge (a breakout above resistance / breakdown below
+            // support), so arming is the PRE-CONDITION, not the trigger.
             //
             // This is the pre-v5.52 arming test, kept verbatim. It is deliberately
             // the edge OPPOSITE the break test below: arming looks past the NEAR
@@ -596,10 +601,10 @@ private:
          // exclusive by construction, so a block can never arm here and be
          // vetoed BROKEN in the same pass.
          //
-         // KEPT VERBATIM through the v5.52 pivot for the one phase it still
-         // has; only the dead Phase 2 arm was removed. v5.49's Phase 2 branch
-         // tested the near edge, which for an armed block was already true --
-         // it would have vetoed the live reversal on its own arming close.
+         // KEPT VERBATIM through the v5.52 pivot; only the dead Phase 2 branch
+         // was removed. That v5.49 branch tested the near edge, which for an
+         // armed block was already true -- it would have vetoed the live setup
+         // on its own arming close.
          bool isBroken =
             (b.type == BLOCK_SUPPORT && close1 < b.bottom - ATRBufferBreak * atrNow) ||
             (b.type == BLOCK_RESISTANCE && close1 > b.top + ATRBufferBreak * atrNow);
@@ -691,7 +696,7 @@ private:
             bool   isLong = (BlockDirection(b) == DIR_LONG);
             // v5.34 Part 2 used to re-anchor this projection to the Phase 2
             // outer-boundary entry. v5.52 has no Phase 2: calcEntry() already
-            // holds the single front edge, so both intra-bar and bar-close
+            // holds the single mapped edge, so both intra-bar and bar-close
             // vetoes judge one price with no shift.
             double target = isLong ? calcEntry + tpRR * calcSLDist
                                    : calcEntry - tpRR * calcSLDist;

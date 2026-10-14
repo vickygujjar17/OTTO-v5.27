@@ -18,9 +18,10 @@ flow and side-effect properties of the shipped sources.
      pending count (CountMyPendingOrders) and the cancel sweeps all span BOTH
      the broker pending pool AND the in-memory virtual book.
 
-  4. R/C PHASE + EXECUTION MODE journal: COttoJournal::LogSetupArmed() stamps
-     the Phase and Execution Mode on the arm header. v5.42: the arm no longer
-     emails -- only LogExit()/LogCancellation() ship the session file.
+  4. SETUP-ARM JOURNAL: COttoJournal::LogSetupArmed() stamps the Logic and
+     Execution Mode on the arm header. v5.52 collapses the old R/C phase to a
+     single constant continuation label, so the journal now names one logic.
+     v5.42: the arm no longer emails -- only LogExit() ships the session file.
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -149,9 +150,9 @@ check("fill scanner resolves the position via the 3-tier detector",
       FILLS is not None and "ResolveFilledPositionTicket(ticket, tracked" in FILLS)
 check("fill scanner seeds the basket from the filled block",
       FILLS is not None and "SeedActiveTradeFromBlock(blocks[i], newTicket)" in FILLS)
-check("fill scanner advances the two-phase lifecycle",
-      FILLS is not None and "mod.touches += 1;" in FILLS and
-      "SyncReversalCluster(bi)" in FILLS)
+check("fill scanner retires the block (one continuation entry per block)",
+      FILLS is not None and
+      re.search(r"mod\.isTriggered\s*=\s*true\s*;", FILLS) is not None)
 check("IsBlockOrderAlive helper exists", "IsBlockOrderAlive(ulong ticket)" in OM_T)
 check("ResolveFilledPositionTicket helper exists",
       re.search(r"ResolveFilledPositionTicket\s*\(ulong orderTicket", OM_T) is not None)
@@ -187,20 +188,19 @@ check("cancel-all prunes physical pendings before emptying the book",
 
 
 # ----------------------------------------------------------------------
-# 4. R/C phase + execution-mode journal
+# 4. Setup-arm journal: logic + execution mode
 # ----------------------------------------------------------------------
-print("\n-- R/C phase + execution mode journal --")
+print("\n-- Setup-arm journal: logic + execution mode --")
 
 check("LogSetupArmed located (LogVirtualOrderArmed is gone)",
       ARM_J is not None and "LogVirtualOrderArmed" not in JRN_T)
-check("arm journal stamps the R/C phase",
-      ARM_J is not None and "R (Phase 1 - S/R Reversal Bounce)" in ARM_J and
-      "C (Phase 2 - Trend Continuation)" in ARM_J)
+check("arm journal stamps the constant continuation logic (v5.52)",
+      ARM_J is not None and "C (Pure Trend Continuation)" in ARM_J)
 check("arm journal stamps the execution mode",
       ARM_J is not None and "PHYSICAL (Broker Limit Order)" in ARM_J and
       "VIRTUAL (In-Memory Arm)" in ARM_J)
-check("arm journal keys the phase off touches",
-      ARM_J is not None and "blk.touches == 0" in ARM_J)
+check("arm journal names the logic on the header",
+      ARM_J is not None and re.search(r"Logic\s*:", ARM_J) is not None)
 check("arm journal writes the snapshot but does NOT email (v5.42)",
       ARM_J is not None and "SUBJECT:" in ARM_J and
       "CloseHandle();" in ARM_J and "SendMailFromFile" not in ARM_J)
