@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.56"
+#property version   "5.57"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -69,14 +69,23 @@ private:
      }
 
    //+------------------------------------------------------------------+
-   //| Returns ATR at the given shift (0 = forming bar)                 |
+   //| Returns ATR at the given shift (0 = forming bar).                |
+   //|                                                                  |
+   //| PUBLIC as of v5.57: COttoOrderManager pins its own entry / SL /   |
+   //| TP geometry to GetATRAtShift(1) -- the LAST CLOSED bar -- so the  |
+   //| order and the Front-Run veto project off the SAME ATR. The cached |
+   //| GetATR() can still lag shift 1 while the forming bar moves, and a |
+   //| geometry priced from a different ATR than the veto's would skew   |
+   //| the very target the veto compares against.                        |
    //+------------------------------------------------------------------+
+public:
    double                  GetATRAtShift(int shift)
      {
       if(shift < 0 || shift >= MAX_ATR_HISTORY) return 0;
       double v = m_atrHistory[shift];
       return (v == EMPTY_VALUE || v <= 0) ? 0 : v;
      }
+private:
 
    //+------------------------------------------------------------------+
    //| Returns ATR at ANY historical shift via a direct CopyBuffer fetch |
@@ -137,9 +146,18 @@ private:
    //   SHORT: b.top    - slDist = b.bottom - 0.5*ATR
    // The SL then lands on the OPPOSITE edge of the zone, a full slDist back
    // (b.bottom for the LONG, b.top for the SHORT), so entry<->SL stays exactly
-   // slDist and the risk distance (and the RR projection) is unchanged from
-   // v5.56 -- the whole entry/SL/TP cluster is simply translated by 0.5*ATR in
-   // the breakout direction, never a wider stop.
+   // slDist and the risk distance is unchanged by the anticipation entry --
+   // the whole entry/SL cluster is simply translated by 0.5*ATR in the
+   // breakout direction, never a wider stop.
+   //
+   // v5.57 -- the RR PROJECTION did NOT follow the entry out to the
+   // anticipation offset. The Front-Run veto still projects its target from
+   // the FAR edge, not from the entry: a LONG target = b.top + tpRR*slDist, a
+   // SHORT target = b.bottom - tpRR*slDist. Anchoring the projection to the
+   // translated entry would have stretched it a further 0.5*ATR past the far
+   // edge -- measurably harsher than every build before the anticipation
+   // entry, i.e. it would veto setups that were never front-runs. See the
+   // front-run block in ProcessBlocks() for the arithmetic.
    //
    // This is the exact twin of COttoOrderManager::CalcEntryPrice(); the two
    // must stay identical or the Front-Run veto would judge a different price
@@ -512,7 +530,6 @@ private:
          // --- FRONT-RUN VETO (InpMaxRR target hit before entry) ---
          if(InpUseFrontRunVeto && b.hasExited && !b.isTriggered)
            {
-            double calcEntry = BlockEntryPrice(b, atrNow);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
             // Projected TP keys off the MAPPED direction (was: b.type ==
@@ -521,14 +538,24 @@ private:
             // -- which supersedes this projection once the order is placed --
             // would sit on the wrong side of price.
             bool   isLong = (BlockDirection(b) == DIR_LONG);
-            // v5.34 Part 2 used to re-anchor this projection to the Phase 2
-            // outer-boundary entry. v5.52 has no Phase 2: the projection is
-            // taken straight from BlockEntryPrice(), the single mapped
-            // anticipation entry (a resistance LONG projects from
-            // b.bottom+slDist, a support SHORT from b.top-slDist). Once the
-            // order rests, b.localTP supersedes this below.
-            double target = isLong ? calcEntry + tpRR * calcSLDist
-                                   : calcEntry - tpRR * calcSLDist;
+            // v5.34 Part 2 once re-anchored this projection to the Phase 2
+            // outer-boundary entry; v5.52 dropped Phase 2 and v5.57 pins the
+            // FAR-EDGE anchor. The target is measured from the edge the
+            // breakout crosses (b.top LONG / b.bottom SHORT), NOT from the
+            // anticipation entry BlockEntryPrice() returns: that entry sits a
+            // further 0.5*ATR past this edge, so projecting from it would move
+            // the target 0.5*ATR beyond what every pre-anticipation build
+            // projected -- vetoing setups that were never front-runs. MATH:
+            // slDist = blockHeight + 0.5*ATR and BlockEntryPrice() maps the
+            // entry a further 0.5*ATR past the far edge; every pre-
+            // anticipation build anchored its target ON that far edge, so this
+            // far-edge form reproduces the retired
+            // 'entryPrice +/- tpRR*slDist' target of the last far-edge build
+            // bit for bit. Once the order rests, b.localTP supersedes this.
+            double farEdge = isLong ? MathMax(b.top, b.bottom)
+                                    : MathMin(b.top, b.bottom);
+            double target  = isLong ? farEdge + tpRR * calcSLDist
+                                    : farEdge - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
                target = b.localTP;   // use exact TP parameter once placed
 
@@ -696,18 +723,18 @@ private:
 
          if(InpUseFrontRunVeto)
            {
-            double calcEntry = BlockEntryPrice(b, atrNow);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-            // Intra-bar twin of the Update() projection above — same
-            // unconditional mapped direction.
+            // Intra-bar twin of the ProcessBlocks() projection above — same
+            // unconditional mapped direction AND the same FAR-EDGE anchor.
+            // v5.57 measures the target from the edge the breakout crosses, not
+            // from the 0.5*ATR anticipation entry, so both passes judge one
+            // price; see the detailed derivation in ProcessBlocks().
             bool   isLong = (BlockDirection(b) == DIR_LONG);
-            // v5.34 Part 2 used to re-anchor this projection to the Phase 2
-            // outer-boundary entry. v5.52 has no Phase 2: calcEntry() already
-            // holds the single mapped anticipation entry, so both intra-bar
-            // and bar-close vetoes judge one price with no shift.
-            double target = isLong ? calcEntry + tpRR * calcSLDist
-                                   : calcEntry - tpRR * calcSLDist;
+            double farEdge = isLong ? MathMax(b.top, b.bottom)
+                                    : MathMin(b.top, b.bottom);
+            double target  = isLong ? farEdge + tpRR * calcSLDist
+                                    : farEdge - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
                target = b.localTP;
 

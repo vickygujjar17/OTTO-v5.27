@@ -1,0 +1,93 @@
+557: fix -- synchronize ATR shift 1 across managers and restore front-run veto strictness
+
+Two corrections ride together, and they are the same correction seen from the
+two sides of one comparison. The Front-Run veto compares the ORDER's projected
+take-profit against price; the order is built by COttoOrderManager and the veto
+is projected by COttoBlockManager. If the two ever read a different ATR, or
+anchor their projection on a different price, the veto silently judges a target
+the order will never carry. v5.57 pins both halves to one ATR and one anchor.
+
+1. ATR SHIFT SYNC -- ORDER MANAGER MOVED ONTO SHIFT 1
+
+  The block-side veto has always priced from GetATRAtShift(1), the last CLOSED
+  bar. The order side priced from m_blockManager.GetATR(), a cache that
+  refreshes from shift 0, the forming bar. On a live bar the two therefore
+  disagreed by one bar of ATR, so the entry, the stop and the veto target were
+  built from two different risk distances.
+
+  COttoOrderManager now reads GetATRAtShift(1) at all three construction
+  sites, each keeping GetATR() as the fallback for the rare tick on which the
+  shift-1 cache slot is not yet populated:
+
+    PlaceOrArmOrder()          entry / SL / TP / rrUnit build
+    target-block stop recovery (SL <= 0 path)
+    CheckVirtualTriggers()     rrUnit recovery for a virtually-filled block
+
+  COttoBlockManager::GetATRAtShift() was moved from private to public so the
+  order side can call it; no body changed, and the section is closed again
+  immediately after it, so no other member's visibility moves.
+
+  What this does NOT change: the sent order carries tp = 0 and sl = 0 at all
+  three send sites (OttoDefines.mqh:165), so localTP / localSL are veto-only
+  scratch. localSL IS read for real trade management later in the file and is
+  deliberately untouched. rrUnit (= slDist) does reach the basket 1R math, so
+  feeding it the shift-1 ATR makes that math agree with the veto -- the
+  intended direction of this fix.
+
+2. FAR-EDGE ANCHOR -- VETO STRICTNESS RESTORED
+
+  The front-running anticipation entry (ENTRY_FRONT_EDGE) moved the order's
+  entry 0.5*ATR past the far edge of the zone. The v5.56 RR projection then
+  followed the entry out, so the target sat a further 0.5*ATR beyond where
+  every pre-anticipation build had put it: the Front-Run veto had quietly
+  become the strictest it had ever been, vetoing setups that were never
+  front-runs.
+
+  Both projections are re-anchored on the FAR edge -- the edge the breakout
+  crosses -- in COttoBlockManager::ProcessBlocks() and its intra-bar twin, and
+  in COttoOrderManager::PlaceOrArmOrder():
+
+    double farEdge = isLong ? MathMax(block.top, block.bottom)
+                            : MathMin(block.top, block.bottom);
+    double takeProfit = isLong ? farEdge + tpRR * slDist
+                               : farEdge - tpRR * slDist;
+
+  MATH: slDist = blockHeight + 0.5*ATR, and BlockEntryPrice() / CalcEntryPrice()
+  map the anticipation entry a further 0.5*ATR past the far edge -- so in v5.56
+  the entry WAS the far edge for the projection's purpose. Far edge + tpRR*slDist
+  therefore reproduces the v5.56 target bit for bit; this is a re-anchoring,
+  not a new distance. The localEntry written to the block still carries the true
+  anticipation entry, so localTP / localSL remain a faithful record of what was
+  placed; only the veto PROJECTION moved.
+
+  The now-dead 'double calcEntry = BlockEntryPrice(...)' arguments are gone from
+  both block-side passes: with the projection anchored on the edge, no entry is
+  read, and none may be left dangling.
+
+NOT PROVEN HERE: behaviour. Compile-clean and probe-clean, but no Strategy
+Tester run on this branch against the v5.56 build.
+
+VERIFICATION
+
+  * Probe census: 21 GREEN / 5 RED across the 26 probes -- identical to the
+    v5.56 baseline, no unintended new failure. The 5 reds are pre-existing and
+    sanctioned (test_v528_hotfix 57/68, test_v52x_pyramid 127/130,
+    test_v531_smart_trim 15/38, test_v532_hightable 125/135,
+    test_v543_session 27/29). test_v530_price_guard stays green at 44/44.
+  * test_v531_smart_trim.py re-pinned: its two projection assertions now
+    require the far edge in both managers. Count unchanged (15/38) -- the edits
+    moved comment-invisible geometry only, so no third check flipped.
+  * Bump census: "no v5.56 literal remains in the shipped sources or docs".
+    python _tools/_bump_version.py -> 5.56 -> 5.57, exactly 20 changed lines
+    across 12 files. The two prose sites that named v5.56 are reworded to
+    describe the behaviour rather than the release, so the census now passes on
+    merit and not by exception.
+  * Build gate: build_check.ps1 -- 0 errors / 0 warnings, GATE PASSED, all 11
+    OTTO modules verified [STAGED] from the temp build tree.
+  * Encoding: scan_encoding.ps1 -> 11 files, bom=none, validUTF8=True,
+    bareLF=0. normalize_eol.py . --check -> files=11 rewritten=0, strict CRLF,
+    bareLF=0 bareCR=0.
+  * Diff size: 11 sources + README + 1 probe. Two logic anchors per manager,
+    three ATR reads, one visibility move; the rest is comments and version rows.
+
+ROLLBACK: git checkout c2e51ea -- <path>   (tag pre-frontrun)

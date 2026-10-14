@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.56"
+#property version   "5.57"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -665,11 +665,14 @@ private:
    //| The SL then lands on the OPPOSITE edge, a full slDist back      |
    //| (block.bottom for the LONG, block.top for the SHORT), so        |
    //| entry<->SL stays exactly slDist and the risk distance is        |
-   //| unchanged from v5.56 -- the whole entry/SL/TP cluster simply    |
-   //| translates by 0.5*ATR in the breakout direction. Twin of        |
-   //| COttoBlockManager::BlockEntryPrice(); they must stay identical  |
-   //| or the Front-Run veto would judge a different price from the    |
-   //| order's.                                                        |
+   //| unchanged by the anticipation entry -- the entry/SL cluster     |
+   //| simply translates by 0.5*ATR in the breakout direction.         |
+   //| v5.57: the TP PROJECTION does NOT follow the entry out; it is   |
+   //| anchored on the FAR edge (see PlaceOrArmOrder) so the Front-Run |
+   //| veto keeps the strictness of every pre-anticipation build. Twin |
+   //| of COttoBlockManager::BlockEntryPrice(); they must stay         |
+   //| identical or the Front-Run veto would judge a different price   |
+   //| from the order's.                                               |
    //+------------------------------------------------------------------+
    double                  CalcEntryPrice(const SSniperBlock &block, double atr)
      {
@@ -753,7 +756,15 @@ private:
       if(!SentimentPasses(block)) return false;
 
       // --- Pine price computation ---
-      double atr = m_blockManager.GetATR();
+      // v5.57 — ATR SHIFT SYNC. Geometry is pinned to shift 1 (the last CLOSED
+      // bar) to match COttoBlockManager's front-run veto, which prices its
+      // projection from GetATRAtShift(1). The cached GetATR() refreshes from
+      // shift 0 (the forming bar), so on a live bar the two managers would
+      // otherwise build the entry, the stop and the veto target from two
+      // different ATRs. GetATR() is kept only as the fallback for the rare tick
+      // on which the shift-1 cache slot is not yet populated.
+      double atr = m_blockManager.GetATRAtShift(1);
+      if(atr <= 0) atr = m_blockManager.GetATR();
       if(atr <= 0) return false;
       // v5.30 — snap onto the symbol's trade tick grid BEFORE any validation.
       // A price that is off-grid is refused with TRADE_RETCODE_INVALID_PRICE
@@ -768,6 +779,9 @@ private:
       // no Phase 2 to shift, so the entry is the single mapped edge from
       // CalcEntryPrice() and InpShiftReversalEntry is a declared no-op.
       // slDist stays hoisted here: SL/TP below are entry-relative and reuse it.
+      // v5.57 — hand CalcSLDistance() the SAME shift-1 ATR the block-side
+      // projection (blockHeight + 0.5*atrNow) uses, so the entry, the stop,
+      // the target and the veto all resolve one risk distance.
       double slDist     = CalcSLDistance(block, atr);
 
       // v5.40 — the duplicate shield and the physical-vs-virtual routing both
@@ -790,8 +804,20 @@ private:
       // (below) rather than re-deriving the target, so a divergence between
       // this line and the veto's projection would silently disable the veto.
       double tpRR       = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-      double takeProfit = isLong ? entryPrice + tpRR * slDist
-                                 : entryPrice - tpRR * slDist;
+      // v5.57 — FAR-EDGE ANCHOR. The target is measured from the edge the
+      // breakout crosses (block.top LONG / block.bottom SHORT), NOT from the
+      // anticipation `entryPrice`, which sits 0.5*ATR beyond that edge.
+      // Projecting from the entry pushed the target a further 0.5*ATR out --
+      // harsher than every pre-anticipation build -- so the Front-Run veto
+      // would miss setups it used to catch. slDist = blockHeight + 0.5*ATR and
+      // the anticipation entry maps a further 0.5*ATR past the far edge; every
+      // pre-anticipation build anchored its target ON that far edge, so this
+      // form reproduces the retired 'entryPrice +/- tpRR*slDist' target bit
+      // for bit. COttoBlockManager::ProcessBlocks projects identically.
+      double farEdge    = isLong ? MathMax(block.top, block.bottom)
+                                 : MathMin(block.top, block.bottom);
+      double takeProfit = isLong ? farEdge + tpRR * slDist
+                                 : farEdge - tpRR * slDist;
 
       // Store local entry/SL/TP/rrUnit on the block (Pine b.local_*)
       block.localEntry = entryPrice;
@@ -1445,7 +1471,9 @@ private:
       if(targetBlock.localSL <= 0)
         {
          // fall back to the Pine formula if not yet computed
-         double atr = m_blockManager.GetATR();
+         // v5.57 — shift-1 ATR, matching the entry build and the block veto.
+         double atr = m_blockManager.GetATRAtShift(1);
+         if(atr <= 0) atr = m_blockManager.GetATR();
          if(atr > 0)
          {
             double slDist = targetBlock.blockHeight + 0.5 * atr;
@@ -2805,7 +2833,9 @@ public:
          // rrUnit is recomputed from the block's OWN geometry (not the broker-
          // adjusted stop) so SeedActiveTradeFromBlock() rebuilds exactly the
          // basket 1R math a resting physical limit fill would have produced.
-         double atr    = m_blockManager.GetATR();
+         // v5.57 — shift-1 ATR so the recovered rrUnit matches the entry build.
+         double atr    = m_blockManager.GetATRAtShift(1);
+         if(atr <= 0) atr = m_blockManager.GetATR();
          double slDist = (atr > 0) ? CalcSLDistance(block, atr)
                                    : MathAbs(vo.triggerPrice - vo.stopLoss);
          block.localEntry = vo.triggerPrice;

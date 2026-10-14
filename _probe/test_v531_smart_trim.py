@@ -148,10 +148,13 @@ check("no hardcoded <n> * slDist risk projection remains", not hardcoded,
 check("order manager falls back to 1.0 when InpMaxRR <= 0",
       re.search(r"double\s+tpRR\s*=\s*\(InpMaxRR\s*>\s*0\.0\)\s*\?\s*InpMaxRR"
                 r"\s*:\s*1\.0\s*;", OM_C) is not None)
-check("order manager projects the take-profit from tpRR * slDist",
+check("order manager projects the take-profit from tpRR * slDist on the FAR edge",
+      re.search(r"double\s+farEdge\s*=\s*isLong\s*"
+                r"\?\s*MathMax\(block\.top,\s*block\.bottom\)\s*"
+                r":\s*MathMin\(block\.top,\s*block\.bottom\)\s*;", OM_C) is not None and
       re.search(r"double\s+takeProfit\s*=\s*isLong\s*"
-                r"\?\s*entryPrice\s*\+\s*tpRR\s*\*\s*slDist", OM_C) is not None and
-      re.search(r":\s*entryPrice\s*-\s*tpRR\s*\*\s*slDist\s*;", OM_C) is not None)
+                r"\?\s*farEdge\s*\+\s*tpRR\s*\*\s*slDist", OM_C) is not None and
+      re.search(r":\s*farEdge\s*-\s*tpRR\s*\*\s*slDist\s*;", OM_C) is not None)
 check("order manager stores the projection as block.localTP",
       re.search(r"block\.localTP\s*=\s*takeProfit\s*;", OM_C) is not None)
 check("order manager still records block.rrUnit = slDist",
@@ -163,10 +166,13 @@ bm_sites = re.findall(r"double\s+tpRR\s*=\s*\(InpMaxRR\s*>\s*0\.0\)\s*\?\s*InpMa
                       r"\s*:\s*1\.0\s*;", BM_C)
 check("both block-manager front-run passes read InpMaxRR", len(bm_sites) == 2,
       "found %d site(s)" % len(bm_sites))
-check("block-manager front-run projects from tpRR * calcSLDist",
+check("block-manager front-run projects from tpRR * calcSLDist on the FAR edge",
+      re.search(r"double\s+farEdge\s*=\s*isLong\s*"
+                r"\?\s*MathMax\(b\.top,\s*b\.bottom\)\s*"
+                r":\s*MathMin\(b\.top,\s*b\.bottom\)\s*;", BM_C) is not None and
       re.search(r"double\s+target\s*=\s*isLong\s*"
-                r"\?\s*calcEntry\s*\+\s*tpRR\s*\*\s*calcSLDist", BM_C) is not None and
-      re.search(r":\s*calcEntry\s*-\s*tpRR\s*\*\s*calcSLDist\s*;", BM_C) is not None)
+                r"\?\s*farEdge\s*\+\s*tpRR\s*\*\s*calcSLDist", BM_C) is not None and
+      re.search(r":\s*farEdge\s*-\s*tpRR\s*\*\s*calcSLDist\s*;", BM_C) is not None)
 check("front-run prefers the exact sent TP once the order is live",
       BM_C.count("target = b.localTP;") == 2,
       "found %d" % BM_C.count("target = b.localTP;"))
