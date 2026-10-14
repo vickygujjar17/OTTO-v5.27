@@ -552,6 +552,14 @@ private:
             // far-edge form reproduces the retired
             // 'entryPrice +/- tpRR*slDist' target of the last far-edge build
             // bit for bit. Once the order rests, b.localTP supersedes this.
+            // REALIZED RR (front-edge entry): the entry sits 0.5*ATR beyond
+            // the far edge while the target is anchored TO that edge, so the
+            // reward-to-risk taken off the ENTRY is InpMaxRR - (0.5*ATR /
+            // slDist) -- slightly less than InpMaxRR, and less still the wider
+            // the ATR runs against the zone height (a 1.0-high zone at ATR 2.0
+            // with InpMaxRR 4.0 -> 3.5R). Intentional: the target reproduces
+            // the pre-anticipation projection and keeps the veto strict. Do
+            // NOT "fix" it by anchoring the target on the entry.
             double farEdge = isLong ? MathMax(b.top, b.bottom)
                                     : MathMin(b.top, b.bottom);
             double target  = isLong ? farEdge + tpRR * calcSLDist
@@ -730,6 +738,14 @@ private:
             // v5.57 measures the target from the edge the breakout crosses, not
             // from the 0.5*ATR anticipation entry, so both passes judge one
             // price; see the detailed derivation in ProcessBlocks().
+            // REALIZED RR (front-edge entry): the entry sits 0.5*ATR beyond
+            // the far edge while the target is anchored TO that edge, so the
+            // reward-to-risk taken off the ENTRY is InpMaxRR - (0.5*ATR /
+            // slDist) -- slightly less than InpMaxRR, and less still the wider
+            // the ATR runs against the zone height (a 1.0-high zone at ATR 2.0
+            // with InpMaxRR 4.0 -> 3.5R). Intentional: the target reproduces
+            // the pre-anticipation projection and keeps the veto strict. Do
+            // NOT "fix" it by anchoring the target on the entry.
             bool   isLong = (BlockDirection(b) == DIR_LONG);
             double farEdge = isLong ? MathMax(b.top, b.bottom)
                                     : MathMin(b.top, b.bottom);

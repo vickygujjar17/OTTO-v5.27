@@ -49,7 +49,7 @@ BM = os.path.join(ROOT, "COttoBlockManager.mqh")
 
 ALL_FILES = ["otto.mq5", "COttoOrderManager.mqh", "COttoTradeManager.mqh",
              "COttoRiskManager.mqh", "COttoBlockManager.mqh", "COttoJournal.mqh",
-             "COttoNewsFilter.mqh", "COttoCorrelationFilter.mqh",
+             "CHighTableAuditor.mqh", "COttoNewsFilter.mqh", "COttoCorrelationFilter.mqh",
              "COttoMarketStructure.mqh", "OttoDefines.mqh"]
 
 
@@ -269,7 +269,7 @@ check("release is v5.30 or later", parts >= (5, 30), RELEASE)
 
 missing = [f for f in ALL_FILES
            if ('#property version   "%s"' % RELEASE) not in read(os.path.join(ROOT, f))]
-check("all 10 files stamp v%s" % RELEASE, not missing,
+check("all %d files stamp v%s" % (len(ALL_FILES), RELEASE), not missing,
       "missing: %s" % ", ".join(missing))
 check("startup banner names the current release",
       ("OTTO EA v%s" % RELEASE) in MAIN_T)
