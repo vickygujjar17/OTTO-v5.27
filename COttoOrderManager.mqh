@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.51"
+#property version   "5.52"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -1906,7 +1906,7 @@ private:
       s += "  Open pendings   : " + IntegerToString(CountMyPendingOrders()) +
            " (broker + virtual)\n";
       s += "  Armed blocks    : " + IntegerToString(CountArmedBlocks()) + "\n";
-      // v5.51 Part 3 -- R/C PHASE TAG (hourly report). Mirrors the R/C marker
+      // v5.52 Part 3 -- R/C PHASE TAG (hourly report). Mirrors the R/C marker
       // the arm and retag paths stamp on the live order, but reads the BLOCK
       // instead, so the operator sees a setup's phase BEFORE it ever fills.
       for(int v = 0; v < m_virtualCount; v++)
