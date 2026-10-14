@@ -1,4 +1,4 @@
-$root = 'C:\Users\vivek\Downloads\OTTO-v5.00 v5.27'
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $out  = 'C:\Users\vivek\AppData\Local\Temp\encoding.txt'
 $files = Get-ChildItem -Path ($root + '\*') -Include '*.mq5','*.mqh' -File
 $res = @()

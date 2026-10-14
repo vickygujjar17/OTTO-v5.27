@@ -1,0 +1,83 @@
+555: chore -- purge obsolete scripts and bump version to 5.55
+
+Two housekeeping changes in one release stamp, plus the repair of a QA script
+that had been silently scanning nothing.
+
+PURGE (47 removed files, 240,535 bytes; every one tracked, so each is
+recoverable from the pre-purge-555 tag at 442a28f)
+
+  * _tools/_bump524.py .. _bump543.py (20) -- the per-release one-shot bump
+    scripts. Superseded by _tools/_bump_version.py, the auto-detecting bump
+    tool the README documents. No _bump544+ was ever written, which confirms
+    the one-shots were already retired in practice before this commit.
+  * _tools/_commit532.txt .. _commit548b.txt (17) -- changelogs older than the
+    5.52 pivot.
+  * _commit527/528/529/531/532/533.txt (6) -- stale root copies from the same
+    era. Root _commit533.txt was byte-identical to _tools/_commit533.txt
+    (SHA256 ED339E28...), but root _commit532.txt was NOT a copy: it is a
+    distinct 26,346-byte document covering the same release, so it is removed
+    as an obsolete changelog rather than as a duplicate.
+  * _tools/dump_hive.ps1, flip_hivemind.ps1, scan_zone.ps1,
+    patch_v500_remove_objectname.py (4) -- one-shot scratch diagnostics.
+  * _tools/__pycache__/ -- gitignored build residue, not tracked.
+
+RETAINED DELIBERATELY
+
+  * _bump_version.py -- the live release tool (10 tracked references including
+    README.md:53 and README.md:63).
+  * build_check.ps1, normalize_eol.py, verify_integrity.py,
+    check_deploy_drift.py, repair_mojibake.py, scan_encoding.ps1 -- the release
+    gate and the QA suite.
+  * _commit552/553/553b/554.txt plus _pivot552.py and _pivot553.py -- the
+    5.52/5.53 pivot record and its reproducible patch evidence.
+  * All 11 .mq5/.mqh sources and all 32 _probe/ files: untouched.
+
+REPAIR
+
+  * scan_encoding.ps1 line 1 hardcoded the dead path
+    C:\Users\vivek\Downloads\OTTO-v5.00 v5.27, so Get-ChildItem matched nothing
+    and the script printed a clean report over zero files. Repointed at
+    $PSScriptRoot\.. -- the same fix build_check.ps1 already carries for the
+    identical failure. The $out temp path is unchanged.
+
+VERSION BUMP (20 rows, 12 files)
+
+  python _tools/_bump_version.py -> 5.54 -> 5.55, exactly 20 changed lines:
+
+    #property version "5.54" -> "5.55"     all 11 sources (otto.mq5 + 10 .mqh)
+    Pine Script Master Build Port (vX)     otto.mq5 file banner
+    OTTO EA vX (startup Print)             otto.mq5 OnInit banner
+    OTTO EA vX (definition banner)         OttoDefines.mqh header
+    #property description "OTTO vX ..."    the EA description
+    [9]/[10]/[11]/[12] ... - vX            four versioned input-group labels
+    **Current base: vX**                   README.md
+
+VERIFICATION
+
+  * Dangling-reference audit: git grep over every remaining tracked file for
+    all 47 purged paths -- ZERO references. Nothing points at what was removed.
+  * Bump census: _bump_version.py reported exactly 20 changed lines and closed
+    with "no v5.54 literal remains in the shipped sources or docs". The only
+    surviving 5.54 strings sit inside _tools/_commit554.txt, where they are the
+    historical record of the previous release.
+  * Build gate: build_check.ps1 (bare invocation) -- 0 errors / 0 warnings,
+    GATE PASSED, all 11 OTTO modules verified [STAGED] from the temp build
+    tree, include root redirected via /inc, terminal never written to.
+  * Line endings: normalize_eol.py . --check -> files=11 rewritten=0,
+    bareLF=0 bareCR=0. All 12 bumped files are strict CRLF; README.md was
+    already LF at HEAD and stays LF, since .gitattributes pins only
+    *.mq5/*.mqh. The edited scan_encoding.ps1 was verified back to strict CRLF
+    (28 CRLF, 0 bareLF) after editing.
+  * Encoding: verify_integrity.py -- non-ASCII counts identical HEAD vs
+    worktree for all 11 sources (COttoOrderManager 198/198, OttoDefines
+    3973/3973, COttoCorrelationFilter 78/78, ...), so the bump introduced no
+    mojibake and no '?' substitution.
+  * Probes: _probe/ is not touched by this commit and no probe references
+    _tools/ (audited), so every probe total is unchanged from 554 by
+    construction. The probe suite was not re-run for a version-only stamp.
+
+NOT PROVEN HERE: behaviour. Not one logic line changes -- the deletions are
+tooling, the only source edit is a release string. The functional gate remains
+a Strategy Tester run of otto.ex5 on this branch versus the v5.54 build.
+
+ROLLBACK: git checkout pre-purge-555 -- <path>, tag pre-purge-555 = 442a28f.
