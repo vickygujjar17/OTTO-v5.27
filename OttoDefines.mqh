@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.52 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.53 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.52"
-#property description "OTTO v5.52 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.53"
+#property description "OTTO v5.53 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -22,8 +22,8 @@
 // above it) and a SUPPORT zone trades SHORT (a breakdown below it), which is
 // exactly what Pine's can_place gate states (long & resistance, short &
 // support). The old two-phase fade -- the first fill a bounce, only a reclaimed
-// zone the flip -- is retired, so this mapping no longer reads block.touches.
-// Enum VALUES are persisted and compared, so they must never be renumbered.
+// zone the flip -- is retired, so this mapping reads no lifecycle counter at
+// all. Enum VALUES are persisted and compared, never renumbered.
 enum ENUM_BLOCK_TYPE
   {
    BLOCK_RESISTANCE = 0,  // Resistance zone (-> LONG: breakout above it)
@@ -136,14 +136,11 @@ struct SSniperBlock
    datetime          creationTime;     // when the block was formed
    int               creationBarSerial;// Bars() serial at creation (diagnostics)
    int               serial;           // unique block id (for trade_id + visuals)
-   // v5.34: lifecycle counter of FILLS CONSUMED on this block: 0 = never filled,
-   // 1 = the single continuation entry has filled, 2+ = a duplicate fill, which
-   // the v5.28 one-tranche-per-block shield refuses. v5.52: the two-phase engine
-   // this counter once encoded is gone, but the field is KEPT because that shield
-   // reads it -- retiring it would let one block fill a SECOND tranche. It no
-   // longer influences direction; see COttoOrderManager::GetDirectionForBlock().
-   // Zeroed by ZeroMemory() at every block-creation site (COttoBlockManager).
-   int               touches;
+   // v5.34's touches counter -- the two-phase lifecycle cursor, later kept as a
+   // 'fill counter' -- is RETIRED here. Nothing read it once v5.52 removed the
+   // phase branches, and the one-shot latch that actually refuses a duplicate
+   // tranche is isTriggered / hasPlacedOrder (set on the fill, cleared only by
+   // block deletion), so the field carried dead weight and a false comment.
    // v5.36: why this zone was promoted to a Phase 2 reversal — the convertible
    // veto that triggered the conversion. VETO_NONE when the block reached
    // Phase 2 normally (or never did). Zeroed by ZeroMemory() at every
@@ -363,7 +360,7 @@ input double   SafetyDailyDDLimit  = 3.0;     // Soft breach: pause new orders a
 input double   SafetyTotalDDLimit  = 5.0;     // Hard breach: close all + halt at this % (Trailing)
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.52"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.53"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart
@@ -375,7 +372,7 @@ input int      InpAnchorTF           = PERIOD_H1;  // Anchor candle timeframe (H
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
 
 input group "══════════════════════════════════════════════════"
-input group "  [10] HIGH TABLE AUDITOR — v5.52"
+input group "  [10] HIGH TABLE AUDITOR — v5.53"
 input group "══════════════════════════════════════════════════"
 // Decoupled watchdog: audits live state on its OWN timer cadence rather
 // than inside OnTick, so a halted / paused / tick-starved trade loop can
@@ -385,7 +382,7 @@ input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
 input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
 
 input group "══════════════════════════════════════════════════"
-input group "  [11] MANUAL TRADE ADOPTION — v5.52"
+input group "  [11] MANUAL TRADE ADOPTION — v5.53"
 input group "══════════════════════════════════════════════════"
 // Let this EA manage positions opened BY HAND on its own chart symbol.
 // A manual position is identified as a MAGIC-0 position on m_symbol: the
@@ -402,7 +399,7 @@ input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual
 
 //+------------------------------------------------------------------+
 input group "══════════════════════════════════════════════════"
-input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.52"
+input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.53"
 input group "══════════════════════════════════════════════════"
 // v5.34 built five switches that let a vetoed Phase 1 setup be re-used as a
 // Phase 2 REVERSAL instead of being discarded.

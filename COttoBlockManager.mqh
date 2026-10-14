@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.52"
+#property version   "5.53"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -103,13 +103,13 @@ private:
    //| cannot reach (both veto funnel projections), so the same mapping |
    //| is mirrored rather than guessed.                                 |
    //|                                                                  |
-   //| v5.52 PURE CONTINUATION: the mapping is UNCONDITIONAL and reads no|
-   //| phase. Pine's can_place gate is 'flat OR (long & resistance) OR  |
-   //| (short & support)', so a RESISTANCE zone is traded LONG (a breakout|
-   //| above it) and a SUPPORT zone is traded SHORT (a breakdown below  |
-   //| it). The v5.34 two-phase fade -- the first fill a bounce, only a |
-   //| reclaimed zone the flip -- is retired, so block.touches no longer|
-   //| enters this decision at all.                                     |
+//| v5.52 PURE CONTINUATION: the mapping is UNCONDITIONAL and reads  |
+//| no phase and no lifecycle counter. Pine's can_place gate is      |
+//| 'flat OR (long & resistance) OR (short & support)', so a         |
+//| RESISTANCE zone is traded LONG (a breakout above it) and a       |
+//| SUPPORT zone is traded SHORT (a breakdown below it). The v5.34   |
+//| two-phase fade -- the first fill a bounce, only a reclaimed zone |
+//| the flip -- is retired with the counter that encoded it.         |
    //|                                                                  |
    //| The two implementations deliberately sit side by side in review: |
    //| they must stay IDENTICAL or the Front-Run veto would project its |
@@ -447,12 +447,12 @@ private:
    //| per Pine: deletion -> hasExited -> Stale(45) -> Front-Run(InpMaxRR)|
    //| -> Near-Miss(6D) -> Arming -> Break/Flip -> Momentum/FVG.       |
    //|                                                                  |
-   //| v5.52 -- the state machine is PHASE-FREE. v5.49's touches-driven |
-   //| geometry inversion existed only to measure a reclaimed zone against|
-   //| its own reversal side; there is no reversal any more, so hasExited,|
-   //| arming and break/flip are each a single unconditional test that  |
-   //| never reads block.touches. See the break block below: its test is|
-   //| the OPPOSITE edge from arming, on purpose.                       |
+//| v5.52 -- the state machine is PHASE-FREE. v5.49's geometry  |
+//| inversion existed only to measure a reclaimed zone against  |
+//| its own reversal side; there is no reversal any more, so    |
+//| hasExited, arming and break/flip are each a single test     |
+//| that reads no lifecycle counter. See the break block below: |
+//| its test is the OPPOSITE edge from arming, on purpose.      |
    //+------------------------------------------------------------------+
    void                    ProcessBlocks(int marketDay)
      {

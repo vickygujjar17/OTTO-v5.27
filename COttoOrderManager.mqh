@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.52"
+#property version   "5.53"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -1556,12 +1556,12 @@ private:
       if(!PositionSelectByTicket(positionTicket)) return;
       m_activeTrade.ticket       = positionTicket;
       // The direction this basket is seeded with. v5.52 makes the default path
-      // trivially correct: GetDirectionForBlock() is now UNCONDITIONAL and no
-      // longer reads block.touches, so a fill that consumes the touch first
-      // still resolves the SAME side the MARKET order executed. overrideDir is
-      // kept as belt-and-braces -- the virtual fire already knows the exact
-      // side it sent, so passing it costs nothing and cannot desync the trail,
-      // the 1R basis, the journal or the High Table mirror for the leg.
+      // trivially correct: GetDirectionForBlock() is UNCONDITIONAL on the zone
+      // type alone, so it resolves the SAME side the MARKET order executed no
+      // matter what the fill changed on the block. overrideDir is kept as
+      // belt-and-braces -- the virtual fire already knows the exact side it
+      // sent, so passing it costs nothing and cannot desync the trail, the 1R
+      // basis, the journal or the High Table mirror for the leg.
       m_activeTrade.direction    = (overrideDir != DIR_NONE) ? overrideDir
                                                              : GetDirectionForBlock(block);
       m_activeTrade.entryPrice   = block.localEntry;
@@ -1898,11 +1898,10 @@ private:
       s += "  Open pendings   : " + IntegerToString(CountMyPendingOrders()) +
            " (broker + virtual)\n";
       s += "  Armed blocks    : " + IntegerToString(CountArmedBlocks()) + "\n";
-      // v5.51 Part 3 -- R/C PHASE TAG (hourly report), v5.52 — every armed
-      // setup is a CONTINUATION now: there is no reversal phase left, so this
-      // opens with the constant label instead of discriminating on block.touches.
-      // The per-serial walk is kept because it is what proves each armed order
-      // still resolves to a live block.
+      // v5.51 Part 3 -- R/C PHASE TAG (hourly report). v5.52 made every armed
+      // setup a CONTINUATION, so there is no phase left to discriminate on and
+      // the report opens with one constant label. The per-serial walk is kept
+      // because it proves each armed order still resolves to a live block.
       for(int v = 0; v < m_virtualCount; v++)
         {
          int vs   = m_virtualOrders[v].blockSerial;
@@ -2534,26 +2533,30 @@ public:
                         " dir=", (newDir == DIR_LONG ? "LONG" : "SHORT"));
               }
 
-            // ---- ADVANCE the two-phase lifecycle ------------------------
+            // ---- RETIRE the block: one entry per block ------------------
             int bi = m_blockManager.FindBlockIndexByTicket(ticket);
             if(bi >= 0)
               {
                SSniperBlock mod;
                if(m_blockManager.GetBlockAt(bi, mod))
                  {
-                  int prevTouch = mod.touches;
-                  mod.touches += 1;
+                  // RETIRE the block: its ONE continuation entry has filled,
+                  // so latch it dead and date it for deletion. isTriggered
+                  // stops PlaceOrArmOrder and the virtual engine from arming
+                  // a second tranche; hasPlacedOrder stops the duplicate;
+                  // deleteOnBarTime lets ProcessBlocks delete it next bar.
                   mod.limitOrderTicket   = 0;
                   mod.pendingOrderCancel = false;
-                  mod.isTriggered        = false;
-                  mod.hasPlacedOrder     = false;
+                  mod.priceAbortLogged   = false;
+                  mod.isTriggered        = true;
+                  mod.hasPlacedOrder     = true;
                   mod.isArmed            = false;
                   mod.hasExited          = false;
-                  mod.deleteOnBarTime    = 0;
+                  mod.deleteOnBarTime    = iTime(m_symbol, PERIOD_CURRENT, 0);
                   m_blockManager.SetBlockAt(bi, mod);
                   if(EnableLogging)
-                     Print("[OrderManager] TOUCH ", mod.touches, " CONSUMED: block ", mod.tradeId,
-                           " (prev=", prevTouch, ") -> continuation entry done; block is one-shot");
+                     Print("[OrderManager] FILL RETIRED: block ", mod.tradeId,
+                           " -> continuation entry done; block is one-shot");
                  }
               }
            }
@@ -2789,19 +2792,21 @@ public:
                                    : vo.triggerPrice - slDist;
          block.rrUnit     = slDist;
 
-         // Consume the entry: this block's ONE continuation entry has filled.
-         // touches is no longer a phase cursor -- it is the counter the v5.28
-         // one-tranche-per-block shield reads, so a duplicate fill (already
-         // >= 1) is refused upstream. Mirrors CheckPendingOrderFills().
-         block.touches            += 1;
+         // RETIRE the block: its ONE continuation entry has filled (this
+         // fire IS that entry), so latch it dead and date it for deletion.
+         // Mirrors CheckPendingOrderFills(). isTriggered stops the engine
+         // from arming a second tranche; hasPlacedOrder stops the duplicate;
+         // deleteOnBarTime lets ProcessBlocks delete it next bar. seedDir
+         // above is still threaded into SeedActiveTradeFromBlock() below, so
+         // the basket is seeded from the side the MARKET order executed.
          block.limitOrderTicket    = 0;
          block.pendingOrderCancel  = false;
          block.priceAbortLogged    = false;
-         block.isTriggered         = false;
-         block.hasPlacedOrder      = false;
+         block.isTriggered         = true;
+         block.hasPlacedOrder      = true;
          block.isArmed             = false;
          block.hasExited           = false;
-         block.deleteOnBarTime     = 0;
+         block.deleteOnBarTime     = iTime(m_symbol, PERIOD_CURRENT, 0);
          m_blockManager.SetBlockAt(bi, block);
 
          // v5.43 -- hand the setup's pre-minted session to THIS basket before
