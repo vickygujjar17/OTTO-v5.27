@@ -868,12 +868,11 @@ private:
          request.magic     = MagicNumber;
          // v5.41 R/C PHASE TAG, v5.52 — the tag is CONSTANT now. A block's
          // entry is the single continuation (the breakout / breakdown); the
-         // phase branch dropped with the two-phase engine. The tag is kept
-         // rather than removed so the MT5 31-char comment SHAPE, and the
-         // "-BLK<n>" setup id ClampOrderComment() tail-preserves, are
+         // phase branch dropped with the two-phase engine. The "_C_P" marker
+         // is written as a literal so the MT5 31-char comment SHAPE, and the
+         // "-BLK<n>" setup id ClampOrderComment() tail-preserves, stay
          // unchanged for any downstream tooling that parses the row.
-         string phaseType  = "C";
-         request.comment   = ClampOrderComment(armSessionId + "_" + phaseType + "_P");
+         request.comment   = ClampOrderComment(armSessionId + "_C_P");
 
          if(request.volume < m_riskManager.GetVolumeMin() ||
             request.volume > m_riskManager.GetVolumeMax())
@@ -2666,12 +2665,12 @@ public:
 
          // v5.38 -- R/C PHASE TAG + REUSE OF THE ARM SESSION. v5.52: the marker
          // is CONSTANT -- every setup is the single continuation entry (the
-         // breakout / breakdown), so there is no phase left to discriminate.
-         // The SESSION id is NOT re-minted here: it was minted when the setup
-         // was ARMED and is carried on the descriptor, so the arm snapshot, this
-         // fill and the later exit all resolve to ONE journal file, and a
-         // fallback mint keeps the identifier defined.
-         string phaseType = "C";
+         // breakout / breakdown), so there is no phase left to discriminate and
+         // the "_C" tag below is written as a literal. The SESSION id is NOT
+         // re-minted here: it was minted when the setup was ARMED and is carried
+         // on the descriptor, so the arm snapshot, this fill and the later exit
+         // all resolve to ONE journal file, and a fallback mint keeps the
+         // identifier defined.
          string newSessionId = vo.sessionId;
          if(newSessionId == "")
            {
@@ -2706,7 +2705,7 @@ public:
          // R/C + session marker, clamped to the MT5 31-char limit. The same
          // string is already the journal session ID set above, so the terminal
          // row and the journal agree without a second source of truth.
-         request.comment   = ClampOrderComment(newSessionId + "_" + phaseType);
+         request.comment   = ClampOrderComment(newSessionId + "_C");
 
          // Optimistic one-shot lock (mirrors PlaceOrArmOrder). Prevents a
          // concurrent tick or a requote retry from firing this order twice.
@@ -2724,8 +2723,7 @@ public:
             // the order armed and leaked a second SVirtualOrder every tick.)
             string errorStr = GetTradeRetcodeString(result.retcode);
             if(EnableLogging)
-               Print("[OrderManager] VIRTUAL REJECTED phase=", phaseType,
-                     " session=", newSessionId,
+               Print("[OrderManager] VIRTUAL REJECTED session=", newSessionId,
                      " retcode=", result.retcode, " (", errorStr, ")",
                      " broker=", result.comment,
                      " sym=", m_symbol, " side=", (isLong ? "LONG" : "SHORT"),

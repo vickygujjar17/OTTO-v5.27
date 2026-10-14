@@ -169,7 +169,7 @@ public:
       // v5.52: constant. A block has exactly one entry -- the continuation
       // (a breakout above Resistance or a breakdown below Support) -- so the
       // header names that and never a phase.
-      string phase    = "C (Continuation - Breakout / Breakdown)";
+      string phase    = "C (Pure Trend Continuation)";
       string execMode = physical ? "PHYSICAL (Broker Limit Order)" : "VIRTUAL (In-Memory Arm)";
       W("SUBJECT: [ACTIVE] Session " + SubjectLine());
       W("================================================================");
@@ -182,9 +182,9 @@ public:
       W("  Volume            : " + DoubleToString(lotSize,2));
       string actionDesc = "";
       if(btype == BLOCK_SUPPORT)
-         actionDesc = "SUPPORT (Selling the Trend Continuation / Breakdown)";
+         actionDesc = "SUPPORT (Aggressive Breakdown / Sell at Bottom Edge)";
       else
-         actionDesc = "RESISTANCE (Buying the Trend Continuation / Breakout)";
+         actionDesc = "RESISTANCE (Aggressive Breakout / Buy at Top Edge)";
       W("  Trade             : " + actionDesc);
       W("  Block Top/Bottom  : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom));
       W("  Wick 1 (Anchor)   : " + TimeToString(blk.wick1Time) + " H=" + FmtPrice(blk.wick1.highPrice) + " L=" + FmtPrice(blk.wick1.lowPrice));
@@ -219,9 +219,9 @@ public:
       W("  S/R Block:");
       string actionDesc = "";
       if(blk.type == BLOCK_SUPPORT)
-         actionDesc = (dir == DIR_LONG) ? "SUPPORT (Buying the S/R Reversal)" : "SUPPORT (Selling the Trend Continuation / Breakdown)";
+         actionDesc = "SUPPORT (Aggressive Breakdown / Sell at Bottom Edge)";
       else
-         actionDesc = (dir == DIR_SHORT) ? "RESISTANCE (Selling the S/R Reversal)" : "RESISTANCE (Buying the Trend Continuation / Breakout)";
+         actionDesc = "RESISTANCE (Aggressive Breakout / Buy at Top Edge)";
       W("    - Logic     : " + actionDesc);
       W("    - Zone      : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom));
       if(blk.wick1Time > 0 && blk.wick2Time > 0)
