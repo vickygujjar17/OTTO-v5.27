@@ -1,0 +1,70 @@
+554: version-only release -- 5.53 -> 5.54, no behaviour change
+
+This commit is the release stamp for the pure-continuation line. It carries NO
+logic, no comment and no probe edit: the only diff is the 20 human-facing
+release rows _tools/_bump_version.py rewrites in one pass, so the tree cannot
+end up stamping two different releases.
+
+WHAT MOVED (20 lines, 12 files)
+
+  #property version "5.53" -> "5.54"      all 11 sources (otto.mq5 + 10 .mqh)
+  Pine Script Master Build Port (vX)      otto.mq5 file banner
+  OTTO EA vX (startup Print)              otto.mq5 OnInit banner
+  OTTO EA vX (definition banner)          OttoDefines.mqh header
+  #property description "OTTO vX ..."     the EA description
+  [9]/[10]/[11]/[12] ... - vX            the four versioned input-group labels
+  **Current base: vX**                    README.md
+
+DELIBERATELY NOT BUMPED
+
+  * Every historical annotation naming the release a feature LANDED in -- the
+    '// v5.4x:' / '// v5.5x:' notes, the 'FIX (vX)' markers and the
+    'RETIRED (v5.5x)' input comments. The bump pass skips any line containing
+    'FIX (' outright, and every remaining pattern is anchored on a specific
+    human-facing prefix rather than on the version number alone, so no comment
+    can be rewritten by accident.
+  * #property link -- names the GitHub repository, not the release.
+
+VERIFICATION
+
+  * Bump: python _tools/_bump_version.py 5.54 -- reported exactly 20 changed
+    lines, and its own closing census printed "no v5.53 literal remains in the
+    shipped sources or docs".
+  * Diff proof: git diff --numstat = 20 insertions / 20 deletions across the 12
+    files. Eyeballing the word-level diff confirms every single moved line is a
+    release stamp or a versioned banner -- no logic line, no prose comment.
+  * Build gate: build_check.ps1 (BARE invocation) -- 0 errors / 0 warnings,
+    GATE PASSED, all 11 OTTO modules verified [STAGED] from the temp build tree,
+    otto.ex5 = 245544 bytes.
+  * Line endings / encoding: all 11 sources remain strict CRLF, 0 bare LF,
+    0 bare CR, no BOM. The only LF file is README.md, which is LF at HEAD as
+    well -- .gitattributes pins only *.mq5 / *.mqh to CRLF -- so the doc's
+    endings are pre-existing and untouched by the bump.
+  * Probes: all 26 probes in _probe/ were run. No probe total changed versus
+    7544857. The five probes harmonised with the pure-continuation edge wording
+    are GREEN at full count -- test_v540_hybrid 41/41, test_v541_sarfix 14/14,
+    test_v542_email 18/18, test_v548_hourly 48/48, test_v548_seed_dir 21/21
+    (142/142). The version-stamp checks auto-detect RELEASE from
+    OttoDefines.mqh, so they simply followed 5.53 -> 5.54 with no edit.
+
+KNOWN PRE-EXISTING REDS (untouched, not caused here)
+
+  Five probes were already red at parent 7544857 (and at d6e96d1) and stay red:
+
+    test_v528_hotfix        57/68
+    test_v52x_pyramid      127/130    (ladder re-spec: deliberate, to be
+                                       validated in the tester)
+    test_v531_smart_trim    15/38
+    test_v532_hightable    125/135
+    test_v543_session       27/29     (2 of 4 session save/restore writes --
+                                       UNRESOLVED: probe over-specification vs
+                                       a genuine cancel-path persistence gap)
+
+  The first, third and fourth pin symbols removed by the v5.52 / v5.53 pivot
+  (frozen v5.5x tombstones); the second and fifth are the v5.28 -> v5.52
+  migration deltas. build_check.ps1 -- the actual release gate -- takes no probe
+  reference and is green.
+
+NOT PROVEN HERE: behaviour. This commit changes one string per stamp site. The
+functional gate remains a Strategy Tester run of otto.ex5 on this branch versus
+the v5.53 build.
