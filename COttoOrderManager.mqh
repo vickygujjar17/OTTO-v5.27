@@ -651,20 +651,33 @@ private:
 
    //+------------------------------------------------------------------+
    //| Entry price per Pine entry_style (Midpoint / Front Edge)        |
+   //| ENTRY_FRONT_EDGE: EXTREME FRONT-RUNNING ANTICIPATION. The entry |
+   //| sits 0.5*ATR BEYOND the FAR edge the breakout crosses (b.top for|
+   //| a LONG, b.bottom for a SHORT), so at arm time price is still    |
+   //| short of it and the trigger is a genuine STOP cross, not a      |
+   //| resting limit.                                                  |
+   //|                                                                 |
+   //| slDist = blockHeight + 0.5*ATR and the far edge is one          |
+   //| blockHeight past the near edge, so the mapped entry collapses   |
+   //| to exactly 0.5*ATR past the FAR edge:                           |
+   //|   LONG : block.bottom + slDist = block.top    + 0.5*ATR         |
+   //|   SHORT: block.top    - slDist = block.bottom - 0.5*ATR         |
+   //| The SL then lands on the OPPOSITE edge, a full slDist back      |
+   //| (block.bottom for the LONG, block.top for the SHORT), so        |
+   //| entry<->SL stays exactly slDist and the risk distance is        |
+   //| unchanged from v5.56 -- the whole entry/SL/TP cluster simply    |
+   //| translates by 0.5*ATR in the breakout direction. Twin of        |
+   //| COttoBlockManager::BlockEntryPrice(); they must stay identical  |
+   //| or the Front-Run veto would judge a different price from the    |
+   //| order's.                                                        |
    //+------------------------------------------------------------------+
-   double                  CalcEntryPrice(const SSniperBlock &block)
+   double                  CalcEntryPrice(const SSniperBlock &block, double atr)
      {
       if(InpEntryStyle == ENTRY_MIDPOINT)
          return block.midpoint;
-      // The front edge is the edge the breakout crosses THROUGH, i.e. the FAR
-      // edge of the zone relative to price. v5.52 keys it straight off the
-      // unconditional mapped direction, so a Resistance LONG is entered at
-      // resistance.top (broken out ABOVE) and a Support SHORT at
-      // support.bottom (broken down BELOW) -- the FAR edge, which the price
-      // crosses on its way out of the zone. Twin of
-      // COttoBlockManager::BlockEntryPrice(); they must stay identical or the
-      // Front-Run veto would judge a different price from the order's.
-      return (GetDirectionForBlock(block) == DIR_LONG) ? block.top : block.bottom;
+      double slDist = block.blockHeight + (0.5 * atr);
+      return (GetDirectionForBlock(block) == DIR_LONG) ? (block.bottom + slDist)
+                                                       : (block.top - slDist);
      }
 
    //+------------------------------------------------------------------+
@@ -691,11 +704,11 @@ private:
    //| CheckPendingOrderFills(); a virtual arm fires its MARKET leg in  |
    //| CheckVirtualTriggers() on the cross.                             |
    //+------------------------------------------------------------------+
-   // v5.52 CONTINUATION: with InpEntryStyle = ENTRY_FRONT_EDGE the entry is
-   // the FAR edge the breakout crosses (a buy-stop above resistance / a
-   // sell-stop below support), so the VIRTUAL arm is the ordinary path and a
-   // physical rest is the pullback case. Either way the trigger is a MARKET
-   // deal when the level is crossed.
+   // v5.57 FRONT-RUNNING ANTICIPATION: with InpEntryStyle = ENTRY_FRONT_EDGE
+   // the entry sits 0.5*ATR beyond the FAR edge the breakout crosses (a
+   // buy-stop above resistance / a sell-stop below support), so the VIRTUAL
+   // arm is the ordinary path and a physical rest is the rare stale-price
+   // case. Either way the trigger is a MARKET deal when the level is crossed.
    bool                    PlaceOrArmOrder(int blockIndex, SSniperBlock &block)
      {
       if(block.isVetoed || block.isTriggered || block.hasPlacedOrder)
@@ -746,7 +759,7 @@ private:
       // A price that is off-grid is refused with TRADE_RETCODE_INVALID_PRICE
       // even when it sits on the correct side of the market. slDist/rrUnit are
       // entry-independent, so snapping does not change the risk distance.
-      double entryPrice = SnapToTick(CalcEntryPrice(block));
+      double entryPrice = SnapToTick(CalcEntryPrice(block, atr));
 
       // v5.34 Part 3 — SHIFTED REVERSAL ENTRY — RETIRED (v5.52).
       // The shift moved a Touch-1 block's entry to the OUTER boundary by one
@@ -824,16 +837,18 @@ private:
       // zone the resting form is illegal, so we ARM an in-memory virtual order
       // and let CheckVirtualTriggers() fire it as a MARKET deal on the cross.
       //
-      // v5.52 CONTINUATION NOTE. With InpEntryStyle = ENTRY_FRONT_EDGE the
-      // entry is the FAR edge the breakout crosses -- a Resistance LONG is
-      // entered at resistance.top (broken out above) and a Support SHORT at
-      // support.bottom (broken down below) -- so the trigger is STOP-style
-      // (breakout), not limit-style. That is handled by the two routes below
-      // rather than by a new order type: while the price has NOT yet crossed,
-      // the entry sits on the non-limit side of the market, this test is false,
-      // and the setup arms VIRTUALLY and fires a MARKET deal on the cross. A
-      // physical rest is only ever used when the entry will genuinely be
-      // crossed toward (a pullback into the zone), which the limit test accepts.
+      // FRONT-RUNNING ANTICIPATION NOTE (v5.57). With InpEntryStyle =
+      // ENTRY_FRONT_EDGE the entry sits 0.5*ATR beyond the FAR edge -- a
+      // Resistance LONG at b.bottom+slDist (= b.top+0.5*ATR), a Support SHORT
+      // at b.top-slDist (= b.bottom-0.5*ATR) -- so the trigger is STOP-style
+      // (breakout): the market must still RISE to a LONG entry and FALL to a
+      // SHORT entry, while the SL sits a full slDist back on the opposite
+      // edge. At arm time price has closed clear of the NEAR edge, i.e. it is
+      // still short of the entry, so the limit test below is FALSE: the setup
+      // arms VIRTUALLY and CheckVirtualTriggers() fires a MARKET deal on the
+      // cross. That inverted cross is the ordinary path, not a fallback; a
+      // physical rest is only ever used when a stale armed price happens to
+      // sit on the limit side of a moved market.
       double boundary = GetPriceBoundaryBuffer();
       bool   priceValid;
       if(isLong)
@@ -2588,10 +2603,13 @@ public:
    //| order's level is reached. This is the execution half of the in-  |
    //| memory engine whose ARM half is PlaceOrArmOrder().               |
    //|                                                                  |
-   //| The cross test mirrors Pine's own strategy fill logic: a         |
-   //| LONG fires once the market has traded DOWN to/through its        |
-   //| trigger, a SHORT once it has traded UP to/through it - so a gap  |
-   //| past the level still triggers.                                   |
+   //| The cross test mirrors Pine's own strategy fill logic and is     |
+   //| INVERTED for the front-running anticipation entry (v5.57): the   |
+   //| trigger now sits BEYOND the far edge, so a LONG fires once the   |
+   //| market has traded UP to/through its trigger and a SHORT once it  |
+   //| has traded DOWN to/through it - a gap past the level still       |
+   //| triggers. (Under the pre-v5.57 far-edge entry the level sat on   |
+   //| the limit side of price and the test ran the other way.)         |
    //+------------------------------------------------------------------+
    void              CheckVirtualTriggers(void)
      {
@@ -2634,10 +2652,12 @@ public:
          // note) -- kept because the virtual fire knows the exact side it sent.
          ENUM_TRADE_DIRECTION seedDir = isLong ? DIR_LONG : DIR_SHORT;
 
-         // THE CROSS TEST. A MARKET condition, not a resting price: a LONG
-         // fires once the market has traded DOWN to (or through) the level,
-         // a SHORT once it has traded UP to it - a gap past it still fires.
-         if(isLong ? (ask > vo.triggerPrice) : (bid < vo.triggerPrice))
+         // THE CROSS TEST. A MARKET condition, not a resting price. Inverted
+         // v5.57 for the front-running anticipation entry: the trigger sits
+         // BEYOND the far edge, so a LONG fires once the market has traded UP
+         // to (or through) the level, a SHORT once it has traded DOWN to it -
+         // a gap past it still fires.
+         if(isLong ? (ask < vo.triggerPrice) : (bid > vo.triggerPrice))
             continue;
 
          // --- Pine gates: the identical ladder every other path applies ---

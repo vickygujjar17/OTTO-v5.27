@@ -126,7 +126,7 @@ check("GetPriceBoundaryBuffer located", BUF is not None)
 check("SnapToTick located", SNAP is not None)
 
 check("entry price is snapped onto the tick grid",
-      re.search(r"double\s+entryPrice\s*=\s*SnapToTick\(CalcEntryPrice\(block\)\)",
+      re.search(r"double\s+entryPrice\s*=\s*SnapToTick\(CalcEntryPrice\(block,\s*atr\)\)",
                 OM_T) is not None)
 check("snap rounds to the nearest tick",
       "MathRound(price / tick) * tick" in SNAP)
@@ -135,7 +135,7 @@ check("snap normalises to the symbol's own digits",
       "SYMBOL_DIGITS" in SNAP and "SYMBOL_TRADE_TICK_SIZE" in SNAP)
 # v5.39: the live-price guard comparisons the snap used to precede are gone.
 check("entry price is snapped (v5.39: guard comparisons retired)",
-      OM_T.find("SnapToTick(CalcEntryPrice(block))") >= 0
+      OM_T.find("SnapToTick(CalcEntryPrice(block, atr))") >= 0
       and "entryPrice >= (liveBid - priceBuffer)" not in OM_T
       and "entryPrice <= (liveAsk + priceBuffer)" not in OM_T)
 

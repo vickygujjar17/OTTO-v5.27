@@ -76,9 +76,14 @@ enum ENUM_VETO_REASON
 enum ENUM_ENTRY_STYLE
   {
    ENTRY_MIDPOINT  = 0,     // entry = (top+bottom)/2
-   ENTRY_FRONT_EDGE = 1     // FAR edge the price breaks out through:
-                            //   support zone (-> SHORT): bottom
-                            //   resistance zone (-> LONG): top
+   ENTRY_FRONT_EDGE = 1     // EXTREME FRONT-RUNNING ANTICIPATION (v5.57):
+                            //   entry 0.5*ATR BEYOND the far edge the breakout
+                            //   crosses, = b.top + 0.5*ATR for a Resistance LONG
+                            //   and b.bottom - 0.5*ATR for a Support SHORT --
+                            //   a full slDist back the SL lands on the opposite
+                            //   edge (b.bottom / b.top), so entry<->SL stays
+                            //   exactly slDist. The trigger is STOP-style and
+                            //   fires on the cross (see CheckVirtualTriggers).
   };
 
 // Pine sim_sentiment simulation input

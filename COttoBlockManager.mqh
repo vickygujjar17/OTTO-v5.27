@@ -125,23 +125,30 @@ private:
    //+------------------------------------------------------------------+
    //| BlockEntryPrice — Pine entry price for a block, honouring        |
    //| InpEntryStyle.                                                   |
-   // The front edge is the edge the breakout crosses THROUGH, i.e. the FAR
-   // edge of the zone relative to price: for a LONG that is b.top (a
-   // resistance zone is broken out ABOVE), for a SHORT b.bottom (a support
-   // zone is broken down BELOW).
+   // EXTREME FRONT-RUNNING ANTICIPATION. The entry sits 0.5*ATR BEYOND the
+   // FAR edge the breakout crosses (b.top for a LONG, b.bottom for a SHORT),
+   // so at arm time price is still short of it and the trigger is a genuine
+   // STOP cross rather than a resting limit.
+   //
+   // slDist = blockHeight + 0.5*ATR and the far edge is one blockHeight past
+   // the near edge, so the mapped entry collapses to exactly 0.5*ATR past the
+   // FAR edge:
+   //   LONG : b.bottom + slDist = b.top    + 0.5*ATR
+   //   SHORT: b.top    - slDist = b.bottom - 0.5*ATR
+   // The SL then lands on the OPPOSITE edge of the zone, a full slDist back
+   // (b.bottom for the LONG, b.top for the SHORT), so entry<->SL stays exactly
+   // slDist and the risk distance (and the RR projection) is unchanged from
+   // v5.56 -- the whole entry/SL/TP cluster is simply translated by 0.5*ATR in
+   // the breakout direction, never a wider stop.
    //
    // This is the exact twin of COttoOrderManager::CalcEntryPrice(); the two
    // must stay identical or the Front-Run veto would judge a different price
    // from the order's.
-   //
-   // v5.52: the unconditional continuation mapping keys the edge off the
-   // direction alone -- (DIR_LONG) ? b.top : b.bottom -- so the order rests at
-   // the FAR edge the breakout crosses, which makes the entry a STOP-style
-   // (breakout) trigger.
-   double                  BlockEntryPrice(const SSniperBlock &b) const
+   double                  BlockEntryPrice(const SSniperBlock &b, double atr) const
      {
       if(InpEntryStyle == ENTRY_MIDPOINT) return b.midpoint;
-      return (BlockDirection(b) == DIR_LONG) ? b.top : b.bottom;
+      double slDist = b.blockHeight + (0.5 * atr);
+      return (BlockDirection(b) == DIR_LONG) ? (b.bottom + slDist) : (b.top - slDist);
      }
 
    //+------------------------------------------------------------------+
@@ -505,7 +512,7 @@ private:
          // --- FRONT-RUN VETO (InpMaxRR target hit before entry) ---
          if(InpUseFrontRunVeto && b.hasExited && !b.isTriggered)
            {
-            double calcEntry = BlockEntryPrice(b);
+            double calcEntry = BlockEntryPrice(b, atrNow);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
             // Projected TP keys off the MAPPED direction (was: b.type ==
@@ -516,9 +523,10 @@ private:
             bool   isLong = (BlockDirection(b) == DIR_LONG);
             // v5.34 Part 2 used to re-anchor this projection to the Phase 2
             // outer-boundary entry. v5.52 has no Phase 2: the projection is
-            // taken straight from BlockEntryPrice(), the single mapped edge
-            // (a resistance LONG projects from b.top, a support SHORT from
-            // b.bottom). Once the order rests, b.localTP supersedes this below.
+            // taken straight from BlockEntryPrice(), the single mapped
+            // anticipation entry (a resistance LONG projects from
+            // b.bottom+slDist, a support SHORT from b.top-slDist). Once the
+            // order rests, b.localTP supersedes this below.
             double target = isLong ? calcEntry + tpRR * calcSLDist
                                    : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
@@ -688,7 +696,7 @@ private:
 
          if(InpUseFrontRunVeto)
            {
-            double calcEntry = BlockEntryPrice(b);
+            double calcEntry = BlockEntryPrice(b, atrNow);
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
             // Intra-bar twin of the Update() projection above — same
@@ -696,8 +704,8 @@ private:
             bool   isLong = (BlockDirection(b) == DIR_LONG);
             // v5.34 Part 2 used to re-anchor this projection to the Phase 2
             // outer-boundary entry. v5.52 has no Phase 2: calcEntry() already
-            // holds the single mapped edge, so both intra-bar and bar-close
-            // vetoes judge one price with no shift.
+            // holds the single mapped anticipation entry, so both intra-bar
+            // and bar-close vetoes judge one price with no shift.
             double target = isLong ? calcEntry + tpRR * calcSLDist
                                    : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
