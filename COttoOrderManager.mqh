@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.58"
+#property version   "5.60"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -1484,7 +1484,16 @@ private:
          if(atr <= 0) atr = m_blockManager.GetATR();
          if(atr > 0)
          {
-            double slDist = targetBlock.blockHeight + 0.5 * atr;
+            // FIX (v5.60) de-duplicated onto the ONE stop-distance definition.
+            // Every other entry path (PlaceOrArmOrder, CheckVirtualTriggers)
+            // already calls CalcSLDistance(); only this SAR fallback re-spelled
+            // the arithmetic inline. The two spellings agreed numerically, but a
+            // future edit to the helper would have diverged this stop ALONE --
+            // and with it the whole reversal basket's 1R basis, its pyramid
+            // ladder, its breakeven and its trail. Sharing the one definition
+            // makes that class of divergence impossible rather than merely
+            // unlikely.
+            double slDist = CalcSLDistance(targetBlock, atr);
             stopLoss = isLong ? entryPrice - slDist : entryPrice + slDist;
          }
         }
@@ -2846,7 +2855,7 @@ public:
          if(atr <= 0) atr = m_blockManager.GetATR();
          double slDist = (atr > 0) ? CalcSLDistance(block, atr)
                                    : MathAbs(vo.triggerPrice - vo.stopLoss);
-         // v5.58 — FAR-EDGE ANCHOR, twin of PlaceOrArmOrder() above. localTP
+         // FIX (v5.58) FAR-EDGE ANCHOR, twin of PlaceOrArmOrder() above. localTP
          // MUST stay the one price the Front-Run veto reads (the veto compares
          // the market against block.localTP once the order rests), so the
          // recovered projection is re-derived with the identical arithmetic

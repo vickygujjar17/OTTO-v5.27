@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.58"
+#property version   "5.60"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -330,7 +330,7 @@ private:
                   nb.atrSnapshot  = GetATRAtShift(pivotShift);
                   nb.wick1Time    = m_w1ResTime;
                   nb.wick2Time    = iTime(m_symbol, PERIOD_CURRENT, pivotShift);
-                  // v5.58 — W1/W2 FULL candle geometry, for the journal's
+                  // FIX (v5.58) W1/W2 FULL candle geometry, for the journal's
                   // Wick H/L lines only (no trading path reads these fields).
                   // W1: the stored m_w1ResTop IS the W1 candle high (it is the
                   // iHigh() captured when this W1 was created), but m_w1ResBot
@@ -427,7 +427,7 @@ private:
                   nb.atrSnapshot  = GetATRAtShift(pivotShift);
                   nb.wick1Time    = m_w1SupTime;
                   nb.wick2Time    = iTime(m_symbol, PERIOD_CURRENT, pivotShift);
-                  // v5.58 — support mirror of the W1/W2 geometry above. W1:
+                  // FIX (v5.58) support mirror of the W1/W2 geometry above. W1:
                   // m_w1SupBot IS the W1 candle low, while m_w1SupTop is the W1
                   // BODY bottom -- so the high comes from the series. W2 is the
                   // pivot bar: curBot is its iLow().
@@ -932,7 +932,7 @@ public:
                      nb.atrSnapshot  = GetATRDirect(s);
                      nb.wick1Time    = m_w1ResTime;
                      nb.wick2Time    = curTime;
-                     // v5.58 — W1/W2 FULL candle geometry (warm-up twin of the
+                     // FIX (v5.58) W1/W2 FULL candle geometry (warm-up twin of the
                      // live pass in TryCreateNewBlocks). The historical scan has
                      // a shift `s` for W2 rather than pivotShift; getATRDirect()
                      // is the warm-up reader, iHigh()/iLow() are shift-agnostic.
@@ -1020,7 +1020,7 @@ public:
                      nb.atrSnapshot  = GetATRDirect(s);
                      nb.wick1Time    = m_w1SupTime;
                      nb.wick2Time    = curTime;
-                     // v5.58 — support mirror of the warm-up W1/W2 geometry.
+                     // FIX (v5.58) support mirror of the warm-up W1/W2 geometry.
                      nb.wick1.time       = m_w1SupTime;
                      nb.wick1.highPrice  = iHigh(m_symbol, PERIOD_CURRENT, w1Shift);
                      nb.wick1.lowPrice   = m_w1SupBot;
