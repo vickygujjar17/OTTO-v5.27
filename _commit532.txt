@@ -1,0 +1,485 @@
+5.32: phantom half-risk journal line, attributable pyramid refusals, T2 crossing trace, 1R across restarts
+
+Four defects, all four on the live-money path, plus the instrumentation
+needed to prove each one is gone. Nothing in this release changes a
+trigger, a size or a stop TARGET: the half-risk rung keeps its arithmetic,
+the ladder keeps 2 -> 3 -> 4 -> 0, and 1R is still the initial stop
+distance. What changed is WHICH of those is reported, and whether a
+refusal is attributable.
+
+PHANTOM HALF-RISK JOURNAL LINE (COttoTradeManager.mqh, otto.mq5)
+
+The legacy "cut risk in half" rung is a LOSS-SIDE floor: LONG sits at
+entry - 0.5R, SHORT at entry + 0.5R. It was evaluated BEFORE the +1.0R
+cost-covering breakeven rung inside each direction's ladder, and it could
+only ever move the stop toward market, so the two rungs competed for the
+SAME desiredSL on the SAME tick.
+
+Under the shipped defaults InpCutRiskRR == InpBreakEvenRR == 1.0, so both
+rungs are reached on the very same tick. On the LONG ladder the half-risk
+guard did assign first -- desiredSL began at the initial stop, one full R
+below entry, which is by construction below entry - 0.5R -- and its
+counter incremented. Then breakeven ran, and it OVERWROTE that value on
+the same tick: its stop sits at entry +/- friction, a fraction of a pip
+on the PROFIT side. The SHORT ladder is the exact mirror.
+
+So m_halfRiskTriggers was really an ASSIGNMENT counter parked in the
+middle of the ladder, not a statement about the stop that reached the
+broker. otto.mq5 journals straight off that counter, so every +1R winner
+printed
+
+  SL -> HALF-RISK        risk now -0.5R
+
+while the live stop sat at cost-covering breakeven -- a trade that could
+not lose. That is a reporting lie on a live-money path: it tells the
+operator to budget -0.5R of risk on a position whose risk was already
+zero, and it was logged on every single +1R winner.
+
+TWO INDEPENDENT HALVES FIX IT
+
+1. LIVENESS. m_cutRiskRungLive is a member resolved ONCE in Initialize()
+   from inputs that cannot change mid-session, so the hot path only ever
+   READS it:
+
+     m_cutRiskRungLive = (InpCutRiskRR > 0.0 && InpCutRiskRR < InpBreakEvenRR);
+
+   A rung whose target cannot survive the higher rungs is INERT, and an
+   inert rung must not count. With the shipped defaults it is INERT: the
+   -0.5R floor is on the far side of the market from a stop already at
+   breakeven, so its comparison is provably false, it never assigns, and
+   the counter never moves. The phantom line cannot be printed because the
+   journal condition can no longer be satisfied. Initialize() says so
+   loudly -- "Journal HALF-RISK ... will NEVER be reported" -- and the
+   counter and the counter's gate are now derived from the same flag:
+
+     if(m_cutRiskRungLive && currentRR >= InpCutRiskRR && desiredSL < halfRiskSL)
+       { desiredSL = halfRiskSL; m_halfRiskTriggers++; }
+
+2. HOIST. The rung is moved to the END of its direction's ladder, after
+   breakeven, both step locks and the ATR trail, so halfRiskSL is
+   computed against the FINAL stop rather than an intermediate one. When
+   the rung IS live (InpCutRiskRR < InpBreakEvenRR) the counter now means
+   exactly what the journal claims: this floor was actually applied to the
+   stop that was pushed. Hoisting is behaviour-neutral by construction --
+   every rung resolves with max() for LONG / min() for SHORT and those are
+   order-independent, so no floor can change hands. The rung's TARGET is
+   deliberately left as the only literal fraction of 1R in the ladder; the
+   v5.31 milestone probe pins it to exactly one site per direction.
+
+The reported step is gated on the same flag, so the state machine cannot
+advertise a stop the ladder never applies:
+
+  else if(m_cutRiskRungLive && rr >= InpCutRiskRR)   step = STEP_HALF_RISK;
+
+With InpCutRiskRR >= InpBreakEvenRR the branch above is taken first
+anyway, so this is a statement of intent rather than a behaviour change --
+but it keeps the reported step and the journalled events derived from ONE
+gate instead of two.
+
+otto.mq5 gains a belt-and-braces warning in OnInit, fired when
+InpCutRiskRR >= InpBreakEvenRR. It is deliberately NOT gated on
+EnableLogging: Initialize()'s LIVE/INERT line already exists but is
+logging-gated, so a silent-mode operator would never learn that the
+configured -0.5R floor is structurally unreachable. A misconfigured rung
+is worth one line of terminal output even in silent mode.
+
+ATTRIBUTABLE PYRAMID REFUSALS (COttoOrderManager.mqh)
+
+AddPyramidTranche() had SEVEN bare `return false` exits -- no log, no
+counter, no distinguishing information of any kind. From the operator's
+side "T2 never triggers" was therefore indistinguishable from "T2
+triggered and the broker silently refused it", and every intermediate
+failure looked identical to a disabled feature. Each exit now names its
+own cause. The five REFUSED branches and the broker-rejection branch
+(inside the 165-line body):
+
+  1. FEATURE DISABLED OR NO BASKET.
+     "[Pyramid] Tranche N REFUSED: InpPyramidEnable=false" or
+     "... REFUSED: basket empty (m_basketCount=0)",
+     then "| nextTranche=.. | err=..".
+     The two causes share one guard (!InpPyramidEnable || m_basketCount
+     == 0) and are split by a ternary in the message, so the guard's shape
+     is untouched.
+
+  2. OUT OF ORDER.
+     "[Pyramid] Tranche N REFUSED: out of order | nextTranche=X
+      (expected N) | basketCount=.. | err=..".
+     This is the second-most-likely reason a rung never fires: the ladder
+     is 2 -> 3 -> 4 -> 0 and a parked or skipped rung leaves the cursor
+     somewhere else, at which point the request can never be granted no
+     matter how far the trade has run. Reporting both the cursor and the
+     expected value makes a desynchronised ladder visible in one line.
+
+  3. UNKNOWN RUNG. The terminal `else` of the rung selector.
+     "[Pyramid] Tranche N REFUSED: unknown rung (ladder is 2/3/4) | err=..".
+
+  4. NO USABLE R UNIT -- see the fallback chain below.
+
+  5. INSUFFICIENT MARGIN.
+     "[Pyramid] Tranche N REFUSED: insufficient margin for lot X
+      | nextTranche stays M (retried next tick) | err=..".
+     The message deliberately states that the cursor is NOT advanced, and
+     the asymmetry is intentional: sub-minimum lot is a property of the
+     rung and will never improve, so that branch advances the cursor to
+     stop a per-tick respawn. Insufficient margin is a property of the
+     ACCOUNT and is transient -- the next tick may be fundable -- so the
+     rung is kept and retried.
+
+  6. BROKER REJECTION. The only remaining exit, and the failure mode the
+     field could never see: the rung was reached, the lot was fundable,
+     and the server said no.
+     "[Pyramid] Tranche N REJECTED by broker | lot=X risk%=Y R=Z
+      retcode=R (comment) | nextTranche=M (retried next tick)".
+     The retcode is printed ALONGSIDE the comment because the comment is
+     broker-localised and can be empty or unhelpful, while the retcode is
+     the machine-readable reason (NO_MONEY, INVALID_STOPS, ...). The lot,
+     the risk percent and the R unit are all echoed so the rejection can
+     be reconciled against the decision that produced it.
+
+REFUSED and REJECTED are distinct verbs on purpose: REFUSED is us
+declining, REJECTED is the broker declining. Grepping one word gives the
+whole class of one kind.
+
+The "risk lot below min" diagnostic (the one exit that was already
+logging) is widened to carry risk%= and slDist=, so it can be compared
+against the other branch messages instead of standing apart.
+
+
+R-UNIT FALLBACK CHAIN (COttoOrderManager.mqh)
+
+AddPyramidTranche() divided by m_basketRRUnit and refused if it was <= 0.
+That single guard carried the whole geometry of the scale-in, and it was
+the one place a cold restart could silently disable the entire ladder:
+SeedActiveTradeFromPosition() zeroes the struct's fields and the basket
+R unit lives ONLY in memory, so a restart that re-adopted a position
+before rebuilding the basket left the divisor at zero and every rung
+refused forever, for a reason nothing printed.
+
+Rather than refuse the scale-in, 1R is now recovered from a documented
+preference chain, and the source used is logged:
+
+  1. m_basketRRUnit            -> rSource = "basket"          (normal path)
+  2. m_activeTrade.rrUnit      -> rSource = "activeTrade"
+  3. |entry - initialSL|       -> rSource = "initialSLDistance"
+  else  REFUSED: no usable R unit, printing every candidate field
+        (m_basketRRUnit, hasActiveTrade, activeTrade.rrUnit) so a zeroed
+        divisor can be traced to the field that lost it.
+
+When the source is anything other than "basket" the call prints
+
+  [Pyramid] Tranche N R unit RECOVERED from <source>: <value>
+            (m_basketRRUnit was <value>)
+
+so a degraded R unit is never silent again. This is safe with respect to
+the scale-in geometry because the R unit is used ONLY to size the tranche
+(RiskPctLotSize) and to report; a recovered-from-a-fallback unit may
+differ by a few points from the original, and the log states which one was
+used rather than pretending they are the same.
+
+Note the chain is reached AFTER the ladder checks: a rung that is
+disabled, out of order or unknown is refused for that reason first, so
+the log never blames the R unit for a rung that was never going to fire.
+
+MUTANT-RESISTANCE NOTE: the recovered-R line is gated on
+`if(rSource != "basket" && EnableLogging)`. Both halves are load-bearing
+and both are pinned by the probe -- dropping the EnableLogging gate would
+print per-tick spam on every recovered scale-in, and dropping the
+rSource check would print the line on the normal path, which would make
+it meaningless as a degradation signal.
+
+T2 CROSSING TRACE (COttoTradeManager.mqh, COttoOrderManager.mqh)
+
+Tranche 2 had never been observed firing in the field, and every refusal
+inside AddPyramidTranche() returned a bare false, so "T2 never triggers"
+was indistinguishable from "T2 triggered and was silently refused". Two
+candidate root causes were outstanding and neither was observable:
+
+  a. the RR gate was never crossed at all, or
+  b. it WAS crossed, but the gate's second half, IsPyramidPending(2), was
+     already false because m_nextTranche had advanced past 2.
+
+A one-shot trace now makes the crossing itself observable. The first tick
+whose RR enters the 5%-wide band below the trigger prints EVERY quantity
+the decision depends on:
+
+  [Pyramid] T2 crossing: currentRR=.. trigger=..R
+             | basketRRUnit=.. ladderRRUnit=..
+             | basketCount=.. | nextTranche=.. pending2=true|false
+             | riskT2%=.. lot=.. | dir=LONG|SHORT enable=true|false
+
+Design points, each deliberate:
+
+  * It runs BEFORE the T2 gate, so it fires even when the gate's second
+    half is false -- i.e. it covers candidate (b) as well as (a). This is
+    the whole reason it is not simply placed inside the gate.
+  * It reports basketRRUnit AND ladderRRUnit side by side, because the
+    two can legitimately differ after a restart (the basket divisor is
+    authoritative; rrUnit is the local derived one). Printing both turns
+    "which R was this RR measured against" into a read-off instead of an
+    inference.
+  * It reports the raw cursor (nextTranche) next to pending2, since
+    IsPyramidPending() collapses every cause into a bool and cannot
+    distinguish "not yet at 2" from "already past 2".
+  * It reports the lot the rung WOULD risk, computed the same way the
+    rung computes it (RiskPctLotSize(InpRiskT2Pct, traceR) with the same
+    basket-then-ladder R preference), so the trace and the eventual order
+    cannot disagree about the size.
+  * ONE REPORT PER APPROACH. m_t2TraceBucket holds the last reported
+    5%-band bucket; the latch re-arms whenever the ladder leaves rung 2
+    (GetNextTranche() != 2), which happens both when T2 fires and when the
+    basket is cleared, so each fresh basket gets its own crossing report.
+    It is deliberately NOT re-armed on InpPyramidEnable: a disabled
+    pyramid parks the cursor on 2 permanently, and re-arming there would
+    turn the trace into a per-tick spammer instead of one report per
+    approach.
+  * Fully read-only apart from the bucket latch, so the diagnostic cannot
+    change what the ladder does.
+
+GetNextTranche() is added to the OrderManager as a const accessor
+(returning m_nextTranche) purely so this trace can report WHY a rung was
+refused. IsPyramidPending() answers "may this rung fire?" but collapses
+every cause into one bool; the trace needs the raw cursor.
+
+
+ORIGINAL 1R ACROSS A COLD RESTART (COttoOrderManager.mqh)
+
+m_basketRRUnit is the divisor for EVERY RR decision the Trade Manager
+makes, and it is NOT recoverable from the broker. SeedActiveTradeFrom
+Position() is the path that runs on a cold start (and on flat adoption),
+i.e. after the EA has lost every in-memory field, and it derived 1R as
+
+  m_activeTrade.rrUnit = m_activeTrade.initialSLDistance;
+
+That is correct ONLY while the untouched initial stop is still in place --
+and the entire point of this EA is that the stop RATCHETS. Once breakeven
+has fired, |entry - POSITION_SL| is no longer 1R, it is friction:
+
+  |entry - POSITION_SL|  ~=  a few pips   where the true 1R is hundreds
+
+Dividing by that INFLATES every subsequent RR by orders of magnitude. The
+consequence is not cosmetic and not confined to the readout: the +1.0R
+tranche-2 gate tests exactly this number, so a position 5 pips into profit
+is reported as hundreds of R and the T2 rung is JUMPED in a single tick
+rather than crossed -- which is precisely why no crossing was ever
+observed, and why the trace above is needed as well as this fix.
+
+The original 1R is now PERSISTED to MT5 global variables alongside the
+position it belongs to:
+
+  OTTO_<key>_<symbol>_<magic>       e.g. OTTO_BASKETR_EURUSD_20240624
+
+Two variables, written as a pair at basket creation
+(PersistBasketR(rrUnit, ticket) from InitBasket) :
+
+  OTTO_..._BASKETR   the 1R distance, written ONLY when r > 0.0
+  OTTO_..._BASKETT   the PRIMARY POSITION TICKET it belongs to
+
+The ticket pairing is what makes the restore SAFE, not merely
+convenient. MT5 keeps a position ticket stable across restarts, so the
+stored 1R can be applied only to the position it was measured on. A
+leftover record from an earlier, already-closed basket can never be
+applied to a different position: RestoreBasketR(adoptedTicket) requires
+the stored ticket to MATCH the ticket being adopted, returns 0.0 on any
+mismatch, and logs the mismatch out loud
+
+  [OrderManager] Stored basket 1R belongs to ticket X, not Y
+                -> discarded (stale record)
+
+Zero-ticket writes are refused at the source (PersistBasketR returns
+early when primaryTicket == 0), so a synthetic or unassigned ticket can
+never plant a record that a later adoption might match by accident.
+
+RestoreBasketR() requires BOTH variables to be present and CHECKED with
+GlobalVariableCheck before reading -- an absent record and a zero record
+are both "no usable record" (0.0) rather than a silent zero divisor.
+
+SeedActiveTradeFromPosition() now resolves the unit in a stated
+preference order:
+
+  1. restoredR = RestoreBasketR(positionTicket); if > 0.0 use it, and log
+       "[OrderManager] Basket 1R RESTORED from persistent store: X
+        (broker SL distance was Y)"
+  2. else fall back to |entry - initialSL|, and log
+       "... Basket 1R REBUILT from broker SL distance: X -- no stored
+        record for ticket T"
+     plus, when the stop has collapsed onto entry (within 2 points), an
+     explicit appended warning:
+       "| WARNING: stop sits AT ENTRY, so this 1R is friction-sized and
+        the derived RR will be badly overstated"
+  3. else the stop is zero: rrUnit is set to 0.0 and the path says so
+       "... WARNING: basket 1R UNRESOLVED for ticket T (entry=.. sl=..)
+        -- RR-based milestones will stay inert until the stop is set"
+
+Every branch states which source it used, because a silently degraded R
+unit is exactly how this bug stayed hidden. Whichever source wins, the
+broker-derived value is always echoed in the RESTORED line, so the size
+of the correction is visible at a glance.
+
+The stored record is CLEARED when the tracked basket state is torn down
+(ClearBasket() -> ClearBasketR(), which deletes both variables), so its
+lifetime is the basket's lifetime. That is the FIRST line of defence
+against a stale record; the ticket check in RestoreBasketR() is the
+second. Deleting 1R with the basket also means a fresh basket starts from
+a clean slate rather than inheriting a divisor from a basket that has
+already run its course.
+
+Note the restart path alone is not sufficient, which is why BOTH the
+persist/restore pair and the AddPyramidTranche fallback chain exist: the
+persisted value covers a restart that adopts the same ticket, and the
+in-memory fallback chain covers a session where the basket R unit was
+never populated at all. They are independent and neither subsumes the
+other.
+
+
+VERIFICATION
+
+build_check.ps1: 0 errors, 0 warnings, all 10 headers verified from the
+staging tree (link provenance lists every Otto module as [STAGED],
+legacy/OTTO entries excluded: 2). The .ex5 byte count is NOT stable across
+runs -- the compiler emits a timestamp, and three green runs of this exact
+tree produced 188738, 189634 and 190950 bytes -- so no size is asserted
+here and none should be read as a fingerprint of this release.
+
+Probe suites: 14/14 files pass, 0 FAIL. Counted checks total 553 across
+the 7 probes that print "N / N checks passed", plus 185 "[PASS]" markers
+across the 7 earliest probes that report per-line, i.e. 738 assertions
+green.
+
+  test_v532_pyramid.py 87/87 (new) is this release's contract probe. It
+    pins: the half-risk liveness expression and its ONE resolution site;
+    the hoisted rung position AFTER breakeven and both step locks in each
+    direction, with the '<' / '>' mirror preserved; the counter gate
+    reading m_cutRiskRungLive in both the ladder and the reported step;
+    the OnInit UNREACHABLE warning, including that it is NOT gated on
+    EnableLogging; the T2 crossing trace (band, bucket latch, re-arm on
+    cursor != 2, the deliberate absence of an InpPyramidEnable term, and
+    that the trace block sits BEFORE the T2 gate); the five REFUSED
+    branches and the REJECTED branch; the margin/advance asymmetry; the
+    R-unit fallback chain order; the recovered-R line's rSource and
+    EnableLogging gates; the GV key format, ticket pairing, ticket
+    mismatch path, zero-ticket refusal, persist-at-init and clear-with-
+    basket; the seed-path RESTORED / REBUILT / UNRESOLVED triad; and the
+    version stamps of all 10 files.
+  test_v52x_pyramid.py 130/130 (updated, was 91/91 at HEAD) tracks the
+    v5.32 changes in its ladder anchors: the refusal-message and
+    cursor-accessor changes it was written for, plus its v5.31 milestone
+    section (section 9), which is new here -- that section shipped in the
+    5.31 release but was never in this file at HEAD. Its replay model now
+    lists the rungs in SHIPPED (post-hoist) order, and its section-9
+    wording no longer describes the half-risk rung as evaluated first.
+    Section 9's ordering claims were then made BRANCH-SCOPED. The ladder
+    is mirrored for LONG and SHORT with byte-identical guard text, so a
+    bare TM_N.index() comparison silently resolves against the LONG copy
+    no matter which branch the claim is about; the text is now split at
+    the SHORT marker and each ordering claim is asserted inside the branch
+    it actually describes. The one stale check that asserted "every
+    milestone rung is evaluated after the half-risk rung" -- backwards
+    once the rung was hoisted -- was replaced by two branch-scoped ones
+    (the milestone rungs run DESCENDING in both directions, and the ATR
+    trail still follows both step locks), and the hoist position itself
+    became a third. The older whole-file ATR-order check was deleted
+    rather than left beside its stronger replacement, which is why the
+    file's total moves by one less than it appears to gain. The reorder
+    mutants in _mutate_ms_milestones.py are what prove the three bite
+    rather than merely re-state the file.
+  test_v531_smart_trim.py 76/76 (new in v5.31), test_v526_vector.py 83/83,
+    test_v527_exit_comment.py 60/60, test_v528_hotfix.py 74/74,
+    test_v530_price_guard.py 43/43 unchanged.
+
+test_v527_exit_comment.py gained ONE assertion (59 -> 60): that
+SyncTradeState reports STEP_HALF_RISK only while m_cutRiskRungLive is
+true, i.e. the reported step and the applied rung are derived from the
+SAME gate. It was verified to bite by deleting the liveness term from the
+reported step in a scratch copy, which turns the suite 59/60 and exits 1;
+it is not a decorative pass.
+
+Section 9 of test_v52x_pyramid.py is new to this file at this commit (it
+documents the 5.31 milestone floors), so its assertions are mutation-
+tested separately by _probe/_mutate_ms_milestones.py: 11/11 mutations
+caught, 0 anchors skipped, verdict "*** EVERY MUTATION CAUGHT ***". That
+harness reverts each floor and each guard one at a time -- the +2.0R
+target back to half-RR, the +3.0R target back to +1.0R, the trail gate
+raised above the first rung, the breakeven friction offset dropped, the
+LONG ratchet made two-way, the half-risk target sign flipped (LONG
+branch), the unified-basket guard stubbed out, the T2 scale-in stop
+zeroed, and a second copy of the ladder drifted into the order manager --
+against the SAME probe, so a clean run is evidence that the
+newly-landed section is not merely describing the code back to itself.
+
+Two of those 11 are a SECOND CLASS of mutation and exist because this
+release's headline change is an ORDERING change, not a rewrite. The hoist
+moves the half-risk rung to the end of each branch while leaving every
+guard byte-for-byte identical, so the literal-replacement table above is
+structurally blind to reverting it: no anchor string changes, nothing for
+the probe to notice. The harness therefore grew a REORDER_MUTATIONS table
+that relocates whole blocks instead of rewriting them. One entry un-hoists
+BOTH branches back to the pre-v5.32 layout; the other un-hoists ONLY the
+SHORT mirror and leaves LONG correct. The second is the sharper of the
+two: it is exactly the regression that slips past a branch-blind ordering
+assertion, because a bare TM_N.index() lookup keeps resolving every claim
+against the still-correct LONG copy. Before the section-9 checks were made
+branch-scoped, that mutant would have survived with the probe green.
+
+Getting mutant A to bite for the RIGHT reason took two corrections, both
+worth recording because either would have produced a green harness that
+proved nothing. First, the block splice was unbounded: `text.index(marker)`
+to EOF swallowed everything after the half-risk rung, so reverting the LONG
+branch also destroyed the SHORT branch and tripped the DESCENDING check --
+a mechanical catch that had nothing to do with the hoist. The caller now
+slices each branch at "else // SHORT" and splices within it. Second, with
+the splice bounded, all nine literal mutants still fail as before and BOTH
+reorder mutants fail on the HOIST check by name -- not on DESCENDING, not
+on a parse error. That is the evidence the new mutants probe the hoist
+specifically rather than merely making the tree unparseable.
+
+Both harnesses share one failure mode worth naming: they assert the probe
+goes RED, so a probe that greps for text the mutation did not actually
+remove will pass the mutation and be scored as a miss. That is precisely
+how the self-defeating mutation in item 2 below was discovered.
+
+Mutation testing: _probe/_mutate_v532.py copies the tree to a temp root,
+applies ONE regression at a time and asserts the probe goes red against
+it -- 43/43 mutations caught, 0 anchors skipped, verdict "*** EVERY
+MUTATION CAUGHT ***". Coverage spans the liveness gate, gate direction
+and counter, hoist ordering, the T2 trace shape, all five refusal
+branches plus the broker rejection, the full R-unit fallback chain, the
+cursor asymmetry in BOTH directions, the const-ness of the accessor, GV
+key scoping / ticket check / zero-ticket / persist / clear / delete, the
+seed-path restore, the OnInit UNREACHABLE warning and all three version
+stamps.
+
+Two things this harness found and that are worth recording, because both
+are failure modes of the HARNESS rather than of the EA:
+
+  1. A GENUINE PROBE GAP. The recovered-R log's EnableLogging gate was
+     never asserted, so a mutation that removed the gate and turned the
+     line into unconditional per-tick spam went UNDETECTED. Three
+     assertions were added to test_v532_pyramid.py: the broker-rejection
+     exit must name retcode= plus res.retcode and res.comment, the
+     recovered-R line must interpolate rSource, and the line must be
+     gated on `if(rSource != "basket" && EnableLogging)`. The harness
+     then reported the mutation CAUGHT.
+  2. A SELF-DEFEATING MUTATION. A mutation whose REPLACEMENT TEXT
+     contains the very token the probe greps for passes silently. Here a
+     mutant rewrote a ClearBasketR() call site but carried
+     "ClearBasketR()" inside its own explanatory comment, so the probe's
+     grep matched the mutant's comment and reported success. The comment
+     text was redacted in the mutation table. This is a class, not an
+     incident: any probe built on token presence rather than structure
+     has to keep the replacement text token-free.
+
+normalize_eol: CRLF=2367 on COttoOrderManager.mqh, all 10 files
+bareLF=0 bareCR=0. repair_mojibake: 0 damaged characters, 0 runs.
+Version bumped 5.31 -> 5.32 in all 10 files plus the README base line,
+the #property version / description pair in OttoDefines.mqh, the startup
+banner in otto.mq5 and the [9] input-group banner. Historical FIX (v5.2x)
+annotations are preserved and excluded from the bump pattern, and the
+#property link still names the OTTO-v5.27 GitHub repo -- that string is
+the repository name, not the release, so it is excluded on purpose.
+
+NOTE FOR THE OPERATOR: with the shipped defaults InpCutRiskRR ==
+InpBreakEvenRR == 1.0, so the -0.5R half-risk rung is INERT by design and
+"SL -> HALF-RISK" will NOT appear in the journal. That is the fix, not a
+regression. To arm the rung, set InpCutRiskRR strictly below
+InpBreakEvenRR; OnInit will state whether it is live either way.
+

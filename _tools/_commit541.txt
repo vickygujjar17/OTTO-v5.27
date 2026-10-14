@@ -1,0 +1,65 @@
+5.41 fix: patch physical route SAR direction guard and missing N/R comment tags
+
+v5.40's hybrid router recovered the physical fill scanner and stamped the N/R
+phase into the journal, but two defects survived on the PHYSICAL route that the
+in-memory VIRTUAL route did not have. Neither is a compile error, so the strict
+gate was green while both shipped. v5.41 closes them.
+
+1. SAR DIRECTION GUARD (COttoOrderManager.mqh)
+
+CheckPendingOrderFills() closed the live basket on ANY resolved physical fill
+whose ticket differed from the tracked one:
+
+    if(m_hasActiveTrade && m_activeTrade.ticket != newTicket)
+
+That is not a stop-and-reverse, it is a ticket mismatch. A SAME-direction
+scale-in fill -- a second entry the block intends to ADD to the basket -- landed
+on exactly that condition and fratricided the incumbent it was meant to join.
+
+The guard now also requires the incoming direction to OPPOSE the live basket:
+
+    if(m_hasActiveTrade && m_activeTrade.ticket != newTicket &&
+       m_activeDirection != newDir)
+
+This mirrors the virtual trigger's by-construction reversal check at
+CheckVirtualTriggers() (`m_activeDirection != (isLong ? DIR_LONG : DIR_SHORT)`),
+so both routes now agree on what a reversal is: a fill that lands while a basket
+is live AND points the other way. newDir is resolved by the 3-tier
+ResolveFilledPositionTicket() to DIR_LONG / DIR_SHORT, so the comparison is
+always against a concrete direction. The wasReversing save/restore around
+CloseEntireBasket() is unchanged.
+
+2. N/R COMMENT TAG (COttoOrderManager.mqh)
+
+The VIRTUAL MARKET leg names its phase in the deal comment, but PlaceOrArmOrder()
+ROUTE A sent the resting broker limit with a phase-less comment:
+
+    request.comment = ClampOrderComment(armSessionId + "_P");
+
+A terminal row for a physical fill therefore could not be told apart as a Phase 1
+bounce vs a Phase 2 reversal without opening the journal. ROUTE A now derives the
+same phase local the virtual engine uses and stamps it between the session id and
+the "_P" (physical) flag:
+
+    string phaseType = (block.touches == 0) ? "N" : "R";
+    request.comment  = ClampOrderComment(armSessionId + "_" + phaseType + "_P");
+
+A block's FIRST fill (touches == 0) is the Phase 1 "N"ormal bounce, its SECOND
+(touches >= 1) the Phase 2 "R"eversal -- identical semantics to the virtual
+marker. ClampOrderComment() already tail-preserves the "-BLK<n>" setup id, so the
+extra tag still fits the MT5 31-char comment limit and no other call site changes.
+
+PROBES
+
+A new test_v541_sarfix.py pins both fixes: the direction clause welded onto the
+same if() as the ticket clause, its semantic mirror of the virtual trigger, and
+the block.touches-derived phase local feeding the "_" + phaseType + "_P" comment
+shape (with the untagged shape asserted gone). 14 checks. The full suite is green
+end-to-end (19 probes); the v5.40 hybrid probe and every earlier probe remain
+untouched and passing.
+
+VERSION BUMP
+
+_tools/_bump541.py rewrites the eleven #property version headers, the OttoDefines
+banner/description, the four input-group release stamps and the README base line
+(20 lines). Strict gate: 0 errors, 0 warnings.

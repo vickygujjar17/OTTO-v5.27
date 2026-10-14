@@ -1,0 +1,81 @@
+v5.32: add "High Table" decoupled watchdog (CHighTableAuditor.mqh)
+
+New module: CHighTableAuditor.mqh - a read-only, timer-driven auditor that
+keeps a CSV evidence trail and emails one alert per incident.
+
+WHY IT IS DECOUPLED
+MQL5 has no exceptions, so "survives a trade-logic fault" cannot be a
+try/catch. The equivalent guarantee here is structural:
+
+  1. The auditor holds NO pointer to any trade module. It is read-only and
+     pull-based: it reads account/position state straight from the terminal,
+     so there is no shared object graph to corrupt and nothing to sync.
+  2. Its entry point (RunAudit) is driven by OnTimer, NOT OnTick. OnTick
+     returns early when the EA is halted (total-DD breach) or daily-paused -
+     precisely the states a watchdog must be able to report. A tick-driven
+     auditor inherits every one of those early returns and goes silent
+     exactly when it is needed.
+  3. Each dispatch owns its CSV handle, opened and closed per write, so a
+     failed write leaves no dangling handle behind for the trade path.
+
+This is the FIRST timer in the EA: EventSetTimer() is registered in OnInit
+next to the other module initialisations, and EventKillTimer() is added to
+OnDeinit. OnDeinit runs on every parameter change, timeframe switch and
+recompile, so without the kill each re-init would stack another timer and
+silently multiply the audit cadence.
+
+ALERT DISPATCH
+  * DispatchAlert(subject, message) - unconditional: logs to CSV, emails.
+  * DispatchAlertOnce(bool &latch, subject, message, severity) - one email
+    per incident. OnTimer re-tests every condition every cycle, so an alert
+    with no latch re-emails every 5 seconds for as long as the violation
+    stands. The latch is passed BY REFERENCE so each call site owns a named,
+    greppable bool; it is RAISED as a side effect of the dispatch itself and
+    re-armed only by ClearLatch() once the condition reads healthy. Raising
+    it on the dispatch (not on the caller noticing the violation) is what
+    stops a live condition from latching itself silent before it is ever
+    reported.
+  * Eight named incident latches are declared and initialised up front
+    (trim failure, daily DD, total DD, floating-loss cap, halt, order
+    rejects, stop-modify failures, state inconsistency).
+
+CSV EVIDENCE
+Otto_HighTable_Audit.csv is appended in the terminal's MQL5\Files sandbox,
+opened FILE_READ|FILE_WRITE and seeked to EOF - plain FILE_WRITE truncates,
+which would leave an evidence file that erases its own history. Every field
+passes through Sanitize(), which folds the delimiter, the quote character
+and raw CR/LF, and maps non-ASCII bytes to '_'. An audit that cannot be
+parsed is not evidence, and this repo has shipped mojibake before.
+
+SendMail is guarded by an MQL_TESTER check on both dispatch paths: it cannot
+dispatch inside the Strategy Tester, so an unguarded call would produce a
+journal error per alert per run. Tester runs still emit the CSV row, marked
+TESTER.
+
+INPUTS (new group [10])
+  InpEnableHighTable       = true   // Enable High Table watchdog
+  InpHighTableAuditSeconds = 5      // Audit cadence (seconds, clamped >= 1)
+
+SCOPE
+Part 1 ships the framework: dispatcher, latches, timer wiring and the
+RunAudit() cadence. The four per-condition audit bodies (AuditTrimHealth,
+AuditDrawdown, AuditOrderHealth, AuditStateConsistency) are deliberately
+side-effect-free stubs so the call graph, the latch inventory and the
+dispatcher contract are final now; Part 2 fills the bodies without
+re-plumbing the auditor.
+
+BUILD GATE
+CHighTableAuditor is registered at all three sites in _tools/build_check.ps1
+(ottoNames, expectedOtto, ottoModules) and the staged-source expectation is
+raised to 11. Without this the module compiles but is never provenance-
+verified - the exact blind spot the gate exists to close.
+
+VALIDATION
+  * build_check.ps1 - 0 errors / 0 warnings, 11 sources staged.
+  * _probe/test_v532_hightable.py - new static probe covering decoupling,
+    timer lifecycle, latch semantics, CSV append safety, tester guarding
+    and version/count agreement.
+  * verify_integrity.py - provenance hashes regenerated.
+
+Group header [9] keeps its original v5.31 stamp: group headers pin the
+release that INTRODUCED the group, not the current release.

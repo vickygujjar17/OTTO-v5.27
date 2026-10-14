@@ -1,0 +1,80 @@
+v5.36: journal a veto-to-reversal conversion instead of a CANCELLED_ rename
+
+A Phase 1 block (touches == 0) that trips a CONVERTIBLE veto is not dead: it
+is upgraded to a Phase 2 reversal by COttoBlockManager::TryConvertToReversal()
+and lives on. But its resting Phase 1 LIMIT still had to come off the books,
+and that drop ran through the same cancel path as a genuinely fatal veto --
+so the journal printed a cancellation reason and LogCancellation() renamed the
+session file to CANCELLED_<name>. A live, re-phased setup was therefore
+recorded as a cancellation, and the paper trail contradicted the position the
+EA went on to trade.
+
+THE DISCRIMINATOR: conversionReason ON THE BLOCK
+
+SSniperBlock gains ENUM_VETO_REASON conversionReason (OttoDefines.mqh): the
+convertible veto that promoted the zone, or VETO_NONE when the block reached
+Phase 2 normally -- or never left Phase 1. It is zeroed by the existing
+ZeroMemory() at every block-creation site, so a fresh block reads VETO_NONE
+with no extra reset.
+
+  * TryConvertToReversal() stamps b.conversionReason = reason, the exact veto
+    that triggered the upgrade.
+  * SyncReversalCluster() -- which promotes a whole cluster to Phase 2 when a
+    sibling converts -- FORCES VETO_NONE on the siblings. Their promotion is a
+    consequence of the sibling's conversion, not a conversion of their own,
+    and a stale reason would mislabel them at the drop site.
+
+THE DROP SITE (CancelOrdersForInvalidBlocks)
+
+The pending-order drop now branches on the block instead of assuming a cancel:
+
+  * conversionReason != VETO_NONE AND touches >= 1  ->  a conversion. The
+    block is journalled through COttoJournal::LogConversion() and the session
+    file is left in place.
+  * otherwise -> the unchanged cancellation path (reason map + rename).
+
+The touches >= 1 half is deliberate: conversionReason is only ever written on
+the promotion edge, and touches is the authoritative phase cursor, so a reason
+without a consumed Touch 1 cannot occur on a live block.
+
+COttoJournal::LogConversion(ticket, btype, reason)
+
+A new public entry point that mirrors LogOrderPlaced()'s shape -- append or
+create, write a [CONVERTED TO REVERSAL] block, CloseHandle(), email -- and
+deliberately does NOT rename the session file. LogCancellation()'s rename to
+CANCELLED_<name> is precisely the behaviour that would mis-file a live
+reversal, so it is not reused. The record names the dropped ticket, the block
+polarity, the trigger event and the next action (Phase 1 order cancelled,
+block upgraded to Phase 2 Reversal).
+
+THE FRONT-RUN LABEL: 1:3 -> 1:4
+
+The Front-Run veto reason string now reads "Fired Front-Run 1:4 Veto" on BOTH
+the conversion and the cancellation branch, matching the shipped RR (InpMaxRR
+default 4.0R). The otto.mq5 STEP 3 banner is updated to match.
+
+INPUTS
+
+The convertible-veto switches are all LIVE on this build:
+
+  InpRevFrontRun = true    InpRevNearMiss = true    InpRevStale = true
+  InpRevMom      = true    InpRevFvg      = true
+
+InpRevStale flips false -> true: the Stale (45D) veto is now convertible like
+the rest. Comments reworded to "Convert <X> Veto to Phase 2 Reversal".
+
+VALIDATION
+
+  * build_check.ps1 - 0 errors / 0 warnings, all 11 headers [STAGED] from the
+    staging tree, binary produced (230738 bytes).
+  * scan_encoding.ps1 - strict CRLF, no BOM, valid UTF-8, bareLF=0 on all 11
+    sources; the three new em-dash comments add +3 non-ASCII bytes exactly.
+  * verify_integrity.py - bareLF=0 / bareCR=0 on every source.
+
+Version bumped 5.35 -> 5.36 in all 11 sources (#property version), the
+OttoDefines master-build banner + #property description, the [9]/[10]/[11]
+/[12] engine-group labels, the otto.mq5 Pine port banner and startup Print,
+and the README base line. Historical '// v5.3x:' and 'v5.34 Part N' engine
+annotations are preserved untouched; _tools/_bump536.py skips any line
+containing "FIX (" and anchors every other pattern on a human-facing prefix
+so no versioned comment can be rewritten.

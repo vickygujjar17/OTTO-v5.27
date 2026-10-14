@@ -1,0 +1,102 @@
+547: order routing — prevent FOK/IOC structural rejections on pending limits
+
+SendOrderWithRetry() in COttoOrderManager.mqh is the EA's single outbound trade
+call: pending limit placement, position close, reversal entry, SL/TP modify, the
+pyramid tranche and the retry itself all funnel through the ONE OrderSend()
+inside it. So the filling mode chosen there is applied to every request the EA
+sends -- and the function chose it unconditionally:
+
+    request.type_filling = GetFillingMode();   // dynamic FOK/IOC/RETURN
+
+GetFillingMode() reads SYMBOL_FILLING_MODE, which advertises which fill policies
+the symbol's DEALS accept (FOK / IOC). That is the correct question for a MARKET
+deal and the wrong one for a resting pending limit, which carries no executable
+price at send time. On a strict venue the dynamic FOK/IOC is structurally
+invalid there and is rejected with TRADE_RETCODE_INVALID_FILL.
+
+The rejection was SILENT, which is what made it worth a release:
+
+  * TRADE_RETCODE_INVALID_FILL is not in the retry ladder's retry set, so the
+    loop did not re-attempt the send;
+  * the pending limit was therefore never placed, and the strategy carried no
+    order where it believed it had one -- an armed block with no broker row.
+
+  1. ACTION-GATED FILLING. The dynamic mode is now applied only to a
+     TRADE_ACTION_DEAL request; every other action takes ORDER_FILLING_RETURN,
+     the only filling mode MT5 defines for a pending order. A DEAL keeps the
+     dynamic FOK/IOC it needs, so nothing about the market path changes.
+
+  2. NEUTRAL ELSEWHERE. MT5 ignores type_filling on TRADE_ACTION_REMOVE and
+     TRADE_ACTION_SLTP, so routing those to RETURN is a no-op today and
+     future-proofs any action added later. The guard is placed inside the retry
+     loop, matching the v5.37 comment guard beside it, so OrderSend() reads a
+     correct mode on every attempt.
+
+Unchanged on purpose: GetFillingMode() itself (still FOK, then IOC, then
+RETURN), the retry ladder, the throttle, and every call site. The pyramid path's
+own req.type_filling = GetFillingMode() is a DEAL request and stays as-is.
+
+
+TOOLING
+
+Two latent defects in _tools/_bump_version.py, both exposed by this release's
+bump and both fixed:
+
+  * The post-bump staleness census flagged ANY surviving old-release literal,
+    including lines carrying a historical 'FIX (vX)' annotation -- the very
+    markers the bump pass skips on purpose. A tree that had landed a fix would
+    therefore fail its own bump guard. The census now applies the same 'FIX ('
+    exemption the bump already did.
+  * Re-running the bump with an explicit target equal to the current release
+    aborted as an error. It is now a no-op, so a bump-then-verify sequence
+    cannot be broken by its own second invocation. The bare (no-argument) form
+    still advances one minor, by design.
+
+Three prose comments in CHighTableAuditor.mqh that named v5.46 in the bare
+'// v5.46 -' form are restated as 'FIX (v5.46):' so the historical annotation is
+in the shape the tooling exempts. Wording only; no code changed.
+
+_probe/test_v546_risk_isolation.py is now release-agnostic. Its stamp check
+pinned the literal {5.46} and so failed on any later bump; it now asserts the
+invariant that actually matters -- every shipped source carries the SAME stamp.
+Two assertions stranded after raise SystemExit(main()) (dead, never executed)
+were moved into the live section, which is why that probe now reports 28 checks
+where it previously reported 26.
+
+
+VERIFICATION
+
+  * build_check.ps1 (BARE invocation, no -Source) : 0 errors / 0 warnings,
+    gate PASSED, 11/11 Otto modules linked from the staging tree. The .ex5 byte
+    count is NOT a fingerprint -- it varies run to run on identical builds.
+  * Probes: test_v547_filling 22/22 (new), test_v546_risk_isolation 28/28 (was
+    26/26 -- two dead assertions recovered). Unchanged and passing:
+    test_v545_throttle 28/28, test_v543_session 29/29, test_v542_email 21/21,
+    test_v541_sarfix 14/14, test_v540_hybrid 41/41, test_v539_rejection 24/24,
+    test_v533_adoptmanual 230/230, test_v532_pyramid 87/87,
+    test_v530_price_guard 44/44, test_v527_exit_comment 60/60,
+    test_v526_vector 83/83.
+  * Pre-existing failures reproduce BYTE-IDENTICALLY at HEAD 0d3af96 in a
+    detached worktree: test_v528_hotfix 57/68, test_v52x_pyramid 127/130,
+    test_v531_smart_trim 15/38, test_v532_hightable 125/135. No regression.
+  * The v5.47 probe is not vacuous: run against HEAD's pre-fix
+    COttoOrderManager.mqh it FAILS -- 0 matches for the DEAL-gated guard, 1
+    unconditional assignment, no else/RETURN branch.
+  * Version stamps: all 11 shipped sources plus the README base line read 5.47;
+    the bump tool reports no stale 5.46 literal outside the exempt 'FIX ('
+    annotations.
+  * git diff: COttoOrderManager.mqh +13 / -2 (a 12-line guard block replacing
+    the single unconditional assignment, plus its version row);
+    CHighTableAuditor.mqh +6 / -6 (three comment passages restated into the
+    FIX (vX) form, plus its stamp); the remaining 9 shipped sources carry
+    version rows only (otto.mq5 3, OttoDefines.mqh 7, each other .mqh 1);
+    README.md 1 row. No collateral reformatting, no whole-file rewrite.
+  * Line endings / encoding: all 16 files in this commit are pure CRLF with no
+    BOM and no lone CR. A byte-level audit caught and repaired two lines the
+    header-comment edit had written LF-only into an otherwise-CRLF file -- the
+    exact mixed-EOL drift that shows up as a stray "LF will be replaced by
+    CRLF" warning.
+  * NOT PROVEN HERE: broker acceptance. The gate proves compilation and the
+    probe proves structure; neither can exercise a live venue. Confirmation is
+    a real PlaceOrArmOrder() on a strict broker returning TRADE_RETCODE_DONE
+    where it previously returned TRADE_RETCODE_INVALID_FILL.

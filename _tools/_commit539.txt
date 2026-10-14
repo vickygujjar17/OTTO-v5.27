@@ -1,0 +1,55 @@
+feat: email armed virtual setups, enrich rejection logs, and strip legacy limit-order price bounds
+
+v5.37 turned the resting broker limit into an in-memory virtual-order engine and
+v5.38 finished the cleanup, but three edges were still half-wired. v5.39 closes
+them: an armed setup now emails its full snapshot, a rejected market order is
+terminal and reads in plain English, and the v5.28 price guard -- dead since
+v5.37 -- is deleted.
+
+ARM NOW EMAILS (COttoJournal.mqh)
+
+LogVirtualOrderArmed() is the only journal writer that did not send mail:
+LogEntry(), LogExit() and LogCancellation() all end in SendMailFromFile().
+The arm snapshot is the richest record the EA produces (setup id, trigger
+price, initial SL, volume, polarity, both wick times and the separation
+verdict), yet it could only be read off disk. It now calls SendMailFromFile()
+right after CloseHandle(), exactly like its three siblings, so the setup
+breakdown ships as a mail the moment the setup arms -- line[0] is the SUBJECT.
+
+REJECTION IS TERMINAL AND READABLE (COttoOrderManager.mqh)
+
+When SendOrderWithRetry() refuses the MARKET deal fired by CheckVirtualTriggers()
+the setup is spent: the deal was rejected, so there is nothing left to retry.
+The v5.37 path kept the one-shot latch SET and left the block armed, which
+re-armed a SECOND SVirtualOrder on every later tick while the first still sat in
+m_virtualOrders[] -- a virtual-order leak. v5.39 maps the raw retcode through
+GetTradeRetcodeString() (INVALID_PRICE / NO_MONEY / MARKET_CLOSED / INVALID_STOPS
+...), journals the cause via LogCancellation("Broker Rejected Market Order: <str>
+(Code: <n>)"), then vetoes the block (VETO_BROKEN) and calls RemoveVirtualOrderAt()
+so no later tick re-fires it. The old "FIX (v5.37) keep the latch set" note is gone.
+
+LEGACY PRICE GUARD DELETED (COttoOrderManager.mqh)
+
+The v5.28 LIVE PRICE VALIDATION pre-flight in ArmVirtualOrder() rejected an entry
+resting on the wrong side of the live market so the server would not answer it
+with TRADE_RETCODE_INVALID_PRICE. Since v5.37 nothing rests at the broker: the
+setup is an SVirtualOrder and the entry fires as a MARKET deal on the cross,
+priced off the live book, so an off-market resting price is structurally
+impossible and the guard (and its one-shot priceAbortLogged gate) is dead code.
+It is removed; the two comments that referenced it are reworded. The helper
+GetPriceBoundaryBuffer() is kept but marked RETIRED (no caller), and the inert
+SSniperBlock.priceAbortLogged field is retained so the block-layout is unchanged.
+
+PROBES
+
+The v5.28/v5.30 probes pinned the deleted guard; they now pin its ABSENCE
+(test_v528_hotfix.py section 5, test_v530_price_guard.py sections 2 and 3) while
+the snap mechanics, buffer-helper internals, retry re-quote, duplicate-shield
+units and version stamps stay live contracts. A new test_v539_rejection.py pins
+the arm email, the terminal rejection and the guard removal (22 checks). Suite is
+at its v5.38 baseline; test_v530_price_guard.py improves to 43/43.
+
+VERSION BUMP
+
+_tools/_bump539.py rewrites the eleven #property version headers, the OttoDefines
+banner/description, the four input-group release stamps and the README base line.

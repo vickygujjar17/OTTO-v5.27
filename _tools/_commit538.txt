@@ -1,0 +1,70 @@
+v5.38: retire broker-limit naming, virtual-book duplicate shield, one-journal-per-setup
+
+v5.37 replaced the broker resting limit with an in-memory virtual-order engine,
+but three edges of that refactor were left half-renamed or half-wired. v5.38 is
+the cleanup that finishes the job: the ARM path is named for what it does, the
+duplicate shield guards the book that actually exists, and a setup writes ONE
+journal instead of being scattered across several.
+
+RENAME: PlaceLimitOrder -> ArmVirtualOrder (COttoOrderManager.mqh)
+
+The ARM half kept the obsolete name PlaceLimitOrder() even though, since
+v5.37, it never sends a broker limit -- it appends an SVirtualOrder to
+m_virtualOrders[], latches block.hasPlacedOrder and returns. The name now
+matches the mechanism (ArmVirtualOrder). No behaviour changes with the rename;
+every caller and comment reference is updated, and the COttoBlockManager
+front-run projection note that pins the two entry anchors together follows suit.
+
+DUPLICATE SHIELD ON THE VIRTUAL BOOK (COttoOrderManager.mqh)
+
+IsOrderAlreadyLiveAtPrice() still walked OrdersTotal() looking for OUR Magic+
+symbol resting at (near) targetPrice. Since v5.37 nothing of ours rests at the
+broker, so that loop could never see our own armed setups -- the shield was a
+no-op against the ONE duplicate source that still exists. It now scans
+m_virtualOrders[] for an entry whose triggerPrice sits within
+tolerancePoints*unit of the target. The tick-aware unit (min(tick, point)) and
+its v5.30 rationale are preserved verbatim: the band must track the snapped
+grid or the snap can slide an entry outside it. The caller comment and the
+DUPLICATE SHIELD print are reworded for the virtual book.
+
+ONE JOURNAL PER SETUP (OttoDefines.mqh + COttoOrderManager.mqh + COttoJournal.mqh)
+
+SVirtualOrder gains a string sessionId. The per-setup journal session is minted
+ONCE, at ARM time, stored on the descriptor, and reused everywhere downstream:
+
+  * ArmVirtualOrder() mints #OTTO-<SYM>-<stamp>-BLK<n>, stores it on the
+    descriptor, and (new) creates the per-setup journal via
+    LogVirtualOrderArmed(), which replaces LogOrderPlaced(). The function is
+    renamed because there is no pending ticket to record: it now keys the
+    setup on the block tradeId (Setup ID) rather than a broker ticket.
+  * CheckVirtualTriggers() NO LONGER re-mints a session at fire time; it reads
+    vo.sessionId (with a defensive fallback mint only if the field is empty),
+    so the N/R comment, the fill record and the exit all resolve to the file
+    the arm created.
+  * CancelOrdersForInvalidBlocks() reuses the same vo.sessionId for BOTH the
+    conversion and the cancellation branch, so a re-phase or a cancel appends
+    into the setup's own journal instead of minting a fresh one.
+
+COttoJournal::LogEntry() now OPENS WITH OpenAppend() (seeking to EOF) with an
+OpenWrite() fallback when no file exists yet -- a manual adoption or a legacy
+session still gets a journal -- so the armed snapshot and the fill land in the
+SAME .txt file rather than the fill truncating the arm record.
+
+VALIDATION
+
+  * build_check.ps1 -Source <repo> - 0 errors / 0 warnings, all 11 headers
+    [STAGED] from the staging tree, otto.ex5 produced.
+  * scan_encoding.ps1 / verify_integrity.py - strict CRLF, no BOM, valid UTF-8,
+    bareLF=0 / bareCR=0 on all 11 sources.
+  * _probe/ static suite - no new failures against the captured v5.37 baseline;
+    only the anchors that named the renamed symbols were refreshed
+    (test_v527_exit_comment.py, test_v528_hotfix.py, test_v530_price_guard.py).
+
+Version bumped 5.37 -> 5.38 in all 11 sources (#property version), the
+OttoDefines master-build banner + #property description, the [9]/[10]/[11]/[12]
+engine-group labels, the otto.mq5 Pine port banner and startup Print, and the
+README base line. The historical '// v5.37 Part N' virtual-engine markers and
+the '// v5.3x:' notes are preserved untouched (they name code that shipped in
+v5.37). _tools/_bump538.py skips any line containing "FIX (" and anchors every
+other pattern on a human-facing prefix so no versioned comment can be
+rewritten.

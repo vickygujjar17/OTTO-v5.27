@@ -1,0 +1,82 @@
+5.43 fix: prevent journal session crosstalk and physical SAR race conditions
+
+v5.42 shipped a spotless compile while two runtime defects rode along, both
+invisible to the gate. One corrupts the per-setup journal at the session-ID
+level; the other lets a redundant physical fill damage a running basket. v5.43
+closes them.
+
+1. JOURNAL SESSION-ID CROSSTALK (COttoOrderManager.mqh)
+
+COttoJournal holds ONE m_sessionID, and it names the file every Log* writer
+appends to. The OrderManager repointed it with m_journal.SetSessionID(...) at
+every arm, fill, cancel and conversion, so whichever setup touched it LAST owned
+the journal -- not whichever basket was live. The concrete failure: while a
+basket ran under "#OTTO-EURUSD-...-BLK3", arming or cancelling a DIFFERENT
+setup left the journal on that setup's id, and the live basket's later exit
+record was appended to the WRONG file.
+
+m_sessionID is now the single source of truth for the LIVE basket, and every
+transient setup write preserves it:
+
+  * PlaceOrArmOrder() (physical ROUTE A and virtual ROUTE B) saves the live
+    basket's id, points the journal at the arm id only for LogSetupArmed(),
+    then restores the live id when a basket exists. When no basket is live --
+    the common arm-time case -- the arm id is left resident so the later fill
+    reuses it (the one-file-per-setup contract).
+
+  * CancelOrdersForInvalidBlocks() does the same save/restore around all four
+    of its terminal writes (physical conversion/cancel, virtual
+    conversion/cancel).
+
+  * InitBasket() no longer asks the SHARED journal pointer who it is. It reuses
+    m_sessionID verbatim when it is already resolved, mints a fresh id only when
+    it is empty (a legacy path with no arm-time session), and always mints its
+    own "-MAN" id for an ADOPTED basket. It then PUSHES the resolved id into the
+    journal, so the caller's follow-up writer (LogEntry / LogManualAdoption)
+    lands in THIS basket's file.
+
+  * The fill paths hand their setup's pre-minted session to the basket before
+    seeding: CheckVirtualTriggers() sets m_sessionID = newSessionId, and
+    CheckPendingOrderFills() sets m_sessionID = blocks[i].sessionId. Each
+    replaces the fragile reliance on whatever the journal happened to hold.
+
+  * CheckVirtualTriggers() no longer repoints the journal BEFORE the send -- the
+    setup's arm snapshot already created its file, and the live basket must keep
+    owning the journal until a fill is actually adopted. The deal comment still
+    carries the pre-minted id. The terminal rejection path now points the
+    journal at newSessionId just for LogCancellation(), so a broker-rejected
+    market order renames ITS OWN arm file to CANCELLED_.
+
+  * Both SAR close sites lock the journal to the incumbent (SetSessionID(
+    m_sessionID)) immediately before CloseEntireBasket(), so the closing
+    basket's exit record resolves to the incumbent's file.
+
+2. PHYSICAL SAR RACE (COttoOrderManager.mqh)
+
+CheckPendingOrderFills() carried the v5.41 direction guard, which correctly
+refused to REVERSE on a same-direction scale-in fill -- but then fell straight
+through to the adoption block and RE-SEEDED the live basket from the newcomer:
+the running trade's journal was repointed at the new fill's session and its 1R
+was overwritten with the newcomer's geometry.
+
+A redundant same-direction fill is now CLOSED (ClosePosition(newTicket)), its
+block released, and the loop advanced with continue -- leaving the incumbent
+basket's ticket, 1R and unified stop untouched. The EA has no fill-driven
+scale-in machinery, so discarding the extra leg is the behaviour that matches
+its design. The reversal branch is unchanged and still guarded by the v5.41
+direction clause.
+
+PROBES
+
+A new test_v543_session.py pins the contract statically: the save/restore shape
+at all six transient-write sites, the incumbent journal lock at both SAR closes,
+the redundant-fill close branch, the InitBasket reuse/else/-MAN structure with
+its journal push, both fill-path m_sessionID hand-offs, and the removal of the
+pre-send virtual repoint. test_v541_sarfix.py still asserts the v5.41 direction
+clause and semantic mirror and remains green.
+
+VERSION BUMP
+
+_tools/_bump543.py rewrites the eleven #property version headers, the OttoDefines
+banner/description, the four input-group release stamps and the README base line.
+Strict gate: 0 errors, 0 warnings.

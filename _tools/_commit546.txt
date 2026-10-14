@@ -1,0 +1,69 @@
+546: risk audit — loss-side isolation and adopted magic-0 legs
+
+AuditRiskExposure() in CHighTableAuditor.mqh is the EA's independent position
+risk audit: it reads the TERMINAL BOOK, never the order layer, so it measures
+the risk that ACTUALLY exists rather than the risk the sizer believes it wrote.
+Two blind spots in that measurement are closed here. Neither is visible to the
+compiler gate -- each is a property of a formula, not of a type.
+
+  1. LOSS-SIDE ONLY. The scan measured capital at risk with
+     `MathAbs(entry - sl)`. That is direction-agnostic: it returns a POSITIVE
+     distance whether the stop sits below entry (real loss) or above it (a stop
+     the unified trail has ratcheted to break-even / into profit). So from the
+     moment ApplyUnifiedSL ratcheted a stop to or past break-even, the auditor
+     went on reporting `distPts * tickValue * vol` as capital at risk and
+     dispatched "HighTable: position risk breach" against a leg that could no
+     longer lose money -- a false CRITICAL, latched, from the loudest channel
+     the EA owns. The distance is now the SIGNED loss-side distance
+     (`isLong ? entry - sl : sl - entry`) and a leg whose stop is at or beyond
+     break-even (`lossDist <= 0`) is skipped before any money is computed.
+
+  2. ADOPTED LEG VISIBILITY. Every book read in this class is magic-scoped
+     (`POSITION_MAGIC == m_magic`), which is correct for the desync test but
+     also hid the adopted magic-0 primary from the risk audit entirely: the one
+     leg the operator did NOT size was the one leg never checked. The filter now
+     admits exactly that ticket -- a magic mismatch still skips unless
+     `m_trackedAdopted` is set AND the ticket equals `m_trackedPrimary`. Keying
+     on the ticket rather than on magic 0 alone keeps the blast radius at one
+     position, so an unrelated manual or foreign-EA magic-0 leg still cannot be
+     counted.
+
+Unchanged on purpose: the 35% tolerance over RiskPercent, the money conversion,
+the worst-leg peak tracking, the WARN severity, the alert text, and the
+ClearLatch() re-arm on a clean cycle. This release narrows what COUNTS as risk;
+it does not retune the threshold.
+
+TOOLING
+
+_tools/build_check.ps1 defaulted `-Source` to a hardcoded absolute path
+("C:\Users\vivek\Downloads\OTTO-v5.00 v5.27") that no longer exists, so the
+documented bare invocation died in Copy-Item before reaching the compiler and
+silently stopped validating anything. The default is now self-locating
+($PSScriptRoot\..), and an explicit -Source still wins. Verified: the bare
+command now compiles the repo and passes the gate.
+
+
+VERIFICATION
+
+  * build_check.ps1 (BARE invocation, no -Source) : 0 errors / 0 warnings,
+    gate PASSED, 11/11 Otto modules linked from the staging tree. The .ex5 byte
+    count is NOT a fingerprint -- it varies run to run on identical builds.
+  * git diff: CHighTableAuditor.mqh +46 / -7 (the function body, plus its
+    header note); _tools/build_check.ps1 +12 / -1; README.md +5 / -1; the
+    remaining 10 files are the single-line version stamp each. No collateral
+    reformatting, no whole-file rewrite.
+  * Non-ASCII integrity: U+2014 (em-dash) byte counts compared HEAD blob vs
+    working tree for all 11 sources + README -- identical per file, 0
+    mismatches, proving the bump rewrote only the version rows.
+  * Line endings: 9233 CRLF / 0 LF-only across the 12 touched files.
+  * Probes: test_v546_risk_isolation 26/26, test_v545_throttle 28/28,
+    test_v543_session 29/29, test_v542_email 21/21, test_v541_sarfix 14/14,
+    test_v540_hybrid 41/41, test_v539_rejection 24/24,
+    test_v533_adoptmanual 230/230, test_v532_pyramid 87/87,
+    test_v530_price_guard 44/44, test_v527_exit_comment 60/60,
+    test_v526_vector 83/83. test_v532_hightable remains 125/135 with the 10
+    failures byte-identical to the pre-existing baseline (all trim / dead-code,
+    none risk- or version-related).
+  * The version-stamp checks in test_v546 read all 11 stamps and require the
+    set to be exactly {5.46}, so a partial bump fails the probe as well as the
+    bump tool.
