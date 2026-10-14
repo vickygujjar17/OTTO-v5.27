@@ -1,0 +1,75 @@
+556: chore -- cleanup and bump version to 5.56
+
+Release stamp for the post-purge tree. The workspace cleanup this release is
+named after had already landed one commit earlier, so this commit carries the
+version rows only -- plus this changelog.
+
+PURGE -- ALREADY COMPLETE (commit d1989c9, stamped 555)
+
+  Nothing was deleted here. Step 1 of the release was executed and pushed as
+  555, which removed 47 tracked files (240,535 bytes):
+
+    * _tools/_bump524.py .. _bump543.py (20) -- one-shot bump scripts
+    * _tools/_commit532.txt .. _commit548b.txt (17) -- pre-pivot changelogs
+    * _commit527/528/529/531/532/533.txt (6) -- stale root copies
+    * dump_hive.ps1, flip_hivemind.ps1, scan_zone.ps1,
+      patch_v500_remove_objectname.py (4) -- scratch diagnostics
+
+  Re-audited before this bump: root _commit* = 0, tracked _bumpNNN.py = 0,
+  scratch scripts absent, no .bak/.tmp/.log anywhere, working tree clean. The
+  only untracked residue is _tools/__pycache__/, gitignored build output.
+
+RETAINED
+
+  * _tools/scan_encoding.ps1 -- KEPT as active QA infrastructure. Its line 1
+    dead-path repair from 555 (hardcoded ...\OTTO-v5.00 v5.27 -> $PSScriptRoot
+    \..) stands. Deletion was considered and rejected: the BOM / line-ending
+    guard is part of the release checklist.
+  * build_check.ps1, normalize_eol.py, verify_integrity.py,
+    check_deploy_drift.py, repair_mojibake.py, _pivot552/553.py,
+    _commit552/553/553b/554/555.txt, all 11 sources, all 32 _probe/ files.
+
+VERSION BUMP (20 rows, 12 files)
+
+  python _tools/_bump_version.py -> 5.55 -> 5.56, exactly 20 changed lines:
+
+    #property version "5.55" -> "5.56"     all 11 sources (otto.mq5 + 10 .mqh)
+    Pine Script Master Build Port (vX)     otto.mq5 file banner
+    OTTO EA vX (startup Print)             otto.mq5 OnInit banner
+    OTTO EA vX (definition banner)         OttoDefines.mqh header
+    #property description "OTTO vX ..."    the EA description
+    [9]/[10]/[11]/[12] ... - vX            four versioned input-group labels
+    **Current base: vX**                   README.md
+
+  Historical annotations naming the release a feature LANDED in -- the many
+  '// v5.5x:' notes, the 'FIX (vX)' markers and the 'RETIRED (v5.52)' input
+  comments -- are untouched by construction: every bump pattern is anchored on
+  a human-facing prefix, and any line containing 'FIX (' is skipped outright.
+
+VERIFICATION
+
+  * Bump census: "no v5.55 literal remains in the shipped sources or docs". A
+    grep of *.mq5/*.mqh/README.md for 5.55 returns nothing; the only surviving
+    5.55 strings sit inside _tools/_commit555.txt, the record of the previous
+    release.
+  * Diff proof: git diff --numstat = 20 insertions / 20 deletions across the 12
+    files. Every moved line is a release stamp or a versioned banner -- no
+    logic line, no prose comment.
+  * Build gate: build_check.ps1 (BARE invocation) -- 0 errors / 0 warnings,
+    GATE PASSED, all 11 OTTO modules verified [STAGED] from the temp build
+    tree, otto.ex5 = 245376 bytes. The terminal is never written to (/inc).
+  * Encoding: scan_encoding.ps1 -> 11 files, bom=none, validUTF8=True,
+    bareLF=0. Non-ASCII byte counts unchanged versus 555 (OttoDefines 3973,
+    COttoOrderManager 198, COttoCorrelationFilter 78, ...).
+  * Line endings: normalize_eol.py . --check -> files=11 rewritten=0, bareLF=0
+    bareCR=0. All 11 sources remain strict CRLF.
+  * Note on verify_integrity.py: it reports DIFFERS on all 11 files when run
+    pre-commit, because it byte-compares the worktree against the committed
+    HEAD blob (still 5.55). That is the expected reading for an uncommitted
+    release stamp, not a corruption signal.
+
+NOT PROVEN HERE: behaviour. Not one logic line changes -- the only diff is a
+release string per stamp site. The functional gate remains a Strategy Tester
+run of otto.ex5 on this branch versus the v5.55 build.
+
+ROLLBACK: git checkout d1989c9 -- <path>.
