@@ -67,6 +67,7 @@ MAIN = os.path.join(ROOT, "otto.mq5")
 OM = os.path.join(ROOT, "COttoOrderManager.mqh")
 BM = os.path.join(ROOT, "COttoBlockManager.mqh")
 DEFS = os.path.join(ROOT, "OttoDefines.mqh")
+JRN = os.path.join(ROOT, "COttoJournal.mqh")
 
 ALL_FILES = ["otto.mq5", "COttoOrderManager.mqh", "COttoTradeManager.mqh",
              "COttoRiskManager.mqh", "COttoBlockManager.mqh", "COttoJournal.mqh",
@@ -172,6 +173,7 @@ def check(name, cond, detail=""):
 
 OM_RAW = read(OM)
 BM_RAW = read(BM)
+JRN_RAW = read(JRN)
 MAIN_T = read(MAIN)
 DEFS_T = read(DEFS)
 OM_C = strip_comments(OM_RAW)
@@ -507,6 +509,64 @@ check("the source states WHY the shift had to reach the OrderManager",
       "GetATRAtShift(1) -- the LAST CLOSED bar" in BM_RAW)
 check("the startup banner names the current release",
       ("OTTO EA v%s" % CURRENT) in MAIN_T)
+
+
+# ----------------------------------------------------------------------
+# 10. v5.58: journal + wick geometry synced to the anticipation model
+# ----------------------------------------------------------------------
+# The anticipation model moved the entry beyond the far edge, but the
+# journal still described the v5.53 "Aggressive ... at ... Edge" geometry and
+# the block's Wick1/Wick2 H/L fields were never written (ZeroMemory() left
+# them 0.0), so the printed " H=0.00000 L=0.00000" was structural, not a
+# missing log. These are runtime/printed relationships the compiler cannot
+# see: nothing reads the wick fields, so a regression here is silent.
+print("\n-- 10. Journal & wick geometry sync --")
+
+check("the journal names the front-run geometry, not the retired wording",
+      "Front-Run Breakdown / Sell at Bottom Edge - 0.5*ATR | SL at Top Edge" in JRN_RAW and
+      "Front-Run Breakout / Buy at Top Edge + 0.5*ATR | SL at Bottom Edge" in JRN_RAW)
+check("the retired 'Aggressive' block wording is gone",
+      "Aggressive" not in JRN_RAW)
+
+# Both journal blocks (LogSetupArmed and LogEntry) must print the FULL zone
+# marks -- Mid and Height were never shown, so an operator could not see the
+# rrUnit derivation (slDist = blockHeight + 0.5*ATR) from the log alone.
+check("both journal blocks print the full zone marks (Mid + Height)",
+      JRN_RAW.count('" | Mid=" + FmtPrice(blk.midpoint) + " | Height=" + FmtPrice(blk.blockHeight)') == 2)
+check("the armed header prints 1R and the projected target",
+      'FmtPrice(blk.rrUnit)' in JRN_RAW and
+      "Projected Target  : " in JRN_RAW and "FmtPrice(blk.localTP)" in JRN_RAW)
+check("the entry record prints the target alongside 1R",
+      '" | 1R = " + FmtPrice(blk.rrUnit) + " | Target = " + FmtPrice(blk.localTP)' in JRN_RAW)
+
+# The Wick H/L lines are now conditional, mirroring the entry block: a block
+# whose wick times are unpopulated prints no bogus zero row.
+check("both wick H/L blocks are guarded on populated wick times",
+      JRN_RAW.count("if(blk.wick1Time > 0 && blk.wick2Time > 0)") == 2)
+
+# All FOUR block-creation passes (live + warm-up, resistance + support) must
+# populate the full W1/W2 candle, or the journal shows zeros for the half of
+# the blocks built by the other pass.
+check("all four block-creation passes populate the full W1/W2 candle",
+      len(re.findall(r"nb\.wick1\.highPrice\s*=", BM_C)) == 4 and
+      len(re.findall(r"nb\.wick1\.lowPrice\s*=", BM_C)) == 4 and
+      len(re.findall(r"nb\.wick2\.highPrice\s*=", BM_C)) == 4 and
+      len(re.findall(r"nb\.wick2\.lowPrice\s*=", BM_C)) == 4,
+      "H=%d/%d L=%d/%d" % (len(re.findall(r"nb\.wick1\.highPrice\s*=", BM_C)),
+                           len(re.findall(r"nb\.wick2\.highPrice\s*=", BM_C)),
+                           len(re.findall(r"nb\.wick1\.lowPrice\s*=", BM_C)),
+                           len(re.findall(r"nb\.wick2\.lowPrice\s*=", BM_C))))
+
+# The virtual-fire commit re-derives localTP on the SAME far-edge anchor as
+# PlaceOrArmOrder; the retired form anchored it on the anticipation trigger, a
+# further 0.5*ATR out, which would let the veto judge a different price after
+# a virtual fire than it did while the order was armed.
+check("CheckVirtualTriggers re-derives localTP on the far edge (twin of PlaceOrArmOrder)",
+      "block.localTP = isLong ? farEdge + tpRR * slDist : farEdge - tpRR * slDist;" in VIRT_W and
+      "double farEdge = isLong ? MathMax(block.top, block.bottom) : MathMin(block.top, block.bottom);" in VIRT_W)
+check("the retired trigger-anchored projection is gone from the OrderManager",
+      "vo.triggerPrice + slDist" not in (OM_C or "") and
+      "vo.triggerPrice - slDist" not in (OM_C or ""))
 
 
 # ----------------------------------------------------------------------

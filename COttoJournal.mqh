@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.57"
+#property version   "5.58"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -177,18 +177,22 @@ public:
       W("  Setup ID          : " + tradeId);
       W("  Logic             : " + phase);
       W("  Execution Mode    : " + execMode);
-      W("  Trigger Price     : " + FmtPrice(entryPrice));
-      W("  Initial SL        : " + FmtPrice(slPrice));
+      W("  Trigger Price     : " + FmtPrice(entryPrice) + " (Front-Run: far edge +/- 0.5*ATR)");
+      W("  Initial SL        : " + FmtPrice(slPrice) + " | 1R = " + FmtPrice(blk.rrUnit));
       W("  Volume            : " + DoubleToString(lotSize,2));
       string actionDesc = "";
       if(btype == BLOCK_SUPPORT)
-         actionDesc = "SUPPORT (Aggressive Breakdown / Sell at Bottom Edge)";
+         actionDesc = "SUPPORT (Front-Run Breakdown / Sell at Bottom Edge - 0.5*ATR | SL at Top Edge)";
       else
-         actionDesc = "RESISTANCE (Aggressive Breakout / Buy at Top Edge)";
+         actionDesc = "RESISTANCE (Front-Run Breakout / Buy at Top Edge + 0.5*ATR | SL at Bottom Edge)";
       W("  Trade             : " + actionDesc);
-      W("  Block Top/Bottom  : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom));
-      W("  Wick 1 (Anchor)   : " + TimeToString(blk.wick1Time) + " H=" + FmtPrice(blk.wick1.highPrice) + " L=" + FmtPrice(blk.wick1.lowPrice));
-      W("  Wick 2 (Retest)   : " + TimeToString(blk.wick2Time) + " H=" + FmtPrice(blk.wick2.highPrice) + " L=" + FmtPrice(blk.wick2.lowPrice));
+      W("  Block Top/Bottom  : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom) + " | Mid=" + FmtPrice(blk.midpoint) + " | Height=" + FmtPrice(blk.blockHeight));
+      W("  Projected Target  : " + FmtPrice(blk.localTP) + " (Front-Run veto anchor, far edge +/- 1R)");
+      if(blk.wick1Time > 0 && blk.wick2Time > 0)
+        {
+         W("  Wick 1 (Anchor)   : " + TimeToString(blk.wick1Time) + " H=" + FmtPrice(blk.wick1.highPrice) + " L=" + FmtPrice(blk.wick1.lowPrice));
+         W("  Wick 2 (Retest)   : " + TimeToString(blk.wick2Time) + " H=" + FmtPrice(blk.wick2.highPrice) + " L=" + FmtPrice(blk.wick2.lowPrice));
+        }
       W("  Separation        : " + (blk.vetoReason==VETO_NO_SEPARATION?"FAILED":"PASSED"));
       W("================================================================");
       CloseHandle();
@@ -214,16 +218,16 @@ public:
       W("================================================================");
       W("[TRADE ENTRY] Session " + m_sessionID + " | " + m_symbol + " (" + (dir==DIR_LONG?"BUY / LONG":"SELL / SHORT") + ") | " + TimeToString(TimeCurrent()));
       W("  Execution Price   : " + FmtPrice(entryPrice));
-      W("  Initial Stop Loss : " + FmtPrice(slPrice) + " | 1R = " + FmtPrice(blk.rrUnit));
+      W("  Initial Stop Loss : " + FmtPrice(slPrice) + " | 1R = " + FmtPrice(blk.rrUnit) + " | Target = " + FmtPrice(blk.localTP));
       W("  Volume & Sizing   : " + DoubleToString(lotSize,2) + " Lots | Risk: $" + DoubleToString(riskMoney,2));
       W("  S/R Block:");
       string actionDesc = "";
       if(blk.type == BLOCK_SUPPORT)
-         actionDesc = "SUPPORT (Aggressive Breakdown / Sell at Bottom Edge)";
+         actionDesc = "SUPPORT (Front-Run Breakdown / Sell at Bottom Edge - 0.5*ATR | SL at Top Edge)";
       else
-         actionDesc = "RESISTANCE (Aggressive Breakout / Buy at Top Edge)";
+         actionDesc = "RESISTANCE (Front-Run Breakout / Buy at Top Edge + 0.5*ATR | SL at Bottom Edge)";
       W("    - Logic     : " + actionDesc);
-      W("    - Zone      : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom));
+      W("    - Zone      : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom) + " | Mid=" + FmtPrice(blk.midpoint) + " | Height=" + FmtPrice(blk.blockHeight));
       if(blk.wick1Time > 0 && blk.wick2Time > 0)
         {
          W("    - Wick1     : " + TimeToString(blk.wick1Time) + " H=" + FmtPrice(blk.wick1.highPrice) + " L=" + FmtPrice(blk.wick1.lowPrice));

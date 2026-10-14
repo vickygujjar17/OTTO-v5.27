@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.57"
+#property version   "5.58"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -71,7 +71,7 @@ private:
    //+------------------------------------------------------------------+
    //| Returns ATR at the given shift (0 = forming bar).                |
    //|                                                                  |
-   //| PUBLIC as of v5.57: COttoOrderManager pins its own entry / SL /   |
+   //| PUBLIC as of FIX (v5.57): COttoOrderManager pins its own entry /  |
    //| TP geometry to GetATRAtShift(1) -- the LAST CLOSED bar -- so the  |
    //| order and the Front-Run veto project off the SAME ATR. The cached |
    //| GetATR() can still lag shift 1 while the forming bar moves, and a |
@@ -150,7 +150,7 @@ private:
    // the whole entry/SL cluster is simply translated by 0.5*ATR in the
    // breakout direction, never a wider stop.
    //
-   // v5.57 -- the RR PROJECTION did NOT follow the entry out to the
+   // FIX (v5.57) -- the RR PROJECTION did NOT follow the entry out to the
    // anticipation offset. The Front-Run veto still projects its target from
    // the FAR edge, not from the entry: a LONG target = b.top + tpRR*slDist, a
    // SHORT target = b.bottom - tpRR*slDist. Anchoring the projection to the
@@ -330,6 +330,18 @@ private:
                   nb.atrSnapshot  = GetATRAtShift(pivotShift);
                   nb.wick1Time    = m_w1ResTime;
                   nb.wick2Time    = iTime(m_symbol, PERIOD_CURRENT, pivotShift);
+                  // v5.58 — W1/W2 FULL candle geometry, for the journal's
+                  // Wick H/L lines only (no trading path reads these fields).
+                  // W1: the stored m_w1ResTop IS the W1 candle high (it is the
+                  // iHigh() captured when this W1 was created), but m_w1ResBot
+                  // is the W1 BODY top -- not a low -- so the low is read from
+                  // the series. W2 is the pivot bar: curTop is its iHigh().
+                  nb.wick1.time       = m_w1ResTime;
+                  nb.wick1.highPrice  = m_w1ResTop;
+                  nb.wick1.lowPrice   = iLow(m_symbol, PERIOD_CURRENT, w1Shift);
+                  nb.wick2.time       = iTime(m_symbol, PERIOD_CURRENT, pivotShift);
+                  nb.wick2.highPrice  = curTop;
+                  nb.wick2.lowPrice   = iLow(m_symbol, PERIOD_CURRENT, pivotShift);
                   nb.wick1Day     = m_w1ResDay;
                   nb.creationTime = TimeCurrent();
                   nb.creationBarSerial = (int)Bars(m_symbol, PERIOD_CURRENT);
@@ -415,6 +427,16 @@ private:
                   nb.atrSnapshot  = GetATRAtShift(pivotShift);
                   nb.wick1Time    = m_w1SupTime;
                   nb.wick2Time    = iTime(m_symbol, PERIOD_CURRENT, pivotShift);
+                  // v5.58 — support mirror of the W1/W2 geometry above. W1:
+                  // m_w1SupBot IS the W1 candle low, while m_w1SupTop is the W1
+                  // BODY bottom -- so the high comes from the series. W2 is the
+                  // pivot bar: curBot is its iLow().
+                  nb.wick1.time       = m_w1SupTime;
+                  nb.wick1.highPrice  = iHigh(m_symbol, PERIOD_CURRENT, w1Shift);
+                  nb.wick1.lowPrice   = m_w1SupBot;
+                  nb.wick2.time       = iTime(m_symbol, PERIOD_CURRENT, pivotShift);
+                  nb.wick2.highPrice  = iHigh(m_symbol, PERIOD_CURRENT, pivotShift);
+                  nb.wick2.lowPrice   = curBot;
                   nb.wick1Day     = m_w1SupDay;
                   nb.creationTime = TimeCurrent();
                   nb.creationBarSerial = (int)Bars(m_symbol, PERIOD_CURRENT);
@@ -539,7 +561,7 @@ private:
             // would sit on the wrong side of price.
             bool   isLong = (BlockDirection(b) == DIR_LONG);
             // v5.34 Part 2 once re-anchored this projection to the Phase 2
-            // outer-boundary entry; v5.52 dropped Phase 2 and v5.57 pins the
+            // outer-boundary entry; v5.52 dropped Phase 2 and FIX (v5.57) pins the
             // FAR-EDGE anchor. The target is measured from the edge the
             // breakout crosses (b.top LONG / b.bottom SHORT), NOT from the
             // anticipation entry BlockEntryPrice() returns: that entry sits a
@@ -735,7 +757,7 @@ private:
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
             // Intra-bar twin of the ProcessBlocks() projection above — same
             // unconditional mapped direction AND the same FAR-EDGE anchor.
-            // v5.57 measures the target from the edge the breakout crosses, not
+            // FIX (v5.57) measures the target from the edge the breakout crosses, not
             // from the 0.5*ATR anticipation entry, so both passes judge one
             // price; see the detailed derivation in ProcessBlocks().
             // REALIZED RR (front-edge entry): the entry sits 0.5*ATR beyond
@@ -910,6 +932,16 @@ public:
                      nb.atrSnapshot  = GetATRDirect(s);
                      nb.wick1Time    = m_w1ResTime;
                      nb.wick2Time    = curTime;
+                     // v5.58 — W1/W2 FULL candle geometry (warm-up twin of the
+                     // live pass in TryCreateNewBlocks). The historical scan has
+                     // a shift `s` for W2 rather than pivotShift; getATRDirect()
+                     // is the warm-up reader, iHigh()/iLow() are shift-agnostic.
+                     nb.wick1.time       = m_w1ResTime;
+                     nb.wick1.highPrice  = m_w1ResTop;
+                     nb.wick1.lowPrice   = iLow(m_symbol, PERIOD_CURRENT, w1Shift);
+                     nb.wick2.time       = curTime;
+                     nb.wick2.highPrice  = curTop;
+                     nb.wick2.lowPrice   = iLow(m_symbol, PERIOD_CURRENT, s);
                      nb.wick1Day     = m_w1ResDay;
                      nb.creationTime = curTime;
                      nb.creationBarSerial = (int)Bars(m_symbol, PERIOD_CURRENT);
@@ -988,6 +1020,13 @@ public:
                      nb.atrSnapshot  = GetATRDirect(s);
                      nb.wick1Time    = m_w1SupTime;
                      nb.wick2Time    = curTime;
+                     // v5.58 — support mirror of the warm-up W1/W2 geometry.
+                     nb.wick1.time       = m_w1SupTime;
+                     nb.wick1.highPrice  = iHigh(m_symbol, PERIOD_CURRENT, w1Shift);
+                     nb.wick1.lowPrice   = m_w1SupBot;
+                     nb.wick2.time       = curTime;
+                     nb.wick2.highPrice  = iHigh(m_symbol, PERIOD_CURRENT, s);
+                     nb.wick2.lowPrice   = curBot;
                      nb.wick1Day     = m_w1SupDay;
                      nb.creationTime = curTime;
                      nb.creationBarSerial = (int)Bars(m_symbol, PERIOD_CURRENT);

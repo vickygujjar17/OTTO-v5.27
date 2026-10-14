@@ -1,0 +1,84 @@
+559: feat — populate wick H/L, sync journal to front-run geometry, harden localTP
+
+The front-run anticipation entry (v5.57) moved the entry 0.5*ATR beyond the
+edge the breakout crosses. Three leftovers still described or depended on the
+old geometry: the block's Wick1/Wick2 candle fields were never written, the
+journal still printed the retired v5.53 "Aggressive ... at ... Edge" wording,
+and the virtual-fire commit re-derived localTP off the anticipation TRIGGER
+rather than the far edge. All three are now consistent with the shipped model.
+
+WICK H/L POPULATED (COttoBlockManager.mqh, 4 sites)
+
+  SSniperBlock carries SFractalPeak wick1/wick2, but only wick1Time/wick2Time
+  were ever assigned -- ZeroMemory() left every price 0.0, so the journal's
+  " H=0.00000 L=0.00000" was structural, not a missing log. All four creation
+  passes (TryCreateNewBlocks + WarmUpHistory, resistance + support) now fill
+  the full candle. The stored anchors are NOT full ranges: m_w1ResTop is the W1
+  iHigh() but m_w1ResBot is the W1 BODY top, and m_w1SupBot is the W1 iLow()
+  while m_w1SupTop is the BODY bottom -- so the missing extreme is read from
+  the series rather than reused. W2 is the pivot bar (curTop/curBot). Fields
+  are display-only: no trading path reads them.
+
+localTP HARDENED (COttoOrderManager.mqh, CheckVirtualTriggers)
+
+  The virtual-fire commit recomputed localTP as triggerPrice +/- slDist, while
+  PlaceOrArmOrder() anchors the target on the FAR edge (farEdge +/- tpRR *
+  slDist). Both feed the Front-Run veto, which compares the market against
+  block.localTP once an order rests, so the virtual form could let the veto
+  judge a price 0.5*ATR away from the one the order was built with. The commit
+  now re-derives with the identical far-edge arithmetic. Numerically identical
+  at every reachable arm path (localTP already holds that value), so this is a
+  consistency guarantee, not a behaviour change -- verified line by line.
+
+JOURNAL SYNC (COttoJournal.mqh, LogSetupArmed + LogEntry)
+
+  * Setup wording -> "Front-Run Breakdown / Sell at Bottom Edge - 0.5*ATR |
+    SL at Top Edge" and the resistance mirror; the retired "Aggressive" text
+    is gone from the file.
+  * Both blocks now print the full zone marks (Top / Bottom / Mid / Height) so
+    the rrUnit derivation (slDist = blockHeight + 0.5*ATR) is legible from the
+    log alone.
+  * LogSetupArmed prints 1R and the projected target; LogEntry prints Target
+    alongside 1R.
+  * Both Wick H/L rows are wrapped in if(wick1Time > 0 && wick2Time > 0), so a
+    block with unpopulated wicks prints no bogus zero row (mirrors LogEntry's
+    pre-existing guard).
+
+NEW PROBE SECTION (_probe/test_v557_frontrun.py, section 10, 8 checks)
+
+  Pins the front-run journal wording, the absence of the retired wording, the
+  doubled zone-mark idiom, the 1R/target rows, both wick guards, 4x population
+  of all four wick price fields, and the far-edge localTP twin in
+  CheckVirtualTriggers plus the retirement of the trigger-anchored form.
+
+VERSION 5.57 -> 5.58 (_tools/_bump_version.py 5.58)
+
+  20 human-facing rows rewritten. The tool then aborted on 16 surviving
+  historical v5.57 annotations, which is its documented post-bump guard. Those
+  are now stated with the repo's sanctioned historical marker -- "FIX (v5.57)"
+  -- which the census exempts by design (precedent: "FIX (v5.26): ..." in
+  OttoDefines.mqh). Box-banner lines were rebuilt to the byte, so all borders
+  keep their original column. Census after: 0 stale v5.57 literals.
+
+VERIFICATION
+
+  * Build gate: build_check.ps1 -- 0 errors / 0 warnings, GATE PASSED, headers
+    verified from the staging tree.
+  * test_v557_frontrun.py: 93 / 93 (was 84 / 84).
+  * Probe census: 22 GREEN / 5 RED across 27 probes. The five reds are
+    pre-existing and byte-identical to the 9bb3f8f baseline -- proven by
+    running each against a clean worktree of HEAD: test_v528_hotfix 57/68,
+    test_v52x_pyramid 127/130, test_v531_smart_trim 15/38, test_v532_hightable
+    125/135, test_v543_session 27/29. Each asserts machinery retired in v5.52
+    (WalkTrimLegs/TrimHeavyLosers smart trim, AuditTrimHealth, the NY-DST
+    reset) and none touches the edited paths.
+  * Encoding: scan_encoding.ps1 -> 11 files, bom=none, validUTF8=True,
+    bareLF=0. normalize_eol.py . --check -> rewritten 0.
+
+NOT PROVEN HERE: behaviour -- no Strategy Tester run. The wick values are
+asserted as populated fields and the localTP change as arithmetic identity,
+not observed on a filled trade.
+
+ROLLBACK: git checkout 9bb3f8f -- COttoBlockManager.mqh COttoOrderManager.mqh
+          COttoJournal.mqh OttoDefines.mqh COtto*.mqh CHighTableAuditor.mqh
+          otto.mq5 README.md _probe/test_v557_frontrun.py

@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.57"
+#property version   "5.58"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -667,7 +667,7 @@ private:
    //| entry<->SL stays exactly slDist and the risk distance is        |
    //| unchanged by the anticipation entry -- the entry/SL cluster     |
    //| simply translates by 0.5*ATR in the breakout direction.         |
-   //| v5.57: the TP PROJECTION does NOT follow the entry out; it is   |
+   //| FIX (v5.57): the TP PROJECTION does NOT follow the entry; it is |
    //| anchored on the FAR edge (see PlaceOrArmOrder) so the Front-Run |
    //| veto keeps the strictness of every pre-anticipation build. Twin |
    //| of COttoBlockManager::BlockEntryPrice(); they must stay         |
@@ -707,7 +707,7 @@ private:
    //| CheckPendingOrderFills(); a virtual arm fires its MARKET leg in  |
    //| CheckVirtualTriggers() on the cross.                             |
    //+------------------------------------------------------------------+
-   // v5.57 FRONT-RUNNING ANTICIPATION: with InpEntryStyle = ENTRY_FRONT_EDGE
+   // FIX (v5.57) FRONT-RUNNING ANTICIPATION: with InpEntryStyle = ENTRY_FRONT_EDGE
    // the entry sits 0.5*ATR beyond the FAR edge the breakout crosses (a
    // buy-stop above resistance / a sell-stop below support), so the VIRTUAL
    // arm is the ordinary path and a physical rest is the rare stale-price
@@ -756,7 +756,7 @@ private:
       if(!SentimentPasses(block)) return false;
 
       // --- Pine price computation ---
-      // v5.57 — ATR SHIFT SYNC. Geometry is pinned to shift 1 (the last CLOSED
+      // FIX (v5.57) — ATR SHIFT SYNC. Geometry is pinned to shift 1 (the last CLOSED
       // bar) to match COttoBlockManager's front-run veto, which prices its
       // projection from GetATRAtShift(1). The cached GetATR() refreshes from
       // shift 0 (the forming bar), so on a live bar the two managers would
@@ -779,7 +779,7 @@ private:
       // no Phase 2 to shift, so the entry is the single mapped edge from
       // CalcEntryPrice() and InpShiftReversalEntry is a declared no-op.
       // slDist stays hoisted here: SL/TP below are entry-relative and reuse it.
-      // v5.57 — hand CalcSLDistance() the SAME shift-1 ATR the block-side
+      // FIX (v5.57) — hand CalcSLDistance() the SAME shift-1 ATR the block-side
       // projection (blockHeight + 0.5*atrNow) uses, so the entry, the stop,
       // the target and the veto all resolve one risk distance.
       double slDist     = CalcSLDistance(block, atr);
@@ -804,7 +804,7 @@ private:
       // (below) rather than re-deriving the target, so a divergence between
       // this line and the veto's projection would silently disable the veto.
       double tpRR       = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-      // v5.57 — FAR-EDGE ANCHOR. The target is measured from the edge the
+      // FIX (v5.57) — FAR-EDGE ANCHOR. The target is measured from the edge the
       // breakout crosses (block.top LONG / block.bottom SHORT), NOT from the
       // anticipation `entryPrice`, which sits 0.5*ATR beyond that edge.
       // Projecting from the entry pushed the target a further 0.5*ATR out --
@@ -871,7 +871,7 @@ private:
       // zone the resting form is illegal, so we ARM an in-memory virtual order
       // and let CheckVirtualTriggers() fire it as a MARKET deal on the cross.
       //
-      // FRONT-RUNNING ANTICIPATION NOTE (v5.57). With InpEntryStyle =
+      // FRONT-RUNNING ANTICIPATION NOTE. FIX (v5.57). With InpEntryStyle =
       // ENTRY_FRONT_EDGE the entry sits 0.5*ATR beyond the FAR edge -- a
       // Resistance LONG at b.bottom+slDist (= b.top+0.5*ATR), a Support SHORT
       // at b.top-slDist (= b.bottom-0.5*ATR) -- so the trigger is STOP-style
@@ -1479,7 +1479,7 @@ private:
       if(targetBlock.localSL <= 0)
         {
          // fall back to the Pine formula if not yet computed
-         // v5.57 — shift-1 ATR, matching the entry build and the block veto.
+         // FIX (v5.57) — shift-1 ATR, matching the entry build and the block veto.
          double atr = m_blockManager.GetATRAtShift(1);
          if(atr <= 0) atr = m_blockManager.GetATR();
          if(atr > 0)
@@ -2640,11 +2640,11 @@ public:
    //| memory engine whose ARM half is PlaceOrArmOrder().               |
    //|                                                                  |
    //| The cross test mirrors Pine's own strategy fill logic and is     |
-   //| INVERTED for the front-running anticipation entry (v5.57): the   |
+   //| INVERTED for the front-running anticipation entry FIX (v5.57):   |
    //| trigger now sits BEYOND the far edge, so a LONG fires once the   |
    //| market has traded UP to/through its trigger and a SHORT once it  |
    //| has traded DOWN to/through it - a gap past the level still       |
-   //| triggers. (Under the pre-v5.57 far-edge entry the level sat on   |
+   //| triggers. FIX (v5.57): under the far-edge entry the level sat on |
    //| the limit side of price and the test ran the other way.)         |
    //+------------------------------------------------------------------+
    void              CheckVirtualTriggers(void)
@@ -2689,7 +2689,7 @@ public:
          ENUM_TRADE_DIRECTION seedDir = isLong ? DIR_LONG : DIR_SHORT;
 
          // THE CROSS TEST. A MARKET condition, not a resting price. Inverted
-         // v5.57 for the front-running anticipation entry: the trigger sits
+         // FIX (v5.57) for the front-running anticipation entry: the trigger sits
          // BEYOND the far edge, so a LONG fires once the market has traded UP
          // to (or through) the level, a SHORT once it has traded DOWN to it -
          // a gap past it still fires.
@@ -2841,15 +2841,29 @@ public:
          // rrUnit is recomputed from the block's OWN geometry (not the broker-
          // adjusted stop) so SeedActiveTradeFromBlock() rebuilds exactly the
          // basket 1R math a resting physical limit fill would have produced.
-         // v5.57 — shift-1 ATR so the recovered rrUnit matches the entry build.
+         // FIX (v5.57) — shift-1 ATR so the recovered rrUnit matches the entry build.
          double atr    = m_blockManager.GetATRAtShift(1);
          if(atr <= 0) atr = m_blockManager.GetATR();
          double slDist = (atr > 0) ? CalcSLDistance(block, atr)
                                    : MathAbs(vo.triggerPrice - vo.stopLoss);
+         // v5.58 — FAR-EDGE ANCHOR, twin of PlaceOrArmOrder() above. localTP
+         // MUST stay the one price the Front-Run veto reads (the veto compares
+         // the market against block.localTP once the order rests), so the
+         // recovered projection is re-derived with the identical arithmetic
+         // rather than from the trigger: target = farEdge +/- tpRR * slDist.
+         // The retired form (vo.triggerPrice +/- slDist) anchored on the
+         // anticipation ENTRY -- a further 0.5*ATR out -- which is exactly the
+         // stretch PlaceOrArmOrder was re-anchored to undo; leaving it here
+         // would let the veto judge a different price after a virtual fire.
+         // At the reachable arm paths localTP already holds this exact value,
+         // so this is a consistency guarantee, not a behaviour change.
+         double tpRR    = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
+         double farEdge = isLong ? MathMax(block.top, block.bottom)
+                                 : MathMin(block.top, block.bottom);
          block.localEntry = vo.triggerPrice;
          block.localSL    = vo.stopLoss;
-         block.localTP    = isLong ? vo.triggerPrice + slDist
-                                   : vo.triggerPrice - slDist;
+         block.localTP    = isLong ? farEdge + tpRR * slDist
+                                   : farEdge - tpRR * slDist;
          block.rrUnit     = slDist;
 
          // RETIRE the block: its ONE continuation entry has filled (this
