@@ -152,36 +152,40 @@ public:
 
    //+--------------------------------------------------------------+
    //| LOG SETUP ARMED - create file + SUBJECT line + setup details.   |
-   //| v5.40: the hybrid router arms a setup EITHER as a physical       |
-   //| broker pending limit (price valid for a resting order) OR as an  |
-   //| in-memory virtual order (price already through the zone). This   |
-   //| CREATES the per-setup journal either way and stamps the two       |
-   //| facts the operator needs on the header: the R/C Phase (touch     |
-   //| 1 = Reversal, touch 2+ = Continuation) and the Execution Mode    |
-   //| (PHYSICAL vs VIRTUAL). The later entry/cancel/exit append into   |
-   //| the same file; the email ships the full snapshot.                |
+   //| v5.40: the hybrid router arms a setup EITHER as a physical      |
+   //| broker pending limit (price valid for a resting order) OR as an |
+   //| in-memory virtual order (price already through the zone). This  |
+   //| CREATES the per-setup journal either way and stamps the two     |
+   //| facts the operator needs on the header: the Logic and the       |
+   //| Execution Mode (PHYSICAL vs VIRTUAL). v5.52: every setup is a   |
+   //| single CONTINUATION entry, so the header no longer names a      |
+   //| phase. The later entry/cancel/exit append into the same file;   |
+   //| the email ships the full snapshot.                              |
    //+--------------------------------------------------------------+
    void              LogSetupArmed(bool physical, string tradeId, ENUM_TRADE_DIRECTION dir, ENUM_BLOCK_TYPE btype, double entryPrice, double slPrice, double lotSize, const SSniperBlock &blk)
      {
       if(!m_ready) return;
       if(!OpenWrite()) return;
-      string phase    = (blk.touches == 0) ? "R (Phase 1 - S/R Reversal Bounce)" : "C (Phase 2 - Trend Continuation)";
+      // v5.52: constant. A block has exactly one entry -- the continuation
+      // (a breakout above Resistance or a breakdown below Support) -- so the
+      // header names that and never a phase.
+      string phase    = "C (Continuation - Breakout / Breakdown)";
       string execMode = physical ? "PHYSICAL (Broker Limit Order)" : "VIRTUAL (In-Memory Arm)";
       W("SUBJECT: [ACTIVE] Session " + SubjectLine());
       W("================================================================");
       W("[SETUP ARMED] Session " + m_sessionID + " | " + m_symbol + " (" + (dir==DIR_LONG?"BUY / LONG":"SELL / SHORT") + ") | " + TimeToString(TimeCurrent()));
       W("  Setup ID          : " + tradeId);
-      W("  Phase             : " + phase);
+      W("  Logic             : " + phase);
       W("  Execution Mode    : " + execMode);
       W("  Trigger Price     : " + FmtPrice(entryPrice));
       W("  Initial SL        : " + FmtPrice(slPrice));
       W("  Volume            : " + DoubleToString(lotSize,2));
       string actionDesc = "";
       if(btype == BLOCK_SUPPORT)
-         actionDesc = (dir == DIR_LONG) ? "SUPPORT (Buying the S/R Reversal)" : "SUPPORT (Selling the Trend Continuation / Breakdown)";
+         actionDesc = "SUPPORT (Selling the Trend Continuation / Breakdown)";
       else
-         actionDesc = (dir == DIR_SHORT) ? "RESISTANCE (Selling the S/R Reversal)" : "RESISTANCE (Buying the Trend Continuation / Breakout)";
-      W("  Logic             : " + actionDesc);
+         actionDesc = "RESISTANCE (Buying the Trend Continuation / Breakout)";
+      W("  Trade             : " + actionDesc);
       W("  Block Top/Bottom  : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom));
       W("  Wick 1 (Anchor)   : " + TimeToString(blk.wick1Time) + " H=" + FmtPrice(blk.wick1.highPrice) + " L=" + FmtPrice(blk.wick1.lowPrice));
       W("  Wick 2 (Retest)   : " + TimeToString(blk.wick2Time) + " H=" + FmtPrice(blk.wick2.highPrice) + " L=" + FmtPrice(blk.wick2.lowPrice));
@@ -341,31 +345,15 @@ public:
      }
 
    //+----------------------------------------------------------------+
-   //| LOG CONVERSION (v5.36): Phase 1 dropped -> Phase 2 Continuation|
-   //| Appends a conversion notice to the session journal. v5.42: no  |
-   //| longer emails -- LogExit() is the only sender.                 |
-   //| Unlike LogCancellation() this does NOT rename the session file |
-   //| to CANCELLED_ : the setup is still live, merely re-phased.     |
+   //| LOG CONVERSION — REMOVED (v5.52).                               |
+   //|                                                                 |
+   //| A conversion notice ('Phase 1 dropped -> Phase 2 Continuation') |
+   //| has no meaning without the two-phase engine: no block is ever   |
+   //| re-phased, so this method had no writer. Deleted rather than left|
+   //| inert so the next reader is not misled into thinking a conversion|
+   //| path still exists. A vetoed setup is now simply cancelled and   |
+   //| journalled by LogCancellation(), which is the surviving path.   |
    //+----------------------------------------------------------------+
-   void              LogConversion(ulong ticket, ENUM_BLOCK_TYPE btype, string reason)
-     {
-      if(!m_ready) return;
-      if(!OpenAppend())
-        {
-         if(!OpenWrite()) return;   // no prior file -> create it
-        }
-      W("================================================================");
-      W("[CONVERTED TO CONTINUATION] Session " + m_sessionID + " | " + m_symbol + " | " + TimeToString(TimeCurrent()));
-      W("  Ticket Dropped    : #" + IntegerToString((int)ticket));
-      W("  Block Polarity    : " + (btype == BLOCK_SUPPORT ? "SUPPORT" : "RESISTANCE"));
-      W("  Trigger Event     : " + reason);
-      W("  Next Action       : Phase 1 order cancelled; Block upgraded to Phase 2 Continuation.");
-      W("================================================================");
-      CloseHandle();
-      // v5.42: NO email here. A re-phase is an intermediate lifecycle stage,
-      // not a session endpoint -- LogExit() is the only writer that ships
-      // the aggregated session file.
-     }
   };
 
 //+------------------------------------------------------------------+

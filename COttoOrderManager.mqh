@@ -508,27 +508,19 @@ private:
    ENUM_TRADE_DIRECTION    GetDirectionForBlock(const SSniperBlock &block)
      {
       // A Support/Resistance zone is DISCOVERED polarity, NOT trade direction.
-      // The mapping is the standard two-phase lifecycle: Phase 1 trades the
-      // zone as a BOUNCE, Phase 2 trades the reclaimed zone as a REVERSAL.
+      // v5.52 PURE CONTINUATION: the mapping is UNCONDITIONAL and reads no
+      // phase. Pine's can_place gate is 'flat OR (long & resistance) OR
+      // (short & support)', so a RESISTANCE zone is traded LONG (a breakout
+      // above it) and a SUPPORT zone is traded SHORT (a breakdown below it).
+      // The v5.34 two-phase fade -- the first fill a bounce, only a reclaimed
+      // zone the flip -- is retired.
+      //
       // This is the single chokepoint every consumer reads (front edge, SL,
       // TP, basket seed, correlation gate), so the mapping stays coherent.
-      //
-      // v5.34 Part 3 — TWO-PHASE LIFECYCLE. The counter in block.touches
-      // carries the phase:
-      //   touches == 0  -> PHASE 1, the normal BOUNCE off the zone (support ->
-      //                    LONG, resistance -> SHORT): SL below a Long, TP
-      //                    above; mirrored for a Short.
-      //   touches == 1  -> PHASE 2, the REVERSAL. Having reclaimed the zone the
-      //                    setup trades the S/R FLIP, so the direction inverts
-      //                    (support -> SHORT, resistance -> LONG). The block
-      //                    geometry and shifted entry are unchanged; only the
-      //                    side of the trade changes.
-      //   touches == 2  -> terminal (the reversal fill), Phase-2 mapping kept.
-      // Keeping this decision in ONE place is what makes the reversal coherent
-      // for the front edge, SL, TP, basket seed and correlation gate at once.
-      if(block.touches >= 1)
-         return (block.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Phase 2 — reversal (S/R flip)
-      return (block.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;      // Phase 1 — normal bounce
+      // COttoBlockManager::BlockDirection() and otto.mq5's MappedZoneDirection()
+      // are identical twins and must be kept in lockstep, or the
+      // Front-Run veto would project off the opposite side of the order.
+      return (block.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Support -> SHORT, Resistance -> LONG
      }
 
 
@@ -662,10 +654,12 @@ private:
      {
       if(InpEntryStyle == ENTRY_MIDPOINT)
          return block.midpoint;
-      // The front edge is the edge the price APPROACHES FROM. With the standard
-      // bounce mapping that is the near edge (support.top / resistance.bottom);
-      // in Phase 2 the setup trades the reclaimed zone from the opposite side,
-      // so the front edge follows the phase-aware mapped direction.
+      // The front edge is the edge the price APPROACHES FROM. v5.52 keys it
+      // straight off the unconditional mapped direction, so a Resistance LONG
+      // is entered at resistance.bottom and a Support SHORT at support.top --
+      // the NEAR edge of the zone, which price crosses on its way through it.
+      // Twin of COttoBlockManager::BlockEntryPrice(); they must stay identical
+      // or the Front-Run veto would judge a different price from the order's.
       return (GetDirectionForBlock(block) == DIR_LONG) ? block.top : block.bottom;
      }
 
@@ -683,15 +677,21 @@ private:
 
 
    //+------------------------------------------------------------------+
-   //| PlaceOrArmOrder — HYBRID ROUTER (v5.40). Translates Pine          |
-   //| strategy.entry(limit=...) into a resting BROKER limit when the    |
-   //| entry price is legal for a pending order, and into an in-memory   |
-   //| SVirtualOrder when price has already reached/through the zone.    |
-   //| NO take-profit is attached on either path (exact mirror: exits    |
-   //| are purely trail-based; localTP is stored on the block only for   |
-   //| the Front-Run veto). A physical fill is caught by                 |
-   //| CheckPendingOrderFills(); a virtual arm fires its MARKET leg in   |
-   //| CheckVirtualTriggers() on the cross.                              |
+   //| PlaceOrArmOrder — HYBRID ROUTER (v5.40). Translates Pine         |
+   //| strategy.entry(limit=...) into a resting BROKER limit when the   |
+   //| entry price is legal for a pending order, and into an in-memory  |
+   //| SVirtualOrder when price has already reached/through the zone.   |
+   //| NO take-profit is attached on either path (exact mirror: exits   |
+   //| are purely trail-based; localTP is stored on the block only for  |
+   //| the Front-Run veto). A physical fill is caught by                |
+   //| CheckPendingOrderFills(); a virtual arm fires its MARKET leg in  |
+   //| CheckVirtualTriggers() on the cross.                             |
+   //|                                                                  |
+   //| v5.52 CONTINUATION: with InpEntryStyle = ENTRY_FRONT_EDGE the    |
+   //| entry is STOP-style (see the CONTINUATION NOTE at the routing    |
+   //| tail), so the VIRTUAL arm is the ordinary path and a physical    |
+   //| rest is the pullback case. Either way the trigger is a MARKET    |
+   //| deal when the continuation level is crossed.                     |
    //+------------------------------------------------------------------+
    bool                    PlaceOrArmOrder(int blockIndex, SSniperBlock &block)
      {
@@ -745,32 +745,14 @@ private:
       // entry-independent, so snapping does not change the risk distance.
       double entryPrice = SnapToTick(CalcEntryPrice(block));
 
-      // v5.34 Part 3 — SHIFTED REVERSAL ENTRY (Phase 2 only). A Touch-1 block
-      // is a reclaimed zone being traded as a REVERSAL, so its entry is moved
-      // to the OUTER boundary of the block by one full stop distance. That
-      // orders the reversal BEYOND the extreme that rejected the Phase 1 bounce,
-      // instead of back inside the zone the bounce already occupied. The
-      // anchor is keyed off the block's OWN type (Phase 2 maps Resistance to a
-      // LONG and Support to a SHORT), so a LONG reversal sits BELOW the block
-      // bottom and a SHORT reversal sits ABOVE the block top. slDist is
-      // hoisted here because the shift below depends on it; both are
-      // entry-independent, so snapping/shifting never changes the risk distance.
+      // v5.34 Part 3 — SHIFTED REVERSAL ENTRY — RETIRED (v5.52).
+      // The shift moved a Touch-1 block's entry to the OUTER boundary by one
+      // full stop distance, to order the reversal beyond the extreme that
+      // rejected the Phase 1 bounce. With the two-phase engine gone there is
+      // no Phase 2 to shift, so the entry is the single front edge from
+      // CalcEntryPrice() and InpShiftReversalEntry is a declared no-op.
+      // slDist stays hoisted here: SL/TP below are entry-relative and reuse it.
       double slDist     = CalcSLDistance(block, atr);
-      if(InpShiftReversalEntry && block.touches >= 1)
-        {
-         // Phase 2 Reversal Outer Boundary Geometry:
-         // Resistance-turned-Support (LONG): Entry is shifted BELOW the block bottom by slDist
-         // Support-turned-Resistance (SHORT): Entry is shifted ABOVE the block top by slDist
-         double shifted = (block.type == BLOCK_RESISTANCE) ? (block.bottom - slDist)
-                                                           : (block.top + slDist);
-         entryPrice = SnapToTick(shifted);   // re-snap: the shift may leave the grid
-         if(EnableLogging)
-            Print("[OrderManager] SHIFTED CONTINUATION ENTRY: block ", block.tradeId,
-                  " touched=", block.touches,
-                  " dir=", (GetDirectionForBlock(block) == DIR_LONG ? "LONG" : "SHORT"),
-                  " entry=", DoubleToString(entryPrice, _Digits),
-                  " (slDist=", DoubleToString(slDist, _Digits), ")");
-        }
 
       // v5.40 — the duplicate shield and the physical-vs-virtual routing both
       // live at the TAIL of this function, AFTER the risk sizing, so the router
@@ -838,6 +820,16 @@ private:
       // (broker-side resting fill). When price has already reached/through the
       // zone the resting form is illegal, so we ARM an in-memory virtual order
       // and let CheckVirtualTriggers() fire it as a MARKET deal on the cross.
+      //
+      // v5.52 CONTINUATION NOTE. With InpEntryStyle = ENTRY_FRONT_EDGE the
+      // entry is the zone edge price CROSSES -- a Resistance LONG is entered at
+      // resistance.bottom and a Support SHORT at support.top -- so the trigger
+      // is STOP-style, not limit-style. That is handled by the two routes below
+      // rather than by a new order type: while the price has NOT yet crossed,
+      // the entry sits on the non-limit side of the market, this test is false,
+      // and the setup arms VIRTUALLY and fires a MARKET deal on the cross. A
+      // physical rest is only ever used when the entry will genuinely be
+      // crossed toward (a pullback into the zone), which the limit test accepts.
       double boundary = GetPriceBoundaryBuffer();
       bool   priceValid;
       if(isLong)
@@ -874,13 +866,13 @@ private:
          request.tp        = 0;   // NO TP — exact mirror of Pine (trail-only exits)
          request.deviation = MaxSlippage;
          request.magic     = MagicNumber;
-         // v5.41 -- R/C PHASE TAG (physical). Mirrors the virtual fill-time
-         // marker so a resting broker row names its phase: a block's FIRST
-         // fill (touches == 0) is the Phase 1 "R"eversal (the S/R bounce),
-         // its SECOND and later (touches >= 1) the Phase 2 "C"ontinuation.
-         // ClampOrderComment() already tail-preserves the "-BLK<n>" setup id,
-         // so the extra tag still fits the MT5 31-char limit.
-         string phaseType  = (block.touches == 0) ? "R" : "C";
+         // v5.41 R/C PHASE TAG, v5.52 — the tag is CONSTANT now. A block's
+         // entry is the single continuation (the breakout / breakdown); the
+         // phase branch dropped with the two-phase engine. The tag is kept
+         // rather than removed so the MT5 31-char comment SHAPE, and the
+         // "-BLK<n>" setup id ClampOrderComment() tail-preserves, are
+         // unchanged for any downstream tooling that parses the row.
+         string phaseType  = "C";
          request.comment   = ClampOrderComment(armSessionId + "_" + phaseType + "_P");
 
          if(request.volume < m_riskManager.GetVolumeMin() ||
@@ -1563,13 +1555,13 @@ private:
      {
       if(!PositionSelectByTicket(positionTicket)) return;
       m_activeTrade.ticket       = positionTicket;
-      // v5.48 -- the direction this basket is seeded with. Deriving it from the
-      // block's phase (touches) is the correct basis for a PHYSICAL fill,
-      // because that path seeds BEFORE it consumes the touch. A VIRTUAL fill
-      // consumes the touch first, so it hands the arm-time side in explicitly
-      // (overrideDir); otherwise GetDirectionForBlock() would flip the basket to
-      // the OPPOSITE of the MARKET order that just filled, desyncing the trail,
-      // the 1R basis, the journal and the High Table mirror for that whole leg.
+      // The direction this basket is seeded with. v5.52 makes the default path
+      // trivially correct: GetDirectionForBlock() is now UNCONDITIONAL and no
+      // longer reads block.touches, so a fill that consumes the touch first
+      // still resolves the SAME side the MARKET order executed. overrideDir is
+      // kept as belt-and-braces -- the virtual fire already knows the exact
+      // side it sent, so passing it costs nothing and cannot desync the trail,
+      // the 1R basis, the journal or the High Table mirror for the leg.
       m_activeTrade.direction    = (overrideDir != DIR_NONE) ? overrideDir
                                                              : GetDirectionForBlock(block);
       m_activeTrade.entryPrice   = block.localEntry;
@@ -1906,17 +1898,20 @@ private:
       s += "  Open pendings   : " + IntegerToString(CountMyPendingOrders()) +
            " (broker + virtual)\n";
       s += "  Armed blocks    : " + IntegerToString(CountArmedBlocks()) + "\n";
-      // v5.52 Part 3 -- R/C PHASE TAG (hourly report). Mirrors the R/C marker
-      // the arm and retag paths stamp on the live order, but reads the BLOCK
-      // instead, so the operator sees a setup's phase BEFORE it ever fills.
+      // v5.51 Part 3 -- R/C PHASE TAG (hourly report), v5.52 — every armed
+      // setup is a CONTINUATION now: there is no reversal phase left, so this
+      // opens with the constant label instead of discriminating on block.touches.
+      // The per-serial walk is kept because it is what proves each armed order
+      // still resolves to a live block.
       for(int v = 0; v < m_virtualCount; v++)
         {
          int vs   = m_virtualOrders[v].blockSerial;
          int bIdx = m_blockManager.FindBlockIndexBySerial(vs);
          SSniperBlock b;
+         // Unresolved block -> a VISIBLE UNKNOWN, never a blank or a guess.
          string phaseLabel = "UNKNOWN";
          if(bIdx >= 0 && m_blockManager.GetBlockAt(bIdx, b))
-            phaseLabel = (b.touches == 0) ? "R (S/R Reversal)" : "C (Continuation)";
+            phaseLabel = "C (Continuation)";
          s += "    Setup #" + IntegerToString(vs) + " " +
               (m_virtualOrders[v].direction == DIR_LONG ? "LONG" : "SHORT") +
               " | Phase : " + phaseLabel + "\n";
@@ -2416,12 +2411,11 @@ public:
             blocks[i].hasPlacedOrder || blocks[i].limitOrderTicket > 0)
             continue;
 
-         // v5.40: Phase 1 (touches==0) and Phase 2 (touches>=1) BOTH route
-         // through PlaceOrArmOrder(). It is phase-aware — it rests a Phase 2
-         // entry at the shift-reversal outer boundary via InpShiftReversalEntry
-         // — and picks PHYSICAL (broker limit) vs VIRTUAL (CheckVirtualTriggers
-         // fires the MARKET leg on the cross) per setup, by live-price validity.
-         // This is the single execution path for every armed block.
+         // v5.52: EVERY armed block routes through PlaceOrArmOrder(), which
+         // picks PHYSICAL (broker limit) vs VIRTUAL (CheckVirtualTriggers fires
+         // the MARKET leg on the cross) per setup by live-price validity. With
+         // the two-phase engine gone there is no Phase 2 to shift, so this is
+         // the single, phase-free execution path for every armed block.
 
          // STACKED / OVERLAPPING BLOCK LOCKOUT — skip if an older active
          // primary block of the same type is within 3.0*ATR (keep disarmed).
@@ -2437,9 +2431,9 @@ public:
    //| The hybrid router may rest a real broker limit order. When one    |
    //| fills, the broker removes the pending and opens a position whose  |
    //| ticket is UNRELATED, so resolve it via the 3-tier detector, seed  |
-   //| the basket, and advance the two-phase lifecycle exactly as the    |
-   //| virtual trigger does. A pending that VANISHED without a position  |
-   //| is a cancel/expiry — just release the block's ticket reference.   |
+   //| the basket, and consume the block's single continuation entry     |
+   //| exactly as the virtual trigger does. A pending that VANISHED      |
+   //| without a position is a cancel/expiry — just release the ticket.  |
    //+------------------------------------------------------------------+
    void              CheckPendingOrderFills(void)
      {
@@ -2557,11 +2551,9 @@ public:
                   mod.hasExited          = false;
                   mod.deleteOnBarTime    = 0;
                   m_blockManager.SetBlockAt(bi, mod);
-                  if(mod.touches == 1)
-                     m_blockManager.SyncReversalCluster(bi);
                   if(EnableLogging)
                      Print("[OrderManager] TOUCH ", mod.touches, " CONSUMED: block ", mod.tradeId,
-                           " (prev=", prevTouch, ") -> Continuation phase active");
+                           " (prev=", prevTouch, ") -> continuation entry done; block is one-shot");
                  }
               }
            }
@@ -2669,15 +2661,14 @@ public:
          if(!SentimentPasses(blocks[bi])) continue;
          if(m_blockManager.IsBlockedByPrimary(bi)) continue;
 
-         // v5.38 -- R/C PHASE TAG + REUSE OF THE ARM SESSION. A block serial
-         // executes repeatedly: its FIRST fill (touches == 0) is the Phase 1
-         // "R"eversal (the S/R bounce), each later fill (touches >= 1) the
-         // Phase 2 "C"ontinuation. The one-letter marker rides in the broker
-         // comment. The SESSION id is NOT re-minted here: it was minted when
-         // the setup was ARMED and is carried on the descriptor, so the arm
-         // snapshot, this fill and the later exit all resolve to ONE journal
-         // file, and a fallback mint keeps the identifier defined.
-         string phaseType = (blocks[bi].touches == 0) ? "R" : "C";
+         // v5.38 -- R/C PHASE TAG + REUSE OF THE ARM SESSION. v5.52: the marker
+         // is CONSTANT -- every setup is the single continuation entry (the
+         // breakout / breakdown), so there is no phase left to discriminate.
+         // The SESSION id is NOT re-minted here: it was minted when the setup
+         // was ARMED and is carried on the descriptor, so the arm snapshot, this
+         // fill and the later exit all resolve to ONE journal file, and a
+         // fallback mint keeps the identifier defined.
+         string phaseType = "C";
          string newSessionId = vo.sessionId;
          if(newSessionId == "")
            {
@@ -2798,8 +2789,10 @@ public:
                                    : vo.triggerPrice - slDist;
          block.rrUnit     = slDist;
 
-         // Consume the touch: 0 -> 1 promotes the block to a Phase 2 reversal
-         // candidate; 1 -> 2 retires it. Mirrors CheckPendingOrderFills().
+         // Consume the entry: this block's ONE continuation entry has filled.
+         // touches is no longer a phase cursor -- it is the counter the v5.28
+         // one-tranche-per-block shield reads, so a duplicate fill (already
+         // >= 1) is refused upstream. Mirrors CheckPendingOrderFills().
          block.touches            += 1;
          block.limitOrderTicket    = 0;
          block.pendingOrderCancel  = false;
@@ -2810,12 +2803,6 @@ public:
          block.hasExited           = false;
          block.deleteOnBarTime     = 0;
          m_blockManager.SetBlockAt(bi, block);
-
-         // Cluster sync: any same-polarity Phase 1 sibling sharing this
-         // territory reverses in lockstep (same call CheckPendingOrderFills
-         // makes when Touch 1 is consumed).
-         if(block.touches == 1)
-            m_blockManager.SyncReversalCluster(bi);
 
          // v5.43 -- hand the setup's pre-minted session to THIS basket before
          // seeding. InitBasket() reuses m_sessionID verbatim when it is already
@@ -2892,40 +2879,27 @@ public:
                      string pts = StringFormat("%04d%02d%02d-%02d%02d%02d", ptm.year, ptm.mon, ptm.day, ptm.hour, ptm.min, ptm.sec);
                      physSession = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, pts, blocks[i].serial);
                     }
-                  if(blocks[i].conversionReason != VETO_NONE && blocks[i].touches >= 1)
-                    {
-                     string convReason = "Fired Front-Run 1:4 Veto";
-                     if(blocks[i].conversionReason == VETO_NEARMISS)      convReason = "Near-Miss Veto (6D)";
-                     else if(blocks[i].conversionReason == VETO_STALE)    convReason = "Stale Veto (45D)";
-                     else if(blocks[i].conversionReason == VETO_MOMENTUM) convReason = "Momentum Veto";
-                     else if(blocks[i].conversionReason == VETO_FVG)      convReason = "FVG Veto";
-                     // v5.43 -- save/restore: a transient setup log must not
-                     // steal the journal from a live basket (see PlaceOrArmOrder).
-                     string prevSession = m_sessionID;
-                     m_journal.SetSessionID(physSession);
-                     m_journal.LogConversion(physTicket, blocks[i].type, convReason);
-                     if(prevSession != "") m_journal.SetSessionID(prevSession);
-                    }
-                  else
-                    {
-                     string cancelReason = "Manual";
-                     if(blocks[i].vetoReason == VETO_FRONTRUN)           cancelReason = "Fired Front-Run 1:4 Veto";
-                     else if(blocks[i].vetoReason == VETO_STALE)         cancelReason = "Stale Veto (45D)";
-                     else if(blocks[i].vetoReason == VETO_NEARMISS)      cancelReason = "Near-Miss Veto (6D)";
-                     else if(blocks[i].vetoReason == VETO_MOMENTUM)      cancelReason = "Momentum Veto";
-                     else if(blocks[i].vetoReason == VETO_FVG)           cancelReason = "FVG Veto";
-                     else if(blocks[i].vetoReason == VETO_SIZING)        cancelReason = "Sizing Veto";
-                     else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
-                     else if(blocks[i].vetoReason == VETO_BROKEN)        cancelReason = "Block Broken";
-                     else if(blocks[i].vetoReason == VETO_FLIPPED)       cancelReason = "Block Flipped";
-                     else if(blocks[i].vetoReason == VETO_CORRELATION)   cancelReason = "Vector Consensus Veto";
-                     else if(blocks[i].pendingOrderCancel)               cancelReason = "Manual / Direction Conflict";
-                     // v5.43 -- save/restore (see the conversion branch above).
-                     string prevSession = m_sessionID;
-                     m_journal.SetSessionID(physSession);
-                     m_journal.LogCancellation(cancelReason);
-                     if(prevSession != "") m_journal.SetSessionID(prevSession);
-                    }
+                  // v5.52: the conversion branch that used to guard this is gone
+                  // with TryConvertToReversal(). conversionReason is now permanently
+                  // VETO_NONE, so every drop is a plain cancellation.
+                  string cancelReason = "Manual";
+                  if(blocks[i].vetoReason == VETO_FRONTRUN)           cancelReason = "Fired Front-Run 1:4 Veto";
+                  else if(blocks[i].vetoReason == VETO_STALE)         cancelReason = "Stale Veto (45D)";
+                  else if(blocks[i].vetoReason == VETO_NEARMISS)      cancelReason = "Near-Miss Veto (6D)";
+                  else if(blocks[i].vetoReason == VETO_MOMENTUM)      cancelReason = "Momentum Veto";
+                  else if(blocks[i].vetoReason == VETO_FVG)           cancelReason = "FVG Veto";
+                  else if(blocks[i].vetoReason == VETO_SIZING)        cancelReason = "Sizing Veto";
+                  else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
+                  else if(blocks[i].vetoReason == VETO_BROKEN)        cancelReason = "Block Broken";
+                  else if(blocks[i].vetoReason == VETO_FLIPPED)       cancelReason = "Block Flipped";
+                  else if(blocks[i].vetoReason == VETO_CORRELATION)   cancelReason = "Vector Consensus Veto";
+                  else if(blocks[i].pendingOrderCancel)               cancelReason = "Manual / Direction Conflict";
+                  // v5.43 -- save/restore: a transient setup log must not steal the
+                  // journal from a live basket (see PlaceOrArmOrder).
+                  string prevSession = m_sessionID;
+                  m_journal.SetSessionID(physSession);
+                  m_journal.LogCancellation(cancelReason);
+                  if(prevSession != "") m_journal.SetSessionID(prevSession);
                  }
               }
            }
@@ -2944,62 +2918,35 @@ public:
 
             if(m_journal != NULL)
               {
-               // v5.36: a block whose Phase 2 promotion came from a convertible
-               // veto is NOT a fatal cancel: it is a re-phase. Journal (and email)
-               // a conversion notice instead of a CANCELLED_ rename.
-               if(blocks[i].conversionReason != VETO_NONE && blocks[i].touches >= 1)
+               // v5.52: the conversion branch that used to guard this is gone with
+               // TryConvertToReversal(). conversionReason is now permanently
+               // VETO_NONE, so every drop is a plain cancellation.
+               string cancelReason = "Manual";
+               if(blocks[i].vetoReason == VETO_FRONTRUN)       cancelReason = "Fired Front-Run 1:4 Veto";
+               else if(blocks[i].vetoReason == VETO_STALE)     cancelReason = "Stale Veto (45D)";
+               else if(blocks[i].vetoReason == VETO_NEARMISS)  cancelReason = "Near-Miss Veto (6D)";
+               else if(blocks[i].vetoReason == VETO_MOMENTUM)  cancelReason = "Momentum Veto";
+               else if(blocks[i].vetoReason == VETO_FVG)        cancelReason = "FVG Veto";
+               else if(blocks[i].vetoReason == VETO_SIZING)     cancelReason = "Sizing Veto";
+               else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
+               else if(blocks[i].vetoReason == VETO_BROKEN)     cancelReason = "Block Broken";
+               else if(blocks[i].vetoReason == VETO_FLIPPED)    cancelReason = "Block Flipped";
+               else if(blocks[i].vetoReason == VETO_CORRELATION) cancelReason = "Vector Consensus Veto";
+               else if(blocks[i].pendingOrderCancel)           cancelReason = "Manual / Direction Conflict";
+               // v5.38: reuse the arm-time session so the cancel lands in the
+               // setup's ONE journal, with a fresh mint as the fallback.
+               string voSession = m_virtualOrders[v].sessionId;
+               if(voSession == "")
                  {
-                  string convReason = "Fired Front-Run 1:4 Veto";
-                  if(blocks[i].conversionReason == VETO_NEARMISS)      convReason = "Near-Miss Veto (6D)";
-                  else if(blocks[i].conversionReason == VETO_STALE)    convReason = "Stale Veto (45D)";
-                  else if(blocks[i].conversionReason == VETO_MOMENTUM) convReason = "Momentum Veto";
-                  else if(blocks[i].conversionReason == VETO_FVG)      convReason = "FVG Veto";
-
-                  // v5.38: keep the setup's ONE journal. Reuse the arm-time
-                  // session carried on the descriptor; only a legacy entry
-                  // with no session id falls back to a freshly minted one.
-                  string voSession = m_virtualOrders[v].sessionId;
-                  if(voSession == "")
-                    {
-                     MqlDateTime ctm2; TimeToStruct(TimeCurrent(), ctm2);
-                     string cts2 = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm2.year, ctm2.mon, ctm2.day, ctm2.hour, ctm2.min, ctm2.sec);
-                     voSession = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts2, blocks[i].serial);
-                    }
-                  // v5.43 -- save/restore (see the physical-cancel path above).
-                  string prevSession = m_sessionID;
-                  m_journal.SetSessionID(voSession);
-                  m_journal.LogConversion(0, blocks[i].type, convReason);
-                  if(prevSession != "") m_journal.SetSessionID(prevSession);
+                  MqlDateTime ctm; TimeToStruct(TimeCurrent(), ctm);
+                  string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
+                  voSession = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial);
                  }
-               else
-                 {
-                  string cancelReason = "Manual";
-                  if(blocks[i].vetoReason == VETO_FRONTRUN)       cancelReason = "Fired Front-Run 1:4 Veto";
-                  else if(blocks[i].vetoReason == VETO_STALE)     cancelReason = "Stale Veto (45D)";
-                  else if(blocks[i].vetoReason == VETO_NEARMISS)  cancelReason = "Near-Miss Veto (6D)";
-                  else if(blocks[i].vetoReason == VETO_MOMENTUM)  cancelReason = "Momentum Veto";
-                  else if(blocks[i].vetoReason == VETO_FVG)        cancelReason = "FVG Veto";
-                  else if(blocks[i].vetoReason == VETO_SIZING)     cancelReason = "Sizing Veto";
-                  else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
-                  else if(blocks[i].vetoReason == VETO_BROKEN)     cancelReason = "Block Broken";
-                  else if(blocks[i].vetoReason == VETO_FLIPPED)    cancelReason = "Block Flipped";
-                  else if(blocks[i].vetoReason == VETO_CORRELATION) cancelReason = "Vector Consensus Veto";
-                  else if(blocks[i].pendingOrderCancel)           cancelReason = "Manual / Direction Conflict";
-                  // v5.38: reuse the arm-time session (see the conversion branch
-                  // above) so the cancel lands in the setup's ONE journal.
-                  string voSession = m_virtualOrders[v].sessionId;
-                  if(voSession == "")
-                    {
-                     MqlDateTime ctm; TimeToStruct(TimeCurrent(), ctm);
-                     string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
-                     voSession = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial);
-                    }
-                  // v5.43 -- save/restore (see the physical-cancel path above).
-                  string prevSession = m_sessionID;
-                  m_journal.SetSessionID(voSession);
-                  m_journal.LogCancellation(cancelReason);
-                  if(prevSession != "") m_journal.SetSessionID(prevSession);
-                 }
+               // v5.43 -- save/restore (see the physical-cancel path above).
+               string prevSession = m_sessionID;
+               m_journal.SetSessionID(voSession);
+               m_journal.LogCancellation(cancelReason);
+               if(prevSession != "") m_journal.SetSessionID(prevSession);
               }
 
             RemoveVirtualOrderAt(v);
@@ -3045,9 +2992,13 @@ public:
 
          ENUM_ORDER_TYPE ot = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
          ENUM_TRADE_DIRECTION odir = DIR_NONE;
-         if(ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP)   odir = DIR_LONG;
-         else if(ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP) odir = DIR_SHORT;
-         if(odir == DIR_NONE) continue;
+      if(ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP)   odir = DIR_LONG;
+      else if(ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP) odir = DIR_SHORT;
+      // v5.52: a BUY is a Resistance continuation (a breakout above it) and a
+      // SELL a Support continuation (a breakdown below it) -- the mapping
+      // GetDirectionForBlock() states unconditionally, so this leg's direction
+      // cannot disagree with the block it mirrors.
+      if(odir == DIR_NONE) continue;
          if(!m_correlationFilter.IsConsensusOpposed(m_symbol, odir)) continue;
 
          if(EnableLogging)
@@ -3128,9 +3079,10 @@ public:
 
          ENUM_ORDER_TYPE ot = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
          ENUM_TRADE_DIRECTION odir = DIR_NONE;
-         if(ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP)   odir = DIR_LONG;
-         else if(ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP) odir = DIR_SHORT;
-         if(odir != m_activeDirection) continue;
+      if(ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP)   odir = DIR_LONG;
+      else if(ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP) odir = DIR_SHORT;
+      // v5.52: same continuation mapping as the consensus sweep above.
+      if(odir != m_activeDirection) continue;
 
          if(EnableLogging)
             Print("[OrderManager] DIRECTION CONFLICT (physical): deleting ticket ",

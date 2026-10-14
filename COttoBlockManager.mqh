@@ -95,44 +95,45 @@ private:
 
 
    //+------------------------------------------------------------------+
-   //| DIRECTION CHOKEPOINT (standard two-phase lifecycle).            |
+   //| DIRECTION CHOKEPOINT (standard two-phase lifecycle).             |
    //|                                                                  |
-   //| A block's ZONE type is not its TRADE direction: that mapping is   |
-   //| owned by COttoOrderManager::GetDirectionForBlock() and mirrored   |
-   //| here. This file needs the direction in two places the OrderManager |
-   //| cannot reach (both veto funnel projections), so the same mapping  |
-   //| is mirrored rather than guessed.                                  |
+   //| A block's ZONE type is not its TRADE direction: that mapping is  |
+   //| owned by COttoOrderManager::GetDirectionForBlock() and mirrored  |
+   //| here. This file needs the direction in two places the OrderManager|
+   //| cannot reach (both veto funnel projections), so the same mapping |
+   //| is mirrored rather than guessed.                                 |
    //|                                                                  |
-   //| v5.34 Part 3: the mapping is PHASE-AWARE. A fresh block           |
-   //| (touches == 0) is a PHASE 1 BOUNCE (support -> LONG). A block that |
-   //| has consumed Touch 1 (touches >= 1) is a PHASE 2 REVERSAL and     |
-   //| trades the S/R flip, so support -> SHORT. The Front-Run veto       |
-   //| projects its target from here, so projecting off the wrong phase   |
-   //| would veto the live reversal or miss real front-runs -- silently.  |
+   //| v5.52 PURE CONTINUATION: the mapping is UNCONDITIONAL and reads no|
+   //| phase. Pine's can_place gate is 'flat OR (long & resistance) OR  |
+   //| (short & support)', so a RESISTANCE zone is traded LONG (a breakout|
+   //| above it) and a SUPPORT zone is traded SHORT (a breakdown below  |
+   //| it). The v5.34 two-phase fade -- the first fill a bounce, only a |
+   //| reclaimed zone the flip -- is retired, so block.touches no longer|
+   //| enters this decision at all.                                     |
    //|                                                                  |
-   //| The two implementations deliberately sit side by side in review:   |
-   //| they must stay IDENTICAL or the Front-Run veto would project its   |
-   //| target off the wrong direction while the order was priced from the |
+   //| The two implementations deliberately sit side by side in review: |
+   //| they must stay IDENTICAL or the Front-Run veto would project its |
+   //| target off the wrong direction while the order was priced from the|
    //| other -- vetoing live entries or missing real front-runs, silently.|
    //|                                                                  |
    //+------------------------------------------------------------------+
    ENUM_TRADE_DIRECTION    BlockDirection(const SSniperBlock &b) const
      {
-      if(b.touches >= 1)
-         return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Phase 2 — reversal (S/R flip)
-      return (b.type == BLOCK_SUPPORT) ? DIR_LONG : DIR_SHORT;      // Phase 1 — normal bounce
+      return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Support -> SHORT, Resistance -> LONG
      }
 
    //+------------------------------------------------------------------+
-   //| BlockEntryPrice — Pine entry price for a block, honouring         |
-   //| InpEntryStyle. The front edge is the edge price APPROACHES FROM,  |
-   //| which follows the mapped direction: for a LONG it is               |
-   //| support.top / resistance.bottom, mirrored for a SHORT.            |
+   //| BlockEntryPrice — Pine entry price for a block, honouring        |
+   //| InpEntryStyle. The front edge is the edge price APPROACHES FROM, |
+   //| which follows the mapped direction: for a LONG it is             |
+   //| resistance.bottom / support.top, mirrored for a SHORT.           |
    //|                                                                  |
-   //| This is the exact twin of COttoOrderManager::CalcEntryPrice() and  |
-   //| flips its front edge with the phase-aware mapped direction (in     |
-   //| Phase 1 a Support zone is a LONG, entered from the top; in Phase 2 |
-   //| it is a SHORT, entered from the bottom).                          |
+   //| This is the exact twin of COttoOrderManager::CalcEntryPrice().   |
+   //| v5.52: with the unconditional continuation mapping the front edge|
+   //| is the NEAR edge of the zone, so a Resistance LONG is entered at |
+   //| resistance.bottom and a Support SHORT at support.top. The order  |
+   //| waits at the zone and the price crosses that edge on its way     |
+   //| THROUGH it, which makes the entry a STOP-style trigger.          |
    //+------------------------------------------------------------------+
    double                  BlockEntryPrice(const SSniperBlock &b) const
      {
@@ -181,36 +182,17 @@ private:
      }
 
    //+------------------------------------------------------------------+
-   //| VETO-TO-REVERSAL (v5.34 Part 2) — a Phase 1 block (touches==0)   |
-   //| that trips a convertible veto is upgraded to Phase 2 instead of  |
-   //| being deleted: the lifecycle counter advances to Touch 2, any    |
-   //| resting Phase 1 order is cancelled, and the block is reset to a  |
-   //| clean, unarmed reversal candidate. Returns true so the caller    |
-   //| SKIPS its SetVeto() call (the block survives as Touch 2).        |
+   //| VETO-TO-REVERSAL — RETIRED (v5.52).                              |
+   //|                                                                  |
+   //| v5.34 Part 2 upgraded a Phase 1 block that tripped a convertible |
+   //| veto into a Phase 2 reversal instead of deleting it. The pure    |
+   //| CONTINUATION engine has no second phase to promote a block INTO, |
+   //| so every one of the five convertible vetoes is now simply a veto |
+   //| and this helper has no caller. Removed rather than left inert so |
+   //| no future edit can reintroduce the fade by accident; the five    |
+   //| InpRev* inputs survive as declared no-ops in OttoDefines.mqh so an|
+   //| old .set file still loads.                                       |
    //+------------------------------------------------------------------+
-   bool                    TryConvertToReversal(int index, bool enabled, ENUM_VETO_REASON reason)
-     {
-      if(!enabled)                           return false;   // conversion disabled
-      if(index < 0 || index >= m_blockCount) return false;
-      if(m_blocks[index].touches != 0)       return false;   // Touch 2 -> permanent veto
-
-      SSniperBlock b   = m_blocks[index];    // copy — no struct reference
-      b.touches        = 1;                  // Phase 2 (Touch 1 consumed)
-      b.conversionReason = reason;           // v5.36: record the convertible veto that upgraded us
-      b.isArmed        = false;
-      b.hasPlacedOrder = false;
-      b.hasExited      = false;
-      b.isTriggered    = false;
-      m_blocks[index]  = b;                  // persist BEFORE the cancel request
-
-      RequestCancel(index);                  // drop any resting Phase 1 order
-
-      if(EnableLogging)
-         Print("[Block] CONVERT #", b.serial,
-               " (", (b.type == BLOCK_SUPPORT ? "SUP" : "RES"), ") ",
-               VetoReasonString(reason), " -> Phase 2 continuation");
-      return true;
-     }
 
    //+------------------------------------------------------------------+
    //| Requests order cancellation for the given block (no veto state).|
@@ -460,15 +442,17 @@ private:
 
 
    //+------------------------------------------------------------------+
-   //| BLOCK MANAGEMENT FUNNEL — the exact v4.70 state machine.        |
+   //| BLOCK MANAGEMENT FUNNEL — the exact v4.70 state machine.         |
    //| Runs once per new bar (calc_on_every_tick=false mirror). Order  |
    //| per Pine: deletion -> hasExited -> Stale(45) -> Front-Run(InpMaxRR)|
    //| -> Near-Miss(6D) -> Arming -> Break/Flip -> Momentum/FVG.       |
    //|                                                                  |
-   //| v5.49 -- the state machine is PHASE-AWARE: hasExited, arming and |
-   //| break/flip read block.touches and INVERT their geometry for a    |
-   //| Phase 2 reversal, so a reclaimed S/R flip is measured against    |
-   //| its OWN trade side, not the Phase 1 bounce it replaced.          |
+   //| v5.52 -- the state machine is PHASE-FREE. v5.49's touches-driven |
+   //| geometry inversion existed only to measure a reclaimed zone against|
+   //| its own reversal side; there is no reversal any more, so hasExited,|
+   //| arming and break/flip are each a single unconditional test that  |
+   //| never reads block.touches. See the break block below: its test is|
+   //| the OPPOSITE edge from arming, on purpose.                       |
    //+------------------------------------------------------------------+
    void                    ProcessBlocks(int marketDay)
      {
@@ -494,21 +478,15 @@ private:
          double high1  = iHigh(m_symbol, PERIOD_CURRENT, 1);
          double low1   = iLow(m_symbol, PERIOD_CURRENT, 1);
 
-         // --- hasExited: price left the zone on a wick basis (phase-aware) ---
+         // --- hasExited: price left the zone on a wick basis ------------
+         // A wick clear of the zone means price has left it and the setup is
+         // free to arm. Unconditional in v5.52: the continuation mapping does
+         // not depend on a phase, so neither does this test.
          if(!b.hasExited)
            {
-            if(b.touches == 0)   // Phase 1 (bounce) - a wick away from the zone
-              {
-               if((b.type == BLOCK_SUPPORT && low1 > b.top) ||
-                  (b.type == BLOCK_RESISTANCE && high1 < b.bottom))
-                  b.hasExited = true;
-              }
-            else                 // Phase 2 (reversal) - a wick through the near side
-              {
-               if((b.type == BLOCK_SUPPORT && low1 < b.bottom) ||
-                  (b.type == BLOCK_RESISTANCE && high1 > b.top))
-                  b.hasExited = true;
-              }
+            if((b.type == BLOCK_SUPPORT && low1 > b.top) ||
+               (b.type == BLOCK_RESISTANCE && high1 < b.bottom))
+               b.hasExited = true;
            }
 
          // --- STALE VETO (45 market days from W1) ---
@@ -516,8 +494,6 @@ private:
            {
             if(b.wick1Day > 0 && (marketDay - b.wick1Day) >= InpStaleDays)
               {
-               m_blocks[i] = b;   // persist hasExited before conversion decision
-               if(TryConvertToReversal(i, InpRevStale, VETO_STALE)) continue;
                SetVeto(i, VETO_STALE);
                continue;
               }
@@ -535,12 +511,10 @@ private:
             // -- which supersedes this projection once the order is placed --
             // would sit on the wrong side of price.
             bool   isLong = (BlockDirection(b) == DIR_LONG);
-            // v5.34 Part 2 - mirror the OrderManager's Phase 2 entry anchor so
-            // this projection cannot veto a live reversal from the wrong price.
+            // v5.34 Part 2 used to re-anchor this projection to the Phase 2
+            // outer-boundary entry. v5.52 has no Phase 2: the projection is
+            // taken straight from BlockEntryPrice(), the single front edge.
             // Once the order rests, b.localTP supersedes this below.
-            if(InpShiftReversalEntry && b.touches >= 1)
-               calcEntry = (b.type == BLOCK_RESISTANCE) ? (b.bottom - calcSLDist)
-                                                        : (b.top + calcSLDist);
             double target = isLong ? calcEntry + tpRR * calcSLDist
                                    : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
@@ -551,8 +525,6 @@ private:
             bool hit = isLong ? (high1 >= target) : (low1 <= target);
             if(hit)
               {
-               m_blocks[i] = b;   // persist hasExited before conversion decision
-               if(TryConvertToReversal(i, InpRevFrontRun, VETO_FRONTRUN)) continue;
                SetVeto(i, VETO_FRONTRUN);
                continue;
               }
@@ -585,8 +557,6 @@ private:
             // 6-market-day expiry from the anchor
             if(b.anchorDay > 0 && (marketDay - b.anchorDay) >= 6)
               {
-               m_blocks[i] = b;   // persist anchor before conversion decision
-               if(TryConvertToReversal(i, InpRevNearMiss, VETO_NEARMISS)) continue;
                SetVeto(i, VETO_NEARMISS);
                continue;
               }
@@ -603,32 +573,36 @@ private:
                continue;          // cannot arm while an older active primary is in range
               }
 
-            if(b.touches == 0)   // Phase 1 (bounce) - arm on a close out the far side
-              {
-               if((b.type == BLOCK_SUPPORT && close1 > b.top + InpArmATR * atrNow) ||
-                  (b.type == BLOCK_RESISTANCE && close1 < b.bottom - InpArmATR * atrNow))
-                  b.isArmed = true;
-              }
-            else                 // Phase 2 (reversal) - arm on a close out the near side
-              {
-               if((b.type == BLOCK_SUPPORT && close1 < b.bottom - InpArmATR * atrNow) ||
-                  (b.type == BLOCK_RESISTANCE && close1 > b.top + InpArmATR * atrNow))
-                  b.isArmed = true;
-              }
+            // ARMED once price has CLOSED clear of the zone on the NEAR edge --
+            // for a SUPPORT zone a close ABOVE it, for a RESISTANCE zone a close
+            // BELOW it. The entry that follows rests back at the zone, so arming
+            // is the PRE-CONDITION, not the trigger.
+            //
+            // This is the pre-v5.52 arming test, kept verbatim. It is deliberately
+            // the edge OPPOSITE the break test below: arming looks past the NEAR
+            // edge, the break past the FAR edge, so the two can never fire on the
+            // same close and a block cannot arm and be vetoed BROKEN in one pass.
+            if((b.type == BLOCK_SUPPORT && close1 > b.top + InpArmATR * atrNow) ||
+               (b.type == BLOCK_RESISTANCE && close1 < b.bottom - InpArmATR * atrNow))
+               b.isArmed = true;
            }
 
-         // --- BREAK / FLIP (phase-aware: a break is the edge the trade cannot use) ---
-         bool isBroken = false;
-         if(b.touches == 0)   // Phase 1: a close through the zone's own far edge
-           {
-            isBroken = (b.type == BLOCK_SUPPORT && close1 < b.bottom - ATRBufferBreak * atrNow) ||
-                       (b.type == BLOCK_RESISTANCE && close1 > b.top + ATRBufferBreak * atrNow);
-           }
-         else                 // Phase 2: the flipped setup breaks out the opposite edge
-           {
-            isBroken = (b.type == BLOCK_SUPPORT && close1 > b.top + ATRBufferBreak * atrNow) ||
-                       (b.type == BLOCK_RESISTANCE && close1 < b.bottom - ATRBufferBreak * atrNow);
-           }
+         // --- BREAK / FLIP (a break is the edge the trade cannot use) ---
+         // Pine's S/R-BREACH / POLARITY-FLIP detector, NOT an entry validator:
+         // it asks whether the close went out the FAR edge of the zone, which
+         // reclassifies the zone and blacklists it. That is why it names the
+         // OPPOSITE edge from arming above -- arming is the near side the trade
+         // breaks out toward, the break is the far side. They are mutually
+         // exclusive by construction, so a block can never arm here and be
+         // vetoed BROKEN in the same pass.
+         //
+         // KEPT VERBATIM through the v5.52 pivot for the one phase it still
+         // has; only the dead Phase 2 arm was removed. v5.49's Phase 2 branch
+         // tested the near edge, which for an armed block was already true --
+         // it would have vetoed the live reversal on its own arming close.
+         bool isBroken =
+            (b.type == BLOCK_SUPPORT && close1 < b.bottom - ATRBufferBreak * atrNow) ||
+            (b.type == BLOCK_RESISTANCE && close1 > b.top + ATRBufferBreak * atrNow);
          if(isBroken)
            {
             if((high1 - low1) > (2.0 * atrNow))
@@ -678,9 +652,6 @@ private:
               }
             if(momentum || fvg)
               {
-               m_blocks[i] = b;   // persist isArmed before conversion decision
-               if(TryConvertToReversal(i, momentum ? InpRevMom : InpRevFvg,
-                                       momentum ? VETO_MOMENTUM : VETO_FVG)) continue;
                SetVeto(i, momentum ? VETO_MOMENTUM : VETO_FVG);
                continue;
               }
@@ -716,13 +687,12 @@ private:
             double calcSLDist = b.blockHeight + (0.5 * atrNow);
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
             // Intra-bar twin of the Update() projection above — same
-            // phase-aware mapped direction.
+            // unconditional mapped direction.
             bool   isLong = (BlockDirection(b) == DIR_LONG);
-            // v5.34 Part 2 - same Phase 2 entry anchor as the Update() projector
-            // above, so both intra-bar and bar-close vetoes judge one price.
-            if(InpShiftReversalEntry && b.touches >= 1)
-               calcEntry = (b.type == BLOCK_RESISTANCE) ? (b.bottom - calcSLDist)
-                                                        : (b.top + calcSLDist);
+            // v5.34 Part 2 used to re-anchor this projection to the Phase 2
+            // outer-boundary entry. v5.52 has no Phase 2: calcEntry() already
+            // holds the single front edge, so both intra-bar and bar-close
+            // vetoes judge one price with no shift.
             double target = isLong ? calcEntry + tpRR * calcSLDist
                                    : calcEntry - tpRR * calcSLDist;
             if(b.hasPlacedOrder && b.localTP > 0)
@@ -731,7 +701,6 @@ private:
             bool hit = isLong ? (high0 >= target) : (low0 <= target);
             if(hit)
               {
-               if(TryConvertToReversal(i, InpRevFrontRun, VETO_FRONTRUN)) continue;
                SetVeto(i, VETO_FRONTRUN);
                continue;
               }
@@ -740,7 +709,6 @@ private:
          // 6-Day near-miss expiry re-check (harmless within a bar)
          if(InpUseNearMissVeto && b.anchorDay > 0 && (marketDay - b.anchorDay) >= 6)
            {
-            if(TryConvertToReversal(i, InpRevNearMiss, VETO_NEARMISS)) continue;
             SetVeto(i, VETO_NEARMISS);
             continue;
            }
@@ -1147,62 +1115,17 @@ public:
      }
 
    //+------------------------------------------------------------------+
-   //| CLUSTER SYNC (v5.34 Part 3) — propagate a Phase 2 promotion to   |
-   //| every PHASE 1 sibling that shares territory.                     |
+   //| CLUSTER SYNC — RETIRED (v5.52).                                  |
    //|                                                                  |
-   //| When the OrderManager consumes Touch 1 on `originIndex` (its      |
-   //| touches just became 1) the reclaimed zone trades as a REVERSAL.   |
-   //| Any OTHER live, same-polarity block (touches==0) whose range      |
-   //| intersects the origin is the SAME reclaim seen twice, so it is    |
-   //| promoted in lockstep: touches -> 1, reset to a clean unarmed      |
-   //| reversal candidate, and any resting Phase 1 order is cancelled.   |
-   //| Without this the twin would keep fading the very level the origin |
-   //| is now reversing against.                                        |
-   //|                                                                  |
-   //| A block whose touches != 0 is a Phase 2 peer already handled (its |
-   //| own sync), so it is skipped — this cannot cascade. Returns the     |
-   //| count of siblings promoted.                                       |
+   //| v5.34 Part 3 promoted every same-territory Phase 1 sibling to    |
+   //| Phase 2 the moment one of them was reclaimed, so a reclaim seen  |
+   //| twice would not leave a twin still fading the level. With the    |
+   //| two-phase engine gone there is no promotion and no fading twin --|
+   //| every zone now trades the SAME unconditional continuation -- so  |
+   //| the helper's two callers are gone with it. Removed rather than   |
+   //| left inert: an unreferenced cluster sync is a silent invitation to|
+   //| re-wire the fade.                                                |
    //+------------------------------------------------------------------+
-   int               SyncReversalCluster(int originIndex)
-     {
-      if(originIndex < 0 || originIndex >= m_blockCount) return 0;
-      if(m_blocks[originIndex].touches < 1)              return 0;   // origin not Phase 2
-
-      SSniperBlock origin = m_blocks[originIndex];   // copy — no struct reference
-      int promoted = 0;
-
-      for(int j = 0; j < m_blockCount; j++)
-        {
-         if(j == originIndex)                  continue;
-         if(m_blocks[j].touches != 0)          continue;   // Phase 2 peer -> skip
-         if(m_blocks[j].type != origin.type)   continue;   // same polarity only
-         if(m_blocks[j].isVetoed)              continue;
-         if(m_blocks[j].deleteOnBarTime > 0)   continue;   // already leaving
-
-         // Same-territory test: ranges must intersect. This is the standard
-         // t1 >= b2 && b1 <= t2 test and is identical to HasTerritoryOverlap().
-         bool overlaps = (origin.top >= m_blocks[j].bottom && origin.bottom <= m_blocks[j].top);
-         if(!overlaps) continue;
-
-         SSniperBlock sib = m_blocks[j];   // copy — persist before the cancel request
-         sib.touches        = 1;           // Phase 2 (Touch 1 consumed)
-         sib.conversionReason = VETO_NONE; // v5.36: Phase 2 reached normally — NOT a veto conversion
-         sib.isArmed        = false;
-         sib.isTriggered    = false;
-         sib.hasPlacedOrder = false;
-         sib.hasExited      = false;
-         sib.deleteOnBarTime = 0;
-         m_blocks[j] = sib;
-         RequestCancel(j);                 // drop any resting Phase 1 order
-
-         if(EnableLogging)
-            Print("[Block] CLUSTER SYNC #", sib.serial,
-                  " (", (sib.type == BLOCK_SUPPORT ? "SUP" : "RES"), ")",
-                  " -> Phase 2 continuation (origin #", origin.serial, ")");
-         promoted++;
-        }
-      return promoted;
-     }
 
    //+------------------------------------------------------------------+
    //| HIVE-MIND: deletes all blocks of a given type (tie-breaker).   |
