@@ -231,14 +231,15 @@ check("the body reports the hybrid pending count",
       BODY is not None and "CountMyPendingOrders()" in BODY)
 
 # ----------------------------------------------------------------------
-# 6b. v5.51 Part 3 -- the R/C phase label per ARMED setup
+# 6b. v5.51 Part 3 -- the per-setup label in the HOURLY report
 # ----------------------------------------------------------------------
-# The report must name whether each armed setup is a Reversal (touches == 0)
-# or a Continuation (touches >= 1), reading the BLOCK rather than the order
-# comment so the phase is visible BEFORE the setup fills. This is the same
-# R/C vocabulary the arm/retag paths stamp on the live order (v5.41/v5.51),
-# rendered here from the live block book.
-print("\n-- R/C phase label per armed setup (v5.51 Part 3) --")
+# v5.52 collapsed the R/C phase to ONE constant: every armed setup is the same
+# continuation (a breakout above resistance / breakdown below support), so the
+# report no longer discriminates on a touch count -- the field is gone from the
+# tree. The per-serial walk is KEPT because it still proves each armed order
+# resolves to a live block, and an unresolved one must degrade to a VISIBLE
+# UNKNOWN rather than a blank.
+print("\n-- Per-setup label in the hourly report (v5.51 Part 3) --")
 
 check("the report walks the live virtual book (armed setups)",
       BODY is not None and "m_virtualOrders" in BODY and "m_virtualCount" in BODY)
@@ -246,10 +247,11 @@ check("it re-resolves each armed setup's block by SERIAL, not by index",
       BODY is not None and "FindBlockIndexBySerial(" in BODY)
 check("it reads the block snapshot it just resolved",
       BODY is not None and re.search(r"GetBlockAt\s*\(\s*bIdx\s*,", BODY) is not None)
-check("the R/C discriminator is the block's touch count",
-      BODY is not None and re.search(r"b\.touches\s*==\s*0", BODY) is not None)
-check("the Reversal label is spelled out",
-      BODY is not None and "R (S/R Reversal)" in BODY)
+check("the label is the constant continuation (v5.52)",
+      BODY is not None and
+      re.search(r'phaseLabel\s*=\s*"C \(Continuation\)"', BODY) is not None)
+check("the old touch-count discriminator is gone",
+      BODY is not None and "b.touches" not in BODY)
 check("the Continuation label is spelled out",
       BODY is not None and "C (Continuation)" in BODY)
 check("an unresolved block degrades to a visible UNKNOWN, never a blank",

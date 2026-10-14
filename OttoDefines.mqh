@@ -59,7 +59,7 @@ enum ENUM_VETO_REASON
    VETO_SIZING,             // h > (1.5*ATR) or h < (0.1*ATR)
    VETO_NO_SEPARATION,      // No candle strictly outside the zone between W1 & W2
    VETO_MOMENTUM,           // (high-low) > 3.5*ATR in the last 8 bars
-   VETO_FVG,                // Fair-value-gap present in the last 8 bars
+   VETO_FVG,                // Fair Value Gap (FVG) present in the last 8 bars
    VETO_STALE,              // 45 market days from W1 without an entry
    VETO_FRONTRUN,           // InpMaxRR target hit before entry
    VETO_NEARMISS,           // 6 market days in the proximity zone without entry
@@ -76,7 +76,9 @@ enum ENUM_VETO_REASON
 enum ENUM_ENTRY_STYLE
   {
    ENTRY_MIDPOINT  = 0,     // entry = (top+bottom)/2
-   ENTRY_FRONT_EDGE = 1     // support: top | resistance: bottom
+   ENTRY_FRONT_EDGE = 1     // FAR edge the price breaks out through:
+                            //   support zone (-> SHORT): bottom
+                            //   resistance zone (-> LONG): top
   };
 
 // Pine sim_sentiment simulation input
@@ -141,10 +143,12 @@ struct SSniperBlock
    // phase branches, and the one-shot latch that actually refuses a duplicate
    // tranche is isTriggered / hasPlacedOrder (set on the fill, cleared only by
    // block deletion), so the field carried dead weight and a false comment.
-   // v5.36: why this zone was promoted to a Phase 2 reversal — the convertible
-   // veto that triggered the conversion. VETO_NONE when the block reached
-   // Phase 2 normally (or never did). Zeroed by ZeroMemory() at every
-   // block-creation site, so a fresh block reads VETO_NONE.
+   // v5.36: why this zone was promoted to a Phase 2 reversal — VESTIGIAL, no
+   // longer written. The v5.52 pure-continuation engine has no second phase to
+   // promote a block INTO, so nothing sets this field any more and nothing reads
+   // it. Kept as a struct member so the SSniperBlock layout and the ZeroMemory()
+   // reset at every block-creation site are unchanged; a fresh or reused block
+   // therefore reads VETO_NONE.
    ENUM_VETO_REASON  conversionReason;
 
    // --- Order data (Pine: local_sl / local_tp / local_entry / rr_unit / trade_id) ---

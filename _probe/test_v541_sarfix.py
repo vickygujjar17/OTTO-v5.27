@@ -12,11 +12,12 @@ properties of the shipped sources.
      m_activeDirection != newDir, mirroring the virtual trigger's by-construction
      reversal check.
 
-  2. R/C COMMENT TAG (physical). PlaceOrArmOrder() ROUTE A now stamps the
-     block's Phase marker ("R" = Phase 1 S/R reversal bounce / "C" = Phase 2
-     trend continuation) into the resting broker limit's MT5 comment, so a
-     terminal row names its phase exactly as the virtual MARKET leg already
-     does.
+  2. CONTINUATION COMMENT TAG (physical). PlaceOrArmOrder() ROUTE A stamps a
+     CONSTANT continuation marker ("_C_P") into the resting broker limit's MT5
+     comment. v5.52 dropped the phase branch with the two-phase engine: every
+     entry is the single continuation (a breakout above resistance / a
+     breakdown below support), so the marker is a literal, exactly as the
+     virtual MARKET leg writes "_C".
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -134,19 +135,20 @@ print("\n-- Physical route R/C comment tag --")
 
 check("PlaceOrArmOrder located", ROUTER is not None)
 
-# The phase local must be derived from the block's touch count: a block's
-# FIRST fill (touches == 0) is the Phase 1 "R"eversal (S/R bounce), each
-# later fill (touches >= 1) the Phase 2 "C"ontinuation.
-check("phase local is derived from block.touches",
+# v5.52: the tag is CONSTANT -- a block's entry is the single continuation (the
+# breakout / breakdown) and the phase branch dropped with the two-phase engine,
+# so "_C_P" is written as a literal rather than derived from a touch counter.
+# The obsolete touches-derived phase local must NOT come back.
+check("no touches-derived phase local remains in the router",
       ROUTER is not None and
-      re.search(r'string\s+phaseType\s*=\s*\(\s*block\.touches\s*==\s*0\s*\)'
-                r'\s*\?\s*"R"\s*:\s*"C"\s*;', ROUTER) is not None)
+      re.search(r"string\s+phaseType\s*=", ROUTER) is None)
 
-# The physical comment must carry the phase marker between the session id and
-# the "_P" (physical) flag.
-check("physical comment embeds the R/C phase tag",
+# The physical comment must carry the continuation marker between the session id
+# and the "_P" (physical) flag.
+check("physical comment embeds the continuation tag",
       ROUTER is not None and
-      'ClampOrderComment(armSessionId + "_" + phaseType + "_P")' in ROUTER)
+      re.search(r'ClampOrderComment\s*\(\s*armSessionId\s*\+\s*"_C_P"\s*\)',
+                ROUTER) is not None)
 
 # The untagged shape must be gone, else a build could silently ship the old
 # comment even though the local is declared.
