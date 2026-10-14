@@ -1,0 +1,150 @@
+553: one entry, one block -- the lifecycle now retires what it fills
+
+v5.52 retired the two-phase MACHINERY but left the ORDER LIFECYCLE treating a
+filled block as reusable. Both fill paths CLEARED isTriggered / hasPlacedOrder
+and zeroed deleteOnBarTime after the entry filled, so a block that had already
+fired its one continuation entry stayed alive -- and re-armable -- until the
+funnel eventually aged it out. v5.53 makes the lifecycle match the engine it
+serves: a block fires its ONE continuation entry and is RETIRED ON THE SPOT.
+
+CORRECTION: what actually guards a duplicate tranche
+
+_commit552.txt (and the SSniperBlock comment it justified) claimed the pivot had
+to KEEP block.touches because "the v5.28 one-tranche-per-block shield reads it".
+That claim was false on both counts, and this commit corrects it:
+
+  * NOTHING READ IT. Every remaining reference was a comment. The counter was
+    written (+= 1) at two sites and read by no live code anywhere in the tree.
+  * THE REAL SHIELD IS THE LATCH, and always was. What refuses a second tranche
+    is isTriggered / hasPlacedOrder -- the same flags the arm path tests -- plus
+    CanPlaceForDirection() for the same-direction case, which keys off the LIVE
+    BASKET, not the block.
+
+So v5.53 SETS the latch on the fill (making the one-entry promise actually
+enforced, now that no phase cursor is left to encode it) and DELETES the dead
+counter. That also closes the ported bug of 2026-05-06, where a resting limit
+could be re-placed on the NEXT TICK after its fill and take a second position:
+the fill path used to clear the very flag that would have stopped it.
+
+THE TWO CORRECTIVE EDITS (one transform, both execution routes)
+
+  COttoOrderManager::CheckPendingOrderFills()  -- the PHYSICAL limit filled
+  COttoOrderManager::CheckVirtualTriggers()    -- the VIRTUAL level crossed
+
+  before                              after
+  ------                              -----
+  touches += 1;                       (field deleted)
+  limitOrderTicket   = 0;             limitOrderTicket   = 0;
+  pendingOrderCancel = false;         pendingOrderCancel = false;
+  priceAbortLogged   = false;         priceAbortLogged   = false;
+  isTriggered        = false;   -->   isTriggered        = true;
+  hasPlacedOrder     = false;   -->   hasPlacedOrder     = true;
+  isArmed            = false;         isArmed            = false;
+  hasExited          = false;         hasExited          = false;
+  deleteOnBarTime    = 0;       -->   deleteOnBarTime    = iTime(m_symbol, PERIOD_CURRENT, 0);
+
+deleteOnBarTime is stamped from the CURRENT bar, so COttoBlockManager::
+ProcessBlocks deletes the block once iTime(0) moves on -- Pine's own
+delete_on_bar semantics, which is the retirement v5.52's pivot prose claimed
+but never wired. isArmed and hasExited keep their cleared values; they are
+inert on a latched block. Cancelling the consumed pending order is deliberately
+NOT done here (a filled/deleted ticket no longer exists);
+CancelOrdersForInvalidBlocks() owns pending cleanup and stays inert on the
+dying block (limitOrderTicket is 0 and its virtual order was removed), so no
+spurious "Manual" cancellation is journalled.
+
+TWO ORDERINGS DELIBERATELY PRESERVED
+
+  * CheckVirtualTriggers() captures ENUM_TRADE_DIRECTION seedDir BEFORE the
+    retire block mutates the struct, and threads it into
+    SeedActiveTradeFromBlock() AFTER. This was load-bearing in the two-phase
+    build (where the mutation promoted the block to Phase 2) and the test that
+    pins it (test_v548_seed_dir.py) is kept passing by not touching either
+    site. The seed must describe the order that was SENT.
+  * Retirement does not orphan the basket: m_activeTrade.sourceBlockSerial is
+    copied into the struct at seed time and only ever read back as a stored
+    int by BuildOrderComment(), so deleting the block cannot dangle it.
+
+THE PURGE (touches, Option B)
+
+  * SSniperBlock::touches -- field and its 8-line comment DELETED. Safe
+    because SSniperBlock is never raw-serialised: no FileWriteStruct /
+    FileReadStruct / memcpy / sizeof anywhere in the tree (stated at
+    OttoDefines.mqh against the string member, which is why the struct can
+    hold a string at all).
+  * The eight remaining comment references REWRITTEN so no comment names a
+    field that no longer exists -- in OttoDefines.mqh (the zone -> direction
+    banner), COttoBlockManager.mqh (the direction twin and the block-funnel
+    banner), COttoOrderManager.mqh (SeedActiveTradeFromBlock, the hourly
+    phase tag, and both retired fill sites).
+  * The section header above the physical fill path still read "ADVANCE the
+    two-phase lifecycle" directly over code that now RETIRES the block; it is
+    rewritten so the file does not narrate the concept it just stopped
+    implementing.
+
+NOT TOUCHED (deliberately)
+
+  * SSniperBlock::conversionReason -- also vestigial post-v5.52, but it is a
+    separate concern with its own change; not bundled here.
+  * the five InpRev* flags and InpShiftReversalEntry -- kept as DECLARED no-op
+    inputs so a saved .set from a two-phase build still loads.
+
+KNOWN, BENIGN SIDE EFFECT (chosen, not accidental)
+
+  IsBlockedByPrimary() counts isTriggered as alive, so a just-filled block locks
+  out a same-type zone within 3.0*ATR for its single dying bar. That is one bar
+  of extra separation after a fill -- acceptable, and cheaper than teaching the
+  lockout about a latched-dead block.
+
+EXPECTED TEST CHURN (probes are NOT in the release gate)
+
+  Measured, HEAD vs parent 2b99593, on the four probes that pin the pivot:
+
+    test_v540_hybrid     38/41 -> 38/41   UNCHANGED
+    test_v541_sarfix     13/14 -> 13/14   UNCHANGED
+    test_v548_hourly     46/48 -> 46/48   UNCHANGED
+    test_v548_seed_dir   19/21 -> 16/21   +3, all from the deleted increment
+
+  The parent's nine failures are exactly the ones _commit552.txt enumerated, so
+  v5.53 adds three and retires none. All three are in test_v548_seed_dir and all
+  three exist because that probe asserts on the CO-LOCATION of seedDir with the
+  now-deleted `block.touches += 1` line:
+
+    seedDir is captured BEFORE block.touches += 1   <- increment=None
+    the virtual seed call follows the increment it must outlive
+    the physical seed still precedes its touch increment   <- increment=None
+
+  The invariant those assertions exist to protect is STILL verified, and the
+  probe's own statement of it -- "the virtual fill passes seedDir into
+  SeedActiveTradeFromBlock" -- still PASSES, because the ordering was preserved
+  verbatim. What broke is the probe's ability to locate an anchor that no longer
+  exists, not the behaviour it was guarding. Probe housekeeping is tracked
+  separately and deliberately NOT bundled into this commit; build_check.ps1
+  (zero probe references) remains the release gate.
+
+VERIFICATION
+
+  * build_check.ps1 (BARE invocation) : 0 errors / 0 warnings, GATE PASSED,
+    headers verified from the staging tree.
+  * The patch is REPRODUCIBLE: applying _tools/_pivot553.py to HEAD's pristine
+    sources yields byte-identical files (SHA256 per file). All 9 regions are
+    anchored on exact text and must match EXACTLY ONCE (the script aborts
+    otherwise), so it cannot half-apply.
+  * Version: _bump_version.py 5.53 -- all 11 '#property version' stamps plus
+    the banners, description, four input-group labels and the README base. Its
+    trailing "STALE v5.52 REMAINS" census is the EXPECTED, pre-existing
+    false-positive: it flags historical annotations naming the release a
+    feature landed in (the same census fired against v5.51 at the previous
+    bump). The gate itself is build_check.ps1, which does not run the census.
+  * Line endings / encoding: all 11 sources are strict CRLF, zero bare LF,
+    zero bare CR. The only non-ASCII byte delta in the tree is -3 in
+    COttoOrderManager.mqh (201 -> 198), from deleting the single em-dash on the
+    rewritten hourly-report comment; no added line introduces or corrupts a
+    byte.
+  * Post-edit grep: zero occurrences of 'touches' outside one intentional
+    historical mention in the retirement comment itself.
+
+NOT PROVEN HERE: behaviour. The gate proves compilation and the script proves
+the diff; neither can prove that a block now retires when it fills.
+Confirmation is a Strategy Tester run on this branch versus the v5.52
+two-phase baseline.
