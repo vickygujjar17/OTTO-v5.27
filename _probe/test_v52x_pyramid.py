@@ -13,8 +13,11 @@ Pins the behaviour that the MQL5 compiler gate CANNOT exercise:
      the success path, so a rung can neither be re-armed nor skipped.
   4. A successful scale-in raises the shared per-tick guard on every rung, so
      the freshly-filled ticket keeps its protective stop for one tick.
-  5. The ATR trail arms at +1.0R on both directions, read from
-     InpTrailStartRR; InpLock3RRR survives only as a declared-but-unused input.
+  5. The ATR trail arms at +2.0R on both directions, read from
+     InpTrailStartRR (v5.62: that input now gates the ATR formula and the trail
+     tally ONLY); InpLock3RRR survives only as a declared-but-unused input. The
+     sibling +1.0R milestone floor is applied to the basket unconditionally, so
+     retuning the trail's activation R:R can no longer darken the ladder.
   6. The lot-sizing floor is epsilon-safe, so a raw lot that is mathematically
      an exact multiple of the volume step is not silently dropped one step.
   7. The worst SINGLE leg sits inside the SafetyMaxRiskPct per-leg budget, and
@@ -344,26 +347,47 @@ check("no rung ever hands the dynamic ATR trail to AddPyramidTranche",
 
 
 # ----------------------------------------------------------------------
-# 6. The ATR trail arms at +1.0R on BOTH directions, and InpLock3RRR is
-#    no longer read anywhere.
+# 6. The ATR trail arms at +2.0R on BOTH directions, InpLock3RRR is no longer
+#    read anywhere, and (v5.62) InpTrailStartRR gates the ATR formula + tally
+#    ONLY -- never the application of the milestone ladder.
 # ----------------------------------------------------------------------
 TRAIL_RR = num_input(DEFS_T, "InpTrailStartRR")
+BE_RR = num_input(DEFS_T, "InpBreakEvenRR")
 check("InpTrailStartRR exists", TRAIL_RR is not None)
-check("InpTrailStartRR defaults to +1.0R", TRAIL_RR == 1.0, TRAIL_RR)
+check("InpTrailStartRR defaults to +2.0R", TRAIL_RR == 2.0, TRAIL_RR)
 
-# Three live sites read the trail trigger: the LONG arm gate, the SHORT arm
-# gate, and the single-ticket push counter at the bottom of Update().
+# Three live sites still read the trail trigger: the LONG ATR arm gate, the
+# SHORT ATR arm gate, and the single-ticket push counter at the bottom of
+# Update(). The COUNT is unchanged from v5.29 -- what changed in v5.62 is what
+# those gates guard. They now gate the ATR formula and the tally only; the
+# ladder no longer applies through them.
 trail_gates = re.findall(r"if\(currentRR\s*>=\s*InpTrailStartRR\)", TM_T)
-check("the three live trail gates read InpTrailStartRR",
+check("the three live ATR-trail gates read InpTrailStartRR",
       len(trail_gates) == 3, "found %d" % len(trail_gates))
 check("both directions carry an ATR trail formula behind that gate",
       "high0 - (InpTrailATRMultiplier * atr)" in TM_T and
       "low0 + (InpTrailATRMultiplier * atr)" in TM_T)
-check("both trail gates are armed at or before the T2 trigger",
-      None not in (TRAIL_RR, T2_RR) and TRAIL_RR <= T2_RR,
-      "trail@%s T2@%s" % (TRAIL_RR, T2_RR))
-check("the trail/push blocks are skipped on the tick a tranche filled",
-      len(re.findall(r"&&\s*!trancheOpenedThisTick\)", TM_T)) == 3,
+# v5.62: the invariant moves from the (now trail-only) gate to the APPLICATION
+# gate. The ladder is applied unconditionally, and its first live rung is the
+# +1.0R cost-covering breakeven, so what must hold is that breakeven's own
+# trigger sits at or below the T2 scale-in trigger -- otherwise the floor the T2
+# fill relies on would be dark on the very tick the tranche lands (1.0 <= 1.0).
+check("the first ladder rung opens no later than the T2 scale-in trigger",
+      None not in (BE_RR, T2_RR) and BE_RR <= T2_RR,
+      "breakeven@%s T2@%s" % (BE_RR, T2_RR))
+# Positive structural pin on the hoist: the ladder push must hang off the
+# per-tick guard ALONE, and the old fused gate (trail trigger AND guard on the
+# same `if`) must be gone. Comment-stripped, so prose about the old layout
+# cannot satisfy or break either half.
+_TM_CODE6 = re.sub(r"\s+", " ", re.sub(r"//[^\n]*", "", TM_T))
+check("the ladder application is no longer gated on the ATR trail trigger",
+      "if(!trancheOpenedThisTick) { m_orderManager.ApplyUnifiedSL(desiredSL);" in _TM_CODE6
+      and "InpTrailStartRR && !trancheOpenedThisTick) { m_orderManager.ApplyUnifiedSL"
+          not in _TM_CODE6)
+# Two guard sites remain (v5.62): the unconditional ladder block and the
+# single-ticket push. The third v5.29 site was the trail gate, which is gone.
+check("the ladder/push blocks are skipped on the tick a tranche filled",
+      len(re.findall(r"&&\s*!trancheOpenedThisTick\)", TM_T)) == 2,
       "guarded sites: %d" % len(re.findall(r"&&\s*!trancheOpenedThisTick\)", TM_T)))
 check("SyncTradeState classification reads InpTrailStartRR",
       re.search(r"rr\s*>=\s*InpTrailStartRR\)\s*step\s*=\s*", TM_T) is not None)
@@ -489,8 +513,8 @@ check("each rung target sits strictly below its own trigger (descending ladder)"
       None not in (L2_TGT, L3_TGT, L2_TRIG, L3_TRIG) and
       0.0 < L2_TGT < L3_TGT and L2_TGT < L2_TRIG and L3_TGT < L3_TRIG,
       (L2_TGT, L3_TGT, L2_TRIG, L3_TRIG))
-check("breakeven / T2 scale-in / trail all arm on the same +1.0R rung",
-      BE_RR == 1.0 and T2_RR == 1.0 and TRAIL_RR == 1.0,
+check("breakeven / T2 scale-in arm on the +1.0R rung; the ATR trail waits for +2.0R",
+      BE_RR == 1.0 and T2_RR == 1.0 and TRAIL_RR == 2.0,
       (BE_RR, T2_RR, TRAIL_RR))
 
 # --- group B: the floor arithmetic exactly as shipped -----------------
@@ -592,9 +616,9 @@ check("the half-risk rung is HOISTED after the ATR trail in BOTH directions",
 check("the ladder lives in the trade manager only (no second drifted copy)",
       "InpLockProfit2TargetRR" not in OM_N and
       "InpLockProfit2RR" not in OM_N)
-check("the trail gate that re-pushes the basket opens no later than the T2 add",
-      None not in (TRAIL_RR, T2_RR) and TRAIL_RR <= T2_RR,
-      (TRAIL_RR, T2_RR))
+check("the ladder application gate opens no later than the T2 add",
+      None not in (BE_RR, T2_RR) and BE_RR <= T2_RR,
+      (BE_RR, T2_RR))
 
 
 # --- group D: the legacy half-risk rung stays contained ----------------
@@ -669,9 +693,10 @@ check("the T2/T3/T4 scale-in hands its protective floor to the market order",
       "AddPyramidTranche(4, t4Floor)" in TM_N)
 check("session SL only advances once a stop is live at the broker",
       "if(anyApplied) { m_sessionSL = newSL;" in OM_N)
-check("PM note: the ladder push is nested under the trail gate, so keep "
-      "InpTrailStartRR <= InpPyramidT2RR or the +1.0R floor goes dark",
-      None not in (TRAIL_RR, T2_RR) and TRAIL_RR <= T2_RR)
+check("PM note (v5.62): the ladder push is UNCONDITIONAL, so the +1.0R floor can "
+      "no longer go dark by retuning InpTrailStartRR; the rung that must still "
+      "open no later than the T2 add is InpBreakEvenRR",
+      None not in (BE_RR, T2_RR) and BE_RR <= T2_RR)
 
 
 # ----------------------------------------------------------------------

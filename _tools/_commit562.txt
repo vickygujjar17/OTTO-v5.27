@@ -1,0 +1,207 @@
+562: feat — split the milestone ladder from the ATR trail gate, arm the trail at +2.0R
+
+RATIONALE
+
+  v5.61 left the milestone ladder wired in series with the ATR trail: the single
+  gate `if(currentRR >= InpTrailStartRR && !trancheOpenedThisTick)` did not just
+  arm the ATR formula, it was the ONLY place the computed basket stop was pushed
+  by ApplyUnifiedSL(). Because the ladder's first rung is the +1.0R
+  cost-covering breakeven, InpTrailStartRR was therefore the de facto activation
+  R:R of the WHOLE ladder -- even though it is named and documented as the
+  trail's input.
+
+  That coupling made the input impossible to retune. Raising InpTrailStartRR to
+  2.0 to delay the trail would have silenced the +1.0R breakeven floor as well,
+  leaving a winner between +1.0R and +2.0R wearing its ORIGINAL -1.0R stop.
+
+SOURCE
+
+  COttoTradeManager.mqh -- Update(), hoist (1 site)
+    The application of the ladder is lifted out of the trail gate into its own
+    unconditional block:
+
+      - if(currentRR >= InpTrailStartRR && !trancheOpenedThisTick)
+      + if(!trancheOpenedThisTick)
+
+    The ApplyUnifiedSL(desiredSL) call and the v5.15 SetActiveTradeSL() mirror
+    move with it. `&& !trancheOpenedThisTick` is RETAINED: it is what stops a
+    stop write racing the broker's confirmation of a ticket filled on that same
+    tick -- the v5.14/v5.20 INVALID_STOPS / instant-stopped-out failure mode.
+
+    This is safe by construction, not by luck. desiredSL is seeded from
+    trade.currentTrailSL (the live stop) and, for a multi-tranche basket, from
+    GetSessionSL(). ApplyUnifiedSL() is a strict one-way ratchet
+    (`if(isLong && newSL <= m_sessionSL) return;` and its SHORT mirror), and
+    m_sessionSL is seeded at InitBasket(). So on any tick below every milestone
+    desiredSL EQUALS the stop already live and the ratchet returns early: zero
+    broker writes. The hoist changes WHEN the stop may be pushed, never WHICH
+    stop is chosen -- the in-branch rungs still each keep their own Inp*RR gate.
+
+  COttoTradeManager.mqh -- ATR formula gates kept (2 sites, unchanged text)
+    Both `if(currentRR >= InpTrailStartRR)` arms (LONG high0 - mult*atr, SHORT
+    low0 + mult*atr) are untouched. They now govern the ATR FORMULA only; the
+    value they raise into desiredSL is carried by the unconditional block.
+
+  OttoDefines.mqh -- InpTrailStartRR 1.0 -> 2.0
+  OttoDefines.mqh -- InpTrailStartRR re-documented as the ATR-trail-only input;
+  the v5.29 InpLock3RRR note rewritten to say "ATR trail gates" and to record
+  the split; the STEP PROFIT LOCK ladder note now states that every floor is
+  applied unconditionally behind its own trigger.
+
+  COttoTradeManager.mqh -- InpTrailStartRR now has exactly three live reads:
+  the two ATR formulas above and the m_trailActivations tally. The tally is the
+  third read precisely because a single-ticket ModifySL() inside `currentRR >=
+  InpTrailStartRR` may have been driven by the ladder rather than the trail;
+  counting those as trail activations would overstate the trail. Comment
+  truth-ups at the tranche guard (:221-230), the LONG/SHORT trail arms
+  (:280-286, :339-341), the T2/T3 notes (:365-370, :474-476), the single-ticket
+  push (:559-563) and the SyncTradeState classifier (:609-616).
+
+RISK LADDER (unchanged, v5.61 values restated for the record)
+
+  T1 1.0% RiskPercent at market | T2 1.0% at +1.0R | T3 0.5% at +2.0R |
+  T4 0.25% at +3.0R -- sum 2.75% of equity with all four legs live.
+  SafetyMaxRiskPct (1.5%) remains a PER-LEG abort threshold, not a basket-sum
+  cap; AuditRiskExposure() tracks peakRiskPct -- the worst single leg -- and on
+  this ladder that peak is 1.0%.
+
+UNIFIED-SL PROGRESSION (the ladder the hoist makes unconditional)
+
+  below +1.0R            original -1.0R stop
+  at    +1.0R            cost-covering breakeven (entry +/- beOffset)   [unchanged]
+  at    +2.0R            stop -> +1.0R lock rung                        [unchanged]
+  at    +3.0R            stop -> +2.0R lock rung                        [unchanged]
+  from  +2.0R onward     ATR trail also armed, tighter-of-the-two wins  [CHANGED]
+
+  The one behavioural delta is the ATR gap: between +1.0R and +2.0R the stop is
+  carried by the milestone floors with NO ATR component. This is intentional --
+  a wide-ATR chop in that band can no longer pull the stop in behind the +1.0R
+  floor. Above +2.0R the trail behaves exactly as it did from +1.0R in v5.61.
+
+PROBES
+
+  _probe/test_v52x_pyramid.py          135 / 135  (was 134 / 134)
+    * section 6 retitled; pins TRAIL_RR == 2.0 and restates the three live
+      InpTrailStartRR reads as the ATR formula + tally, explaining why the count
+      is still 3 while what those gates guard has changed.
+    * NEW positive structural pin: the ladder push must hang off
+      `if(!trancheOpenedThisTick) { m_orderManager.ApplyUnifiedSL(desiredSL);`
+      and the old fused `InpTrailStartRR && !trancheOpenedThisTick)` push must be
+      gone. Comment-stripped, so prose describing the old layout can neither
+      satisfy nor break it.
+    * re-scoped invariant x3 plus the group-A trio: the "trail arms at or before
+      the T2 add" claim is now the correct one -- BE_RR <= T2_RR (1.0 <= 1.0),
+      since the first live rung the T2 fill relies on is the +1.0R breakeven,
+      not the trail. The trio pin becomes BE 1.0 / T2 1.0 / TRAIL 2.0.
+    * guard-site count 3 -> 2: the unconditional ladder block and the
+      single-ticket push. The third v5.29 site was the fused trail gate, now gone.
+
+  _probe/_mutate_ms_milestones.py      14 / 14 caught, 0 anchors skipped
+    The v5.61 anchor `"InpTrailStartRR = 1.0;"` became a DEAD anchor at the new
+    default of 2.0 -- it would have degraded silently to SKIPPED, quietly losing
+    coverage of "the +1.0R floor goes dark". Re-anchored onto the application
+    gate: `"if(!trancheOpenedThisTick)"` ->
+    `"if(currentRR >= InpLockProfit2RR && !trancheOpenedThisTick)"`. That mutant
+    re-opens the exact gap this release closes, and is CAUGHT.
+
+  _probe/_mutate_v532_pyramid.py       44 / 44 caught, 0 anchors skipped
+    Was 40 / 40 with 3 anchors SKIPPED and 1 mutant MISSED. Two independent
+    defects, both now repaired:
+
+    * DEAD ANCHORS (3). The release rows were hand-stamped
+      `'#property version   "5.32"'`, `"OTTO EA v5.32"`,
+      `"Master Build Port (v5.32)"`. None of those literals has been in the tree
+      since v5.32, so all three rows degraded to SKIPPED -- the harness printed
+      39 caught / 40 attempted and reported them as `<- anchor not found`, which
+      reads like an anchor problem rather than the three missing version
+      assertions it is. Fixed the way v5.31 already fixed it: the live stamp is
+      read out of OttoDefines.mqh at startup (`resolve_release()`) and the three
+      rows are BUILT from it, so they follow the release instead of rotting.
+      Also added the missing `RESOLVED is None -> ABORT` guard, so an
+      unresolvable stamp can no longer drop version coverage silently.
+
+    * MISSED MUTANT (1). "stored ticket value never deleted (GV leak)" SURVIVED:
+      editing the shipped `GlobalVariableDel(tName);` away still saw the probe
+      pass. The check it targeted counted `GlobalVariableDel` FILE-WIDE
+      (`len(re.findall(r"GlobalVariableDel", OM_T)) >= 2`), but the file has four
+      delete sites (two in ClearBasketR, two more in the virtual-arm teardown),
+      so removing either ClearBasketR delete left the count at 3 and the check
+      green. A file-wide count cannot pin a specific delete. The check is now
+      scoped to the ClearBasketR body with the probe's existing `brace_body()`
+      helper and pins BOTH deletes by name -- `GlobalVariableDel(name);` and
+      `GlobalVariableDel(tName);`. This STRENGTHENS an existing check in place
+      rather than adding one, so test_v532_pyramid.py is still 87 / 87 and the
+      GATES row below stays accurate.
+
+    * The now-verified fourth delete is covered by one new row ("stored R value
+      never deleted (BASKETR GV leak)", mutating `GlobalVariableDel(name);`),
+      which is why the denominator moved 40 -> 44: 3 re-anchored + 1 new.
+
+  _probe/_mutate_v533_adoptmanual.py   54 / 54 detected, 0 problems
+    Was 51 caught with 3 anchors reported as `found 0 times`. All three are the
+    same rot as above, none is a lost assertion:
+
+    * D5 and I2 both anchored on the adjacent pair
+      `"      CompleteReversal();\n      CheckPendingOrderFills();\n"`. v5.40
+      inserted a three-line comment block between those two calls (documenting
+      the physical-route fill scan), so the pair is no longer adjacent. D5 now
+      anchors on the still-unique `"      CompleteReversal();\n"` line; I2
+      anchors on the still-adjacent `EmitHourlyStatusReportIfDue()` +
+      `CompleteReversal()` pair directly above it. Both replacements still move
+      the sweep AHEAD of the fill detection -- the same invariant, applied to
+      the layout the tree actually has.
+
+    * J6 was hand-stamped `"Master Build Port (v5.33)"`, dead since v5.34. Now
+      built from the same `resolve_release()` reading of OttoDefines.mqh.
+      J4 / J5 stay literal: they mutate only the version-agnostic PREFIX of
+      their labels, so they were never version-anchored.
+
+NOT PROVEN HERE
+
+  Behaviour. The probes above are static source assertions plus an arithmetic
+  model; no Strategy Tester run accompanies this commit. The claim that the
+  hoist produces zero extra broker writes below every milestone rests on the
+  ApplyUnifiedSL() ratchet being a strict one-way comparison, read line by line,
+  and on m_sessionSL being seeded before the first Update() -- not on an
+  observed tick-by-tick trace.
+
+VERSION 5.61 -> 5.62 (_tools/_bump_version.py 5.62)
+
+  20 human-facing rows rewritten (11 #property version stamps, the otto.mq5 Pine
+  port banner and startup Print, the OttoDefines banner and description, the four
+  versioned input-group labels, README "Current base"). The historical
+  `FIX (v5.61)` markers in OttoDefines.mqh and COttoTradeManager.mqh are exempt
+  by design and are intentionally preserved. No v5.61 literal remains outside
+  them; exit 0.
+
+GATES
+
+  * build_check.ps1 -NoDeploy : 0 errors / 0 warnings, GATE PASSED, headers
+    verified from the staging tree.
+  * test_v52x_pyramid.py 135/135 | test_v532_pyramid.py 87/87 |
+    test_v527_exit_comment.py 60/60 | _mutate_ms_milestones.py 14/14 caught.
+  * Harness repairs (see PROBES): _mutate_v532_pyramid.py 44/44 caught with
+    0 anchors skipped; _mutate_v533_adoptmanual.py 54/54 detected, 0 problems.
+    Both were RED on the v5.62 tree before this repair (40/40 with 3 anchors
+    skipped and 1 mutant survived; 51 caught with 3 dead anchors). The repair
+    itself changes NO shipped MQL5 source -- it touches only the two harnesses
+    and one check in test_v532_pyramid.py. The MQL5 edits listed under SOURCE
+    are this release's feature, not the repair.
+  * Census 23 GREEN / 4 RED across 27 probes. The four reds are pre-existing and
+    byte-identical to the 0776575 baseline: test_v528_hotfix 57/68,
+    test_v531_smart_trim 15/38, test_v532_hightable 125/135, test_v543_session
+    27/29. None reads a path edited here.
+  * Encoding: scan_encoding.ps1 clean; normalize_eol.py . --check rewritten 0,
+    strict CRLF preserved; verify_integrity.py INTEGRITY OK with the 3973
+    non-ASCII bytes in OttoDefines.mqh intact (box-drawing borders, em-dashes).
+
+ROLLBACK
+
+  pre-commit : git checkout -- COttoTradeManager.mqh OttoDefines.mqh
+                             _probe/test_v52x_pyramid.py
+                             _probe/_mutate_ms_milestones.py
+                             _probe/_mutate_v532_pyramid.py
+                             _probe/test_v532_pyramid.py
+                             _probe/_mutate_v533_adoptmanual.py
+                             _tools/_commit562.txt
+  post-commit: git reset --soft HEAD~1

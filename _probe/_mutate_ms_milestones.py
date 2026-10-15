@@ -60,9 +60,15 @@ MUTATIONS = [
      "InpLockProfit2TargetRR = 1.0;", "InpLockProfit2TargetRR = 0.5;"),
     ("rung-3 floor reverted to +1.0R", "OttoDefines.mqh",
      "InpLockProfitTargetRR = 2.0;", "InpLockProfitTargetRR = 1.0;"),
-    ("trail gate raised above the first ladder rung (gap: +1.0R floor goes dark)",
-     "OttoDefines.mqh",
-     "InpTrailStartRR = 1.0;", "InpTrailStartRR = 2.0;"),
+    # v5.62: the trail gate no longer carries the ladder, so raising
+    # InpTrailStartRR (the v5.61 anchor) would be a no-op against the +1.0R floor
+    # and the mutation would silently degrade to SKIPPED. Re-anchored onto the
+    # APPLICATION gate: raising the unconditional ladder block's trigger to the
+    # +2.0R rung still darkens the +1.0R floor, which is the failure this
+    # mutation exists to catch.
+    ("ladder application gate raised above the first rung (gap: +1.0R floor goes dark)",
+     "COttoTradeManager.mqh",
+     "if(!trancheOpenedThisTick)", "if(currentRR >= InpLockProfit2RR && !trancheOpenedThisTick)"),
     ("breakeven floor loses the friction offset", "COttoTradeManager.mqh",
      "double beSL = primaryEntry + beOffset;", "double beSL = primaryEntry;"),
     ("LONG floor ratchet made two-way (stop can move backwards)",

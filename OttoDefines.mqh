@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.61 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.62 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.61"
-#property description "OTTO v5.61 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.62"
+#property description "OTTO v5.62 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -323,14 +323,28 @@ input group "  [5] EXIT & TRAILING (Pine half_risk_rr / be_rr / trail_rr)"
 input group "══════════════════════════════════════════════════"
 input double   InpCutRiskRR   = 1.0;         // Cut Risk in Half at R:R
 input double   InpBreakEvenRR = 1.0;         // Move to Cost-Covering Breakeven at R:R
-input double   InpTrailStartRR = 1.0;        // Dynamic ATR trail activation R:R
+input double   InpTrailStartRR = 2.0;        // Dynamic ATR trail activation R:R
 // v5.29: InpLock3RRR is SUPERSEDED. Every live read of it in COttoTradeManager
-// (both trail gates, both single-ticket push guards and the SyncTradeState
-// classification) was repointed to InpTrailStartRR, because the trail is now a
-// risk-management tool that must arm at +1.0R rather than waiting for the same
-// +3.0R step at which the pyramid reaches full size. The input is retained so
-// saved .set files keep loading without an "unknown input" mismatch; MQL5
-// emits no warning for an unused input, so it costs nothing.
+// (both ATR trail gates, both single-ticket push guards and the SyncTradeState
+// classification) was repointed to InpTrailStartRR, because the trail is a
+// risk-management tool and must not wait for the same +3.0R step at which the
+// pyramid reaches full size. The input is retained so saved .set files keep
+// loading without an "unknown input" mismatch; MQL5 emits no warning for an
+// unused input, so it costs nothing.
+// FIX (v5.62): this input now gates the DYNAMIC ATR TRAIL ONLY -- the ATR
+// formula on each branch plus the m_trailActivations tally. The milestone
+// ladder (the +1.0R cost-covering breakeven floor, the +2.0R lock rung and the
+// +3.0R lock rung) is applied to the basket UNCONDITIONALLY by its own block
+// in Update(). It used to be nested inside this gate, which made
+// InpTrailStartRR the de facto activation R:R of the whole ladder: raising it
+// 1.0 -> 2.0 under that old layout would have darkened the +1.0R floor
+// (contradicting the 1R ladder documented below) instead of merely delaying
+// the trail. The gate and the ladder are now separate concerns.
+// The resulting +1.0R -> +2.0R ATR gap is INTENTIONAL: for that one R of open
+// profit the stop is carried by the milestone floors alone, with no ATR
+// component, so a wide-ATR chop between +1.0R and +2.0R cannot pull the stop
+// in behind the +1.0R floor. The trail still takes over before the +2.0R lock
+// rung does.
 input double   InpLock3RRR      = 3.0;        // SUPERSEDED by InpTrailStartRR (retained for .set compatibility)
 // v5.27 STEP PROFIT LOCK. When price reaches InpLockProfitRR, the stop is
 // ratcheted forward to InpLockProfitTargetRR (expressed in R, measured from
@@ -350,6 +364,11 @@ input double   InpLock3RRR      = 3.0;        // SUPERSEDED by InpTrailStartRR (
 // only ever move the stop BACKWARDS, and the one-way ratchet in
 // ApplyUnifiedSL() would silently refuse it. Keep every trigger strictly above
 // its own target.
+// FIX (v5.62): every floor above is applied to the basket UNCONDITIONALLY
+// (subject only to the shared per-tick tranche guard), each behind its own
+// Inp*RR trigger. They are NOT gated on InpTrailStartRR -- that input arms the
+// ATR trail alone. Reading the ladder and the trail as one milestone is what
+// previously tied the +1.0R floor to the trail's activation R:R.
 input double   InpLockProfit2RR       = 2.0; // Step profit lock rung 2 trigger (+2.0R)
 input double   InpLockProfit2TargetRR = 1.0; // Step profit lock rung 2 target: lock SL at +1.0R
 input double   InpLockProfitRR       = 3.0;  // Step profit lock trigger (+3.0R)
@@ -382,7 +401,7 @@ input double   SafetyDailyDDLimit  = 3.0;     // Soft breach: pause new orders a
 input double   SafetyTotalDDLimit  = 5.0;     // Hard breach: close all + halt at this % (Trailing)
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.61"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.62"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart
@@ -394,7 +413,7 @@ input int      InpAnchorTF           = PERIOD_H1;  // Anchor candle timeframe (H
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
 
 input group "══════════════════════════════════════════════════"
-input group "  [10] HIGH TABLE AUDITOR — v5.61"
+input group "  [10] HIGH TABLE AUDITOR — v5.62"
 input group "══════════════════════════════════════════════════"
 // Decoupled watchdog: audits live state on its OWN timer cadence rather
 // than inside OnTick, so a halted / paused / tick-starved trade loop can
@@ -404,7 +423,7 @@ input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
 input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
 
 input group "══════════════════════════════════════════════════"
-input group "  [11] MANUAL TRADE ADOPTION — v5.61"
+input group "  [11] MANUAL TRADE ADOPTION — v5.62"
 input group "══════════════════════════════════════════════════"
 // Let this EA manage positions opened BY HAND on its own chart symbol.
 // A manual position is identified as a MAGIC-0 position on m_symbol: the
@@ -421,7 +440,7 @@ input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual
 
 //+------------------------------------------------------------------+
 input group "══════════════════════════════════════════════════"
-input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.61"
+input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.62"
 input group "══════════════════════════════════════════════════"
 // v5.34 built five switches that let a vetoed Phase 1 setup be re-used as a
 // Phase 2 REVERSAL instead of being discarded.

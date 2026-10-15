@@ -434,9 +434,14 @@ check("ClearBasket clears the persisted 1R",
       CLEAR is not None and "ClearBasketR()" in CLEAR)
 
 # Free GlobalVariables are a finite, terminal-wide resource; the helpers must
-# not leak one per basket.
+# not leak one per basket. Scoped to the ClearBasketR body: a file-wide count
+# is evadable (the virtual-order teardown deletes GVs too), so it would let a
+# dropped delete slip through.
+CLEAR_R, _ = brace_body(OM_T, r"void\s+ClearBasketR\s*\(void\)")
 check("ClearBasketR deletes both stored values",
-      len(re.findall(r"GlobalVariableDel", OM_T)) >= 2)
+      CLEAR_R is not None and
+      re.search(r"GlobalVariableDel\(name\)\s*;", CLEAR_R) is not None and
+      re.search(r"GlobalVariableDel\(tName\)\s*;", CLEAR_R) is not None)
 
 
 # ----------------------------------------------------------------------

@@ -30,6 +30,7 @@ the working tree mutated.
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,28 @@ AUD = os.path.join(ROOT, "CHighTableAuditor.mqh")
 ORD = os.path.join(ROOT, "COttoOrderManager.mqh")
 JRN = os.path.join(ROOT, "COttoJournal.mqh")
 MAIN = os.path.join(ROOT, "otto.mq5")
+
+# ---------------------------------------------------------------------------
+# Release resolution -- keeps the banner row from rotting into a dead anchor.
+# A hardcoded "5.33" becomes a dead anchor the moment the tree moves on (the
+# row is then reported with an anchor count of 0 and fails the run), so the
+# stamp the probe compares against is read out of OttoDefines.mqh here.
+# ---------------------------------------------------------------------------
+_VERSION_RE = re.compile(r'#property version\s+"(\d+\.\d+)"')
+
+
+def resolve_release():
+    """Return the release stamp the tree ships, or None if unresolvable."""
+    try:
+        with io.open(DEFS, encoding="utf-8", newline="") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    stamps = set(_VERSION_RE.findall(text))
+    return sorted(stamps)[0] if len(stamps) == 1 else None
+
+
+RELEASE = resolve_release()
 
 
 def read(p):
@@ -186,11 +209,13 @@ MUTATIONS = [
      "         ulong orphan = (ulong)PositionGetInteger(POSITION_TICKET);",
      "         ulong orphan = (ulong)PositionGetInteger(POSITION_TICKET);"),
 
+    # D5 moves the sweep AHEAD of the fill detection. Anchored on the
+    # CompleteReversal() line (unique) rather than the old
+    # CompleteReversal()+CheckPendingOrderFills() pair, because v5.40 inserted a
+    # comment block between them and broke the adjacency, not the intent.
     ("D5 the adoption sweep is reordered ahead of the EA fill detection", ORD,
-     ("      CompleteReversal();\n"
-      "      CheckPendingOrderFills();\n"),
-     ("      AdoptManualPosition();\n"
-      "      CompleteReversal();\n")),
+     "      CompleteReversal();\n",
+     "      AdoptManualPosition();\n      CompleteReversal();\n"),
 
     ("D6 FindActivePosition is widened to accept magic 0", ORD,
      "         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber ||\n"
@@ -354,9 +379,13 @@ MUTATIONS = [
      "   g_orderManager.Update();\n"
      "   g_orderManager.AdoptManualPosition();\n"),
 
+    # I2 runs the sweep twice. Anchored on the EmitHourlyStatusReportIfDue()
+    # + CompleteReversal() pair, which IS still adjacent, so the second call
+    # lands ahead of the FIRST fill scan (i.e. not last) either way.
     ("I2 the adoption sweep runs twice in Update", ORD,
-     "      CompleteReversal();\n"
-     "      CheckPendingOrderFills();\n",
+     "      EmitHourlyStatusReportIfDue();\n"
+     "      CompleteReversal();\n",
+     "      EmitHourlyStatusReportIfDue();\n"
      "      AdoptManualPosition();\n"
      "      CompleteReversal();\n"),
 
@@ -389,7 +418,7 @@ MUTATIONS = [
      "input group \"  [9] CURRENCY VECTOR & AFFINITY ENGINE (unversioned)"),
 
     ("J6 the Pine port banner stops naming the release otto.mq5 ships", MAIN,
-     "Master Build Port (v5.33)",
+     "Master Build Port (v%s)" % RELEASE,
      "Master Build Port"),
 ]
 

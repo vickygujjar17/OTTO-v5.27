@@ -22,9 +22,16 @@ Anchors are written with plain \\n and applied CRLF-tolerantly, so this table
 does not silently rot if the working tree is normalised to a different line
 ending. A missed anchor is reported as SKIP and fails the run, because a stale
 anchor table is itself a silent-gap risk.
+
+The three release/banner rows are NOT hand-stamped to a version: the current
+stamp is read out of OttoDefines.mqh at startup and the rows are built from it.
+A hardcoded \"5.32\" becomes a dead anchor the moment the tree moves on (the row
+is then SKIPped, and a skipped anchor fails the run), so resolving it here keeps
+this harness catching a left-behind version on ANY release.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +44,41 @@ FILES = ["otto.mq5", "COttoOrderManager.mqh", "COttoTradeManager.mqh",
          "COttoRiskManager.mqh", "COttoBlockManager.mqh", "COttoJournal.mqh",
          "COttoNewsFilter.mqh", "COttoCorrelationFilter.mqh",
          "COttoMarketStructure.mqh", "OttoDefines.mqh"]
+
+# ---------------------------------------------------------------------------
+# Release resolution -- keeps the version rows from rotting into dead anchors.
+# ---------------------------------------------------------------------------
+_VERSION_RE = re.compile(r'#property version\s+"(\d+)\.(\d+)"')
+
+
+def resolve_release():
+    """Return (release, previous) stamps from the live tree, or None."""
+    try:
+        with open(os.path.join(REAL, "OttoDefines.mqh"),
+                  encoding="utf-8", newline="") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    stamps = set(_VERSION_RE.findall(text))
+    if len(stamps) != 1:
+        return None
+    major, minor = sorted(stamps)[0]
+    return ("%s.%s" % (major, minor), "%s.%d" % (major, int(minor) - 1))
+
+
+RESOLVED = resolve_release()
+RELEASE, PREV = RESOLVED if RESOLVED else (None, None)
+VERSION_MUTATIONS = [] if not RESOLVED else [
+    ("version stamp left behind", "OttoDefines.mqh",
+     '#property version   "%s"' % RELEASE,
+     '#property version   "%s"' % PREV),
+    ("startup banner left behind", "otto.mq5",
+     "OTTO EA v%s \u2014 28-Pair" % RELEASE,
+     "OTTO EA v%s \u2014 28-Pair" % PREV),
+    ("Pine port banner left behind", "otto.mq5",
+     "Master Build Port (v%s)" % RELEASE,
+     "Master Build Port (v%s)" % PREV),
+]
 
 MUTATIONS = [
     # --- 1. half-risk rung liveness ------------------------------------
@@ -235,6 +277,11 @@ MUTATIONS = [
      "GlobalVariableDel(tName);",
      "// MUTANT: ticket value never deleted"),
 
+    ("stored R value never deleted (BASKETR GV leak)",
+     "COttoOrderManager.mqh",
+     "GlobalVariableDel(name);",
+     "// MUTANT: R value never deleted"),
+
     ("seed path re-derives 1R from the ratcheted stop again",
      "COttoOrderManager.mqh",
      "      double restoredR = RestoreBasketR(positionTicket);",
@@ -268,19 +315,8 @@ MUTATIONS = [
      "is UNREACHABLE and will never be",
      "is unreachable and will never be"),
 
-    # --- 10. version stamps ------------------------------------------
-    ("version stamp left behind",
-     "OttoDefines.mqh",
-     '#property version   "5.32"', '#property version   "5.31"'),
-
-    ("startup banner left behind",
-     "otto.mq5",
-     "OTTO EA v5.32 \u2014 28-Pair", "OTTO EA v5.31 \u2014 28-Pair"),
-
-    ("Pine port banner left behind",
-     "otto.mq5",
-     "Master Build Port (v5.32)", "Master Build Port (v5.31)"),
-]
+    # --- 10. version stamps (built from the live stamp, see above) -----
+] + VERSION_MUTATIONS
 
 
 def run_probe(root):
@@ -312,6 +348,13 @@ def main():
     if not os.path.isdir(REAL):
         print("ABORT: tree not found: %s" % REAL)
         return 1
+
+    if RESOLVED is None:
+        print("ABORT: could not resolve a single '#property version' stamp "
+              "from %s" % os.path.join(REAL, "OttoDefines.mqh"))
+        return 1
+    print("  release under test: v%s (previous: v%s), %d mutation(s)\n"
+          % (RELEASE, PREV, len(VERSION_MUTATIONS)))
 
     rc, out = run_probe(REAL)
     if rc != 0:
