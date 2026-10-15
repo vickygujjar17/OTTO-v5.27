@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.60 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.61 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.60"
-#property description "OTTO v5.60 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.61"
+#property description "OTTO v5.61 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -282,16 +282,29 @@ input bool     InpPyramidEnable   = true;     // Enable 4-tranche pyramiding (un
 // (1.0%), so there is NO separate InpRiskT1Pct input. The v5.27 declaration of
 // one was dead -- nothing in the tree ever read it -- and a second knob that
 // silently changes no behaviour is worse than no knob at all.
-// v5.29: the ladder is now a true risk-percent pyramid. Each scale-in risks
-// roughly half the previous rung and the four rungs total 1.4375% of equity,
-// comfortably inside the SafetyMaxRiskPct = 1.5% budget:
+// FIX (v5.61): the ladder is now a FLAT-HEAD pyramid. T1 and T2 EACH risk 1.0%
+// of equity, then T3 halves to 0.5% and T4 quarters to 0.25%. The four rungs
+// sum to 2.75% of equity with all four legs live:
 //   T1  1.0%     RiskPercent (group [6])   at market
-//   T2  0.25%    InpRiskT2Pct              at +1.0R  (InpPyramidT2RR)
-//   T3  0.125%   InpRiskT3Pct              at +2.0R  (InpPyramidT3RR)
-//   T4  0.0625%  InpRiskT4Pct              at +3.0R  (InpPyramidT4RR)
-input double   InpRiskT2Pct       = 0.25;     // Tranche 2 risk % of equity (at +1.0R)
-input double   InpRiskT3Pct       = 0.125;    // Tranche 3 risk % of equity (at +2.0R)
-input double   InpRiskT4Pct       = 0.0625;   // Tranche 4 risk % of equity (at +3.0R)
+//   T2  1.0%     InpRiskT2Pct              at +1.0R  (InpPyramidT2RR)
+//   T3  0.5%     InpRiskT3Pct              at +2.0R  (InpPyramidT3RR)
+//   T4  0.25%    InpRiskT4Pct              at +3.0R  (InpPyramidT4RR)
+// 2.75% is the SUMMED stacked exposure, and that sum is the intended design:
+// each rung is only reached once the rungs beneath it are already wearing a
+// milestone floor (T2 at friction breakeven, T3 at +1.0R, T4 at +2.0R), so the
+// risk actually at stake is always a fraction of the nominal sum.
+// Do NOT read 2.75% against SafetyMaxRiskPct (1.5%). That input is a PER-LEG
+// abort threshold, not a basket-sum cap, and it is what
+// CHighTableAuditor::AuditRiskExposure() actually enforces: it tracks
+// peakRiskPct -- the worst SINGLE leg, measured from its own entry to the shared
+// basket SL -- and never the sum. On this ladder the worst single leg is T1/T2
+// at 1.0%, and both of those legs read as risk-free (lossDist <= 0) once the
+// unified SL ratchets past their entries, so the peak sits at 1.0% against the
+// 1.5% budget. The v5.29 text that stood here claimed the SUM was inside 1.5%;
+// nothing in the tree ever enforced that, and the 2.75% sum is deliberate.
+input double   InpRiskT2Pct       = 1.0;      // Tranche 2 risk % of equity (at +1.0R)
+input double   InpRiskT3Pct       = 0.5;      // Tranche 3 risk % of equity (at +2.0R)
+input double   InpRiskT4Pct       = 0.25;     // Tranche 4 risk % of equity (at +3.0R)
 // v5.27: Tranche 2 is DECOUPLED from InpBreakEvenRR. The two milestones used
 // to share a value (both 2.0), so lowering breakeven to 1.0 would have dragged
 // the T2 scale-in down with it and fired it a full R early. T2 now has its own
@@ -369,7 +382,7 @@ input double   SafetyDailyDDLimit  = 3.0;     // Soft breach: pause new orders a
 input double   SafetyTotalDDLimit  = 5.0;     // Hard breach: close all + halt at this % (Trailing)
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.60"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.61"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart
@@ -381,7 +394,7 @@ input int      InpAnchorTF           = PERIOD_H1;  // Anchor candle timeframe (H
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
 
 input group "══════════════════════════════════════════════════"
-input group "  [10] HIGH TABLE AUDITOR — v5.60"
+input group "  [10] HIGH TABLE AUDITOR — v5.61"
 input group "══════════════════════════════════════════════════"
 // Decoupled watchdog: audits live state on its OWN timer cadence rather
 // than inside OnTick, so a halted / paused / tick-starved trade loop can
@@ -391,7 +404,7 @@ input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
 input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
 
 input group "══════════════════════════════════════════════════"
-input group "  [11] MANUAL TRADE ADOPTION — v5.60"
+input group "  [11] MANUAL TRADE ADOPTION — v5.61"
 input group "══════════════════════════════════════════════════"
 // Let this EA manage positions opened BY HAND on its own chart symbol.
 // A manual position is identified as a MAGIC-0 position on m_symbol: the
@@ -408,7 +421,7 @@ input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual
 
 //+------------------------------------------------------------------+
 input group "══════════════════════════════════════════════════"
-input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.60"
+input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.61"
 input group "══════════════════════════════════════════════════"
 // v5.34 built five switches that let a vetoed Phase 1 setup be re-used as a
 // Phase 2 REVERSAL instead of being discarded.

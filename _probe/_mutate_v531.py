@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 
-REAL = r"C:\Users\vivek\Downloads\OTTO-v5.00 v5.27"
+REAL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROBE = os.path.join("_probe", "test_v531_smart_trim.py")
 FILES = ["otto.mq5", "COttoOrderManager.mqh", "COttoTradeManager.mqh",
          "COttoRiskManager.mqh", "COttoBlockManager.mqh", "COttoJournal.mqh",

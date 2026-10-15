@@ -4,7 +4,7 @@
 //|            OTTO EA - Cut / Cost-BE / ATR Trail / Pyramiding       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.60"
+#property version   "5.61"
 
 #ifndef __OTTO_TRADE_MANAGER__
 #define __OTTO_TRADE_MANAGER__
@@ -447,37 +447,66 @@ public:
       // Two reasons: (1) 'desiredSL' is the ATR trail anchored to high0-1.5*ATR,
       // which at +2.0R already sits close to market and can be rejected with
       // INVALID_STOPS or instantly stop the whole basket on a spread spike;
-      // (2) the new ticket would otherwise be opened with sl=0. Instead we pass
-      // the friction-based group breakeven with the fill request, so T3 is
-      // protected from the first tick, and the normal ATR-trail block below
-      // (currentRR >= InpTrailStartRR) ratchets it forward on the next tick.
+      // (2) the new ticket would otherwise be opened with sl=0.
+      // FIX (v5.61): T3's protective floor is now the UNIFIED-SL MILESTONE at
+      // +2.0R -- the same +1.0R lock the milestone ladder above already applies
+      // to the basket (InpLockProfit2RR / InpLockProfit2TargetRR) -- instead of
+      // the cost-covering breakeven it used to carry. The old floor stopped the
+      // new leg merely at entry +/- friction, which at +2.0R was far LOOSER than
+      // the stop the rest of the basket was already wearing, so T3 entered with
+      // more risk on it than every ticket beneath it.
+      //
+      // CLAMPED AGAINST THE LIVE SESSION STOP. Handing the raw +1.0R floor to
+      // ApplyUnifiedSL() would be a silent NO-OP: the v5.32-hoisted half-risk
+      // rung pins the basket at entry -/+ 0.5R from the +1.0R breakeven onward,
+      // so +1.0R is looser than the floor already live and the one-way ratchet
+      // in ApplyUnifiedSL() would reject it. Taking the tighter of the two means
+      // the new leg is born wearing exactly the stop the basket already has, and
+      // the normal ATR-trail block below (currentRR >= InpTrailStartRR) ratchets
+      // it forward on the next tick.
       if(currentRR >= InpPyramidT3RR && m_orderManager.IsPyramidPending(3))
         {
-         double beOffset = CalcBasketFriction(dir==DIR_LONG);
-         double safeBE = primaryEntry + (dir==DIR_LONG ? beOffset : -beOffset);
-         if(m_orderManager.AddPyramidTranche(3, safeBE))
+         double t3FloorRaw = primaryEntry + (dir==DIR_LONG ? 1.0 : -1.0) * rrUnit;
+         double sessionNow = m_orderManager.GetSessionSL();
+         double t3Floor = t3FloorRaw;
+         if(sessionNow > 0.0)
+            t3Floor = (dir==DIR_LONG) ? MathMax(t3FloorRaw, sessionNow)
+                                      : MathMin(t3FloorRaw, sessionNow);
+         if(m_orderManager.AddPyramidTranche(3, t3Floor))
              {
-              m_orderManager.ApplyUnifiedSL(safeBE);
-              m_orderManager.LogGroupStop("Tranche 3 (+2.0R) - Executed (Trail Pending)", safeBE);
+              m_orderManager.ApplyUnifiedSL(t3Floor);
+              m_orderManager.LogGroupStop("Tranche 3 (+2.0R) - Executed (Unified SL +1.0R)", t3Floor);
               trancheOpenedThisTick = true;
              }
         }
       // Tranche 4 at +3.0R (InpPyramidT4RR): add the final InpRiskT4Pct tranche.
       // This is the last rung, so a successful add advances m_nextTranche to 0
       // and IsPyramidPending() is false for every rung from here on. Mirrors the
-      // T3 pattern exactly: the friction-based group breakeven travels WITH the
-      // fill request (never the tight dynamic 'desiredSL', for the INVALID_STOPS
-      // reasons spelled out above), and the trail/push blocks are skipped for
-      // this tick so the broker can confirm the new ticket's protective stop
-      // before anything tightens it further.
+      // T3 pattern exactly: a protective floor travels WITH the fill request
+      // (never the tight dynamic 'desiredSL', for the INVALID_STOPS reasons
+      // spelled out above), and the trail/push blocks are skipped for this tick
+      // so the broker can confirm the new ticket's protective stop before
+      // anything tightens it further.
+      //
+      // FIX (v5.61): the floor is now the UNIFIED-SL MILESTONE at +3.0R -- the
+      // +2.0R lock the milestone ladder above already applies to the basket
+      // (InpLockProfitRR / InpLockProfitTargetRR) -- rather than the
+      // cost-covering breakeven. As with T3 it is CLAMPED against the live
+      // session stop, so a leg added while the ATR trail is already tighter than
+      // +2.0R inherits that tighter stop instead of loosening the basket back to
+      // the milestone (which the one-way ratchet would refuse anyway).
       if(currentRR >= InpPyramidT4RR && m_orderManager.IsPyramidPending(4))
         {
-         double beOffset4 = CalcBasketFriction(dir==DIR_LONG);
-         double safeBE4 = primaryEntry + (dir==DIR_LONG ? beOffset4 : -beOffset4);
-         if(m_orderManager.AddPyramidTranche(4, safeBE4))
+         double t4FloorRaw = primaryEntry + (dir==DIR_LONG ? 2.0 : -2.0) * rrUnit;
+         double sessionNow4 = m_orderManager.GetSessionSL();
+         double t4Floor = t4FloorRaw;
+         if(sessionNow4 > 0.0)
+            t4Floor = (dir==DIR_LONG) ? MathMax(t4FloorRaw, sessionNow4)
+                                      : MathMin(t4FloorRaw, sessionNow4);
+         if(m_orderManager.AddPyramidTranche(4, t4Floor))
              {
-              m_orderManager.ApplyUnifiedSL(safeBE4);
-              m_orderManager.LogGroupStop("Tranche 4 (+3.0R) - Executed (Trail Pending)", safeBE4);
+              m_orderManager.ApplyUnifiedSL(t4Floor);
+              m_orderManager.LogGroupStop("Tranche 4 (+3.0R) - Executed (Unified SL +2.0R)", t4Floor);
               trancheOpenedThisTick = true;
              }
         }

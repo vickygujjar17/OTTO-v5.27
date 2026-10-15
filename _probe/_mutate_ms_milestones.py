@@ -29,7 +29,7 @@ import subprocess
 import sys
 import tempfile
 
-REAL = r"C:\Users\vivek\Downloads\OTTO-v5.00 v5.27"
+REAL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROBE = os.path.join("_probe", "test_v52x_pyramid.py")
 FILES = ["otto.mq5", "COttoOrderManager.mqh", "COttoTradeManager.mqh",
          "COttoRiskManager.mqh", "COttoBlockManager.mqh", "COttoJournal.mqh",
@@ -75,6 +75,20 @@ MUTATIONS = [
      "if(isLong && newSL <= m_sessionSL) return;", "if(false) return;"),
     ("T2 scale-in no longer carries its protective stop", "COttoTradeManager.mqh",
      "AddPyramidTranche(2, groupBE)", "AddPyramidTranche(2, 0.0)"),
+    # v5.61: the T3/T4 fills no longer carry the unified-SL milestone floor, so a
+    # fresh leg is born naked (sl=0) in hedge mode instead of wearing the stop the
+    # rest of the basket already has.
+    ("T3 scale-in no longer carries its milestone floor", "COttoTradeManager.mqh",
+     "AddPyramidTranche(3, t3Floor)", "AddPyramidTranche(3, 0.0)"),
+    ("T4 scale-in no longer carries its milestone floor", "COttoTradeManager.mqh",
+     "AddPyramidTranche(4, t4Floor)", "AddPyramidTranche(4, 0.0)"),
+    # v5.61: the T3 floor is clamped against the live session stop precisely so a
+    # bare +1.0R override cannot be silently refused by the one-way ratchet.
+    # Dropping the clamp restores the no-op.
+    ("T3 milestone floor no longer clamped to the live session stop",
+     "COttoTradeManager.mqh",
+     "t3Floor = (dir==DIR_LONG) ? MathMax(t3FloorRaw, sessionNow)",
+     "t3Floor = t3FloorRaw; if(false)"),
     ("a second copy of the ladder drifts into the order manager",
      "COttoOrderManager.mqh",
      "double            GetBasketRRUnit(void) const { return m_basketRRUnit; }",

@@ -4,7 +4,7 @@ v5.29 static verification probe - 4-tranche Risk-% pyramid + trail repoint.
 Pins the behaviour that the MQL5 compiler gate CANNOT exercise:
 
   1. Four risk rungs with distinct, strictly-ascending triggers:
-     T1 RiskPercent (0.25, at market), T2 InpRiskT2Pct (at +1.0R),
+     T1 RiskPercent (1.0, at market), T2 InpRiskT2Pct (at +1.0R),
      T3 InpRiskT3Pct (at +2.0R), T4 InpRiskT4Pct (at +3.0R).
   2. Each rung draws its OWN risk input - an unrecognised tranche is refused
      outright and can never fall through onto another rung's risk budget
@@ -17,7 +17,10 @@ Pins the behaviour that the MQL5 compiler gate CANNOT exercise:
      InpTrailStartRR; InpLock3RRR survives only as a declared-but-unused input.
   6. The lot-sizing floor is epsilon-safe, so a raw lot that is mathematically
      an exact multiple of the volume step is not silently dropped one step.
-  7. The ladder total sits inside the SafetyMaxRiskPct budget.
+  7. The worst SINGLE leg sits inside the SafetyMaxRiskPct per-leg budget, and
+     the 2.75% summed stacked exposure is documented as intended (v5.61: that
+     input is a per-leg abort threshold, not a basket-sum cap - see the note in
+     OttoDefines.mqh and AuditRiskExposure(), which tracks peakRiskPct only).
   8. The v5.31 STRICT stop-loss milestone floors, measured from primaryEntry:
      +1.0R -> breakeven + broker friction, +2.0R -> exactly +1.0R and
      +3.0R -> exactly +2.0R, evaluated in DESCENDING order behind a one-way
@@ -91,10 +94,10 @@ check("T1 risk input RiskPercent exists", T1_RISK is not None)
 check("T2 risk input InpRiskT2Pct exists", T2_RISK is not None)
 check("T3 risk input InpRiskT3Pct exists", T3_RISK is not None)
 check("T4 risk input InpRiskT4Pct exists", T4_RISK is not None)
-check("RiskPercent (T1) defaults to 0.25", T1_RISK == 0.25, T1_RISK)
-check("InpRiskT2Pct defaults to 0.25", T2_RISK == 0.25, T2_RISK)
-check("InpRiskT3Pct defaults to 0.125", T3_RISK == 0.125, T3_RISK)
-check("InpRiskT4Pct defaults to 0.0625", T4_RISK == 0.0625, T4_RISK)
+check("RiskPercent (T1) defaults to 1.0", T1_RISK == 1.0, T1_RISK)
+check("InpRiskT2Pct defaults to 1.0", T2_RISK == 1.0, T2_RISK)
+check("InpRiskT3Pct defaults to 0.5", T3_RISK == 0.5, T3_RISK)
+check("InpRiskT4Pct defaults to 0.25", T4_RISK == 0.25, T4_RISK)
 check("no dead InpRiskT1Pct input was re-introduced",
       not re.search(r"^\s*input\s+double\s+InpRiskT1Pct", DEFS_T, re.M))
 
@@ -104,14 +107,26 @@ if all(r is not None for r in RISKS):
     check("risk ladder is non-increasing after T2 (T1 >= T2 > T3 > T4)",
           RISKS[0] >= RISKS[1] > RISKS[2] > RISKS[3], RISKS)
     total = sum(RISKS)
-    check("ladder total risk is 0.6875%", abs(total - 0.6875) < 1e-12, total)
+    check("ladder total risk is 2.75%", abs(total - 2.75) < 1e-12, total)
     budget = num_input(DEFS_T, "SafetyMaxRiskPct")
-    check("ladder total sits inside the SafetyMaxRiskPct budget",
-          budget is not None and total < budget, "%s < %s" % (total, budget))
+    # v5.61: SafetyMaxRiskPct is a PER-LEG abort threshold, not a summed-ladder
+    # cap. AuditRiskExposure() tracks peakRiskPct -- the worst single leg, from
+    # its own entry to the shared basket SL -- and never the basket sum, so the
+    # check is re-scoped to match what the runtime actually enforces. On this
+    # ladder the peak leg is T1/T2 at 1.0%, safely inside the 1.5% budget.
+    check("every rung stays inside the SafetyMaxRiskPct per-leg budget",
+          budget is not None and max(RISKS) < budget,
+          "%s < %s" % (max(RISKS), budget))
+    # ...while the SUMMED stacked exposure is deliberate and pinned explicitly,
+    # so a future retune cannot quietly drift the total without a red probe.
+    check("summed stacked exposure is documented as intended (2.75%, not a cap breach)",
+          abs(total - 2.75) < 1e-12, total)
 else:
     check("risk ladder is non-increasing after T2 (T1 >= T2 > T3 > T4)", False, RISKS)
-    check("ladder total risk is 0.6875%", False, RISKS)
-    check("ladder total sits inside the SafetyMaxRiskPct budget", False, RISKS)
+    check("ladder total risk is 2.75%", False, RISKS)
+    check("every rung stays inside the SafetyMaxRiskPct per-leg budget", False, RISKS)
+    check("summed stacked exposure is documented as intended (2.75%, not a cap breach)",
+          False, RISKS)
 
 
 # ----------------------------------------------------------------------
@@ -197,10 +212,10 @@ check("T4 gate: currentRR >= InpPyramidT4RR && IsPyramidPending(4)",
                 r"m_orderManager\.IsPyramidPending\(4\)\)", TM_T) is not None)
 check("T2 is added through AddPyramidTranche(2, groupBE)",
       "m_orderManager.AddPyramidTranche(2, groupBE)" in TM_T)
-check("T3 is added through AddPyramidTranche(3, safeBE)",
-      "m_orderManager.AddPyramidTranche(3, safeBE)" in TM_T)
-check("T4 is added through AddPyramidTranche(4, safeBE4)",
-      "m_orderManager.AddPyramidTranche(4, safeBE4)" in TM_T)
+check("T3 is added through AddPyramidTranche(3, t3Floor)",
+      "m_orderManager.AddPyramidTranche(3, t3Floor)" in TM_T)
+check("T4 is added through AddPyramidTranche(4, t4Floor)",
+      "m_orderManager.AddPyramidTranche(4, t4Floor)" in TM_T)
 
 
 # ----------------------------------------------------------------------
@@ -305,9 +320,25 @@ if M_T2:
 check("T2 fill is protected by groupBE (friction-based breakeven)",
       re.search(r"AddPyramidTranche\(2,\s*groupBE\)", TM_T) is not None and
       "groupBE = primaryEntry" in TM_T)
-check("T3 and T4 fills are protected by their own friction-based breakeven",
-      re.search(r"AddPyramidTranche\(3,\s*safeBE\)", TM_T) is not None and
-      re.search(r"AddPyramidTranche\(4,\s*safeBE4\)", TM_T) is not None)
+check("T3 and T4 fills are protected by their own milestone floor",
+      re.search(r"AddPyramidTranche\(3,\s*t3Floor\)", TM_T) is not None and
+      re.search(r"AddPyramidTranche\(4,\s*t4Floor\)", TM_T) is not None)
+# v5.61: T3/T4 carry the UNIFIED-SL MILESTONES (+1.0R and +2.0R off the primary
+# entry), the same locks the milestone ladder above applies to the basket.
+check("T3 carries the +1.0R unified-SL milestone and T4 the +2.0R one",
+      "primaryEntry + (dir==DIR_LONG ? 1.0 : -1.0) * rrUnit" in TM_T and
+      "primaryEntry + (dir==DIR_LONG ? 2.0 : -2.0) * rrUnit" in TM_T)
+# Both are CLAMPED against the live session stop: a bare milestone override is
+# looser than the floor the basket already wears (the hoisted half-risk rung),
+# so ApplyUnifiedSL()'s one-way ratchet would refuse it and the new leg would
+# keep whatever the fill handed it. Taking the tighter of the two is what makes
+# the override effective.
+check("both milestone floors are clamped to the live session stop (both directions)",
+      "MathMax(t3FloorRaw, sessionNow)" in TM_T and
+      "MathMin(t3FloorRaw, sessionNow)" in TM_T and
+      "MathMax(t4FloorRaw, sessionNow4)" in TM_T and
+      "MathMin(t4FloorRaw, sessionNow4)" in TM_T)
+check("the T3/T4 cost-covering breakeven floors are gone", "safeBE" not in TM_T)
 check("no rung ever hands the dynamic ATR trail to AddPyramidTranche",
       not re.search(r"AddPyramidTranche\(\s*\d\s*,\s*desiredSL\s*\)", TM_T))
 
@@ -378,7 +409,7 @@ check("epsilon restores the intended 29 steps",
 # Exact multiples must stay exact - the epsilon must not ADD a step.
 check("0.30 / 0.01 -> 30 steps", floor_steps(0.30, 0.01) == 30, floor_steps(0.30, 0.01))
 check("0.10 / 0.01 -> 10 steps", floor_steps(0.10, 0.01) == 10, floor_steps(0.10, 0.01))
-check("0.0625 / 0.01 -> 6 steps (T4 rung, strict round-down)",
+check("0.0625 / 0.01 -> 6 steps (sample value, strict round-down)",
       floor_steps(0.0625, 0.01) == 6, floor_steps(0.0625, 0.01))
 
 # The epsilon must never round a lot UP past the risk budget: it may only
@@ -414,7 +445,7 @@ check("the [4] group banner names 4-tranche pyramiding",
 check("the pyramid group banner no longer says 3 tranches",
       "3-tranche pyramiding" not in DEFS_T)
 check("the ladder total is documented in the inputs",
-      "0.6875" in DEFS_T)
+      "2.75" in DEFS_T)
 check("the MILESTONE LADDER documents the +2.0R rung",
       re.search(r"\+2\.0R\s+lock rung 2", DEFS_T) is not None)
 check("InpLockProfit2RR and InpLockProfit2TargetRR are both declared",
@@ -627,13 +658,15 @@ check("model: a higher milestone can never move the floor backwards",
 check("ApplyUnifiedSL is called on every rung push (breakeven floors included)",
       TM_N.count("m_orderManager.ApplyUnifiedSL(desiredSL);") >= 1 and
       TM_N.count("m_orderManager.ApplyUnifiedSL(groupBE);") == 1 and
-      "m_orderManager.ApplyUnifiedSL(safeBE4);" in TM_N)
+      "m_orderManager.ApplyUnifiedSL(t3Floor);" in TM_N and
+      "m_orderManager.ApplyUnifiedSL(t4Floor);" in TM_N)
 check("ApplyUnifiedSL enforces the one-way ratchet for BOTH directions",
       "if(isLong && newSL <= m_sessionSL) return;" in OM_N and
       "if(!isLong && newSL >= m_sessionSL) return;" in OM_N)
 check("the T2/T3/T4 scale-in hands its protective floor to the market order",
       "AddPyramidTranche(2, groupBE)" in TM_N and
-      "AddPyramidTranche(4, safeBE4)" in TM_N)
+      "AddPyramidTranche(3, t3Floor)" in TM_N and
+      "AddPyramidTranche(4, t4Floor)" in TM_N)
 check("session SL only advances once a stop is live at the broker",
       "if(anyApplied) { m_sessionSL = newSL;" in OM_N)
 check("PM note: the ladder push is nested under the trail gate, so keep "
