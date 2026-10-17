@@ -4,7 +4,7 @@
 //|            OTTO EA - Cut / Cost-BE / ATR Trail / Pyramiding       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.62"
+#property version   "5.63"
 
 #ifndef __OTTO_TRADE_MANAGER__
 #define __OTTO_TRADE_MANAGER__
@@ -219,15 +219,16 @@ public:
       // that one tick so the broker can confirm the protective breakeven stop on
       // the new ticket before the dynamic trail takes over.
       // v5.29: generalised from t3OpenedThisTick. The Tranche 2 fill, the
-      // breakeven ratchet and (until v5.62) the trail activation all landed on
-      // the SAME +1.0R tick, so the guard had to cover every rung. Scoping it to
+      // breakeven ratchet and the trail activation all land on the SAME +1.0R
+      // tick -- the trail sat at +2.0R for v5.62 only, and v5.63 put it back on
+      // the +1.0R rung -- so the guard has to cover every rung. Scoping it to
       // Tranche 3 alone would have let a tight ATR trail be written over a
       // brand-new T2 ticket whose protective stop the broker had not yet
       // confirmed -- the v5.14/v5.20 INVALID_STOPS / instant-stopped-out failure
       // mode, moved one rung earlier.
-      // FIX (v5.62): still required. The trail no longer arms at +1.0R, but the
-      // +1.0R breakeven FLOOR is applied unconditionally now, so the coincident
-      // write on the T2 tick is if anything more certain than before.
+      // FIX (v5.62): the unconditional ladder was the reason this guard is
+      // still required; v5.63 restores the trail to the +1.0R rung, so the
+      // coincident write on the T2 tick is if anything more certain again.
       bool trancheOpenedThisTick = false;
       // FIX (v5.15): after a T2/T3 ApplyUnifiedSL moved the BASKET stop, the
       // primary struct field (trade.currentTrailSL) lags behind the real
@@ -282,8 +283,9 @@ public:
            }
          // v5.29: trail gate repointed from InpLock3RRR (3.0) to InpTrailStartRR,
          // so the ATR trail arms without waiting for the step at which the pyramid
-         // reaches full size. FIX (v5.62): InpTrailStartRR is now 2.0, so the trail
-         // arms from +2.0R. Evaluated AFTER both lock rungs, so the tighter of the
+         // reaches full size. FIX (v5.63): InpTrailStartRR is 1.0, so the trail
+         // arms from +1.0R -- the SAME rung as the first milestone floor below.
+         // Evaluated AFTER both lock rungs, so the tighter of the
          // three wins on this same tick. NOTE: this gate governs the ATR FORMULA
          // only. The floors computed above are applied to the basket by the
          // unconditional milestone-ladder block below, NOT by this gate.
@@ -472,7 +474,7 @@ public:
       // in ApplyUnifiedSL() would reject it. Taking the tighter of the two means
       // the new leg is born wearing exactly the stop the basket already has, and
       // the normal milestone-ladder block below ratchets it forward on the next
-      // tick (v5.62: that block is the unconditional ApplyUnifiedSL(), no longer
+      // tick (that block is the unconditional ApplyUnifiedSL(), no longer
       // gated on currentRR >= InpTrailStartRR).
       if(currentRR >= InpPyramidT3RR && m_orderManager.IsPyramidPending(3))
         {
@@ -527,7 +529,7 @@ public:
       // branches above may have raised into desiredSL -- the +1.0R cost-covering
       // breakeven, the +2.0R lock rung, the +3.0R lock rung -- was only ever
       // written to the basket once that single gate opened, so raising
-      // InpTrailStartRR to 2.0 would have darkened the +1.0R floor instead of
+      // InpTrailStartRR to 1.0 would have darkened the +1.0R floor instead of
       // just delaying the trail.
       //
       // The gate and the ladder are separate concerns and are now split: each
@@ -559,7 +561,10 @@ public:
       // is part of desiredSL and is carried by the unconditional block above.
       // InpTrailStartRR therefore still governs exactly two things: that formula
       // and the m_trailActivations tally below. Nothing to apply here -- kept as a
-      // named boundary so the trail/ladder split is legible.
+      // named boundary so the trail/ladder split is legible. v5.63: the trail
+      // gate now sits at 1.0R, the same rung as the ladder's first floor, so the
+      // two contributors to desiredSL overlap from +1.0R onward and the tighter
+      // one wins each tick.
 
       // --- Push the primary stop to the broker ---
       // When a multi-tranche basket is active, ApplyUnifiedSL() above already
@@ -569,8 +574,8 @@ public:
       // same reason as the milestone-ladder block above -- no stop write races the
       // broker's confirmation of the new ticket's protective stop. v5.29: this now
       // covers T2 as well as T3/T4, which matters because the T2 fill coincides
-      // with the +1.0R breakeven-rung activation (v5.62: no longer the ATR trail
-      // activation -- that now waits for +2.0R).
+      // with the +1.0R breakeven-rung activation (and, since v5.63, the ATR trail
+      // activation too -- it arms on that same +1.0R rung).
       double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
       if(m_orderManager.GetBasketCount() <= 1 && !trancheOpenedThisTick)
         {
@@ -589,6 +594,11 @@ public:
                // been caused by the milestone ladder instead, and counting that as
                // a trail activation would overstate the trail's contribution.
                if(currentRR >= InpTrailStartRR) m_trailActivations++;
+               // v5.63: with InpTrailStartRR at 1.0 the trail is armed from the
+               // same +1.0R rung as the first milestone floor, so a write that
+               // the ladder alone caused is ONLY distinguishable by this gate.
+               // The guard is unchanged; what changed is that the window in
+               // which the ladder can act unaccompanied is now empty.
               }
            }
         }
@@ -610,10 +620,16 @@ public:
       // milestone). v5.29: the second branch was repointed from InpLock3RRR to
       // InpTrailStartRR, so the reported trail step now agrees with the input
       // that actually arms the trail in Update(). As before, both remain
-      // inputs. FIX (v5.62): with InpTrailStartRR at 2.0 the second branch now
-      // reports STEP_TRAILING from +2.0R rather than +1.0R, which is exactly when
-      // the ATR trail genuinely begins contributing -- the +1.0R rung is a
-      // milestone floor and is correctly reported as STEP_BREAKEVEN.
+      // inputs. FIX (v5.63): InpTrailStartRR is 1.0, so the second branch now
+      // fires from the SAME +1.0R rung as the InpBreakEvenRR branch below it.
+      // Because STEP_TRAILING is tested first, the +1.0R rung reports
+      // STEP_TRAILING and the STEP_BREAKEVEN branch is shadowed while the two
+      // inputs are equal. That is deliberate: at +1.0R the ATR trail genuinely
+      // IS armed, so STEP_TRAILING is the truthful label, and the milestone
+      // floor at that rung is still applied by the ladder block in Update()
+      // regardless of what the state machine reports. STEP_BREAKEVEN becomes
+      // reachable again the moment InpTrailStartRR is raised above
+      // InpBreakEvenRR.
       // Order matters: highest milestone first.
       if(InpLockProfitRR > 0.0 && rr >= InpLockProfitRR)      step = STEP_TRAILING;
       else if(rr >= InpTrailStartRR)                          step = STEP_TRAILING;

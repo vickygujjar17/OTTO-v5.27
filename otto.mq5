@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                       OttoEA.mq5 |
 //|                    OTTO — Goat Funded Trader (GFT) Master Build    |
-//|                    Pine Script Master Build Port (v5.62)            |
+//|                    Pine Script Master Build Port (v5.63)            |
 //|                                    Institutional / Real-Money    |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.62"
+#property version   "5.63"
 #property description "OTTO EA â€” Goat Funded Trader (GFT) Master Build"
 #property description "Separation | Sizing | Front-Run | Near-Miss | Stale vetoes"
 #property description "Modules: News Shield | Risk | Block Manager | Order Mgmt | Trail"
@@ -180,7 +180,7 @@ int OnInit(void)
    g_symbol = _Symbol;
 
    Print("==============================================================");
-   Print("  OTTO EA v5.62 — 28-Pair Institutional Master Build — INITIALIZING");
+   Print("  OTTO EA v5.63 — 28-Pair Institutional Master Build — INITIALIZING");
    Print("  Symbol: ", g_symbol, " | Magic: ", MagicNumber);
    Print("==============================================================");
 
@@ -992,6 +992,18 @@ void HighTablePushFacts(void)
       // than re-derived from POSITION_MAGIC here so the book is still read
       // in exactly one place.
       adopted = active.adoptedManual;
+      // v5.63: the tracked RISK GEOMETRY, pushed on the SAME branch because
+      // the facts are one record. The 1R unit the trail keys off lives only
+      // in the order layer (m_basketRRUnit), so it must be pushed for the
+      // same reason the drawdown anchors are: re-deriving it inside the
+      // auditor would create a second, silently drift-prone source of truth
+      // for the denominator of every RR decision. Entry, direction and the
+      // working stop ride along so the auditor can re-derive the excursion
+      // in R without knowing anything about the basket.
+      g_highTable.SetTrackedGeometry(active.ticket, active.direction,
+                                     active.entryPrice,
+                                     g_orderManager.GetBasketRRUnit(),
+                                     active.currentTrailSL);
      }
    g_highTable.SetTrackedLegs(g_orderManager.CountOpenPositions(),
                               ticket, g_orderManager.HasActiveTrade(),

@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.62"
+#property version   "5.63"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -94,6 +94,8 @@ private:
    // the member it names.
    bool              m_alertSent_StateInconsistency; // book vs tracked state
    bool              m_alertSent_RiskBreach;        // position risk exceeded allowance
+   bool              m_alertSent_StaleTrail;        // price ran past the trail's arm R:R, stop never followed (v5.63)
+   bool              m_alertSent_AggRiskBreach;     // SUMMED basket risk over the stacked budget (v5.63)
 
    //+------------------------------------------------------------------+
    //| PART 2 - pushed observation state.                                |
@@ -141,6 +143,36 @@ private:
    bool              m_trackedAdopted;       // primary is an ADOPTED magic-0 manual leg (v5.33)
    bool              m_stateSkewSeen;        // divergence seen once, awaiting confirm
    bool              m_adoptionSeen;         // adoption INFO already dispatched (v5.33)
+   bool              m_aggRiskSeen;          // summed-risk breach seen once, awaiting confirm (v5.63)
+
+   //| Tracked RISK GEOMETRY, pushed from the order layer (v5.63).         |
+   //|                                                                     |
+   //| The terminal can answer everything about a leg EXCEPT its 1R unit:   |
+   //| m_basketRRUnit is the order layer's own private divisor, derived at  |
+   //| basket init and persisted across restarts. Re-deriving it here would |
+   //| be a second source of truth for the denominator of every RR         |
+   //| decision -- exactly what the decoupling contract forbids -- so the   |
+   //| EA pushes it, together with the entry and direction it belongs to.   |
+   //|                                                                     |
+   //| m_trackedSL is the order layer's view of the working stop. It is     |
+   //| only a FALLBACK: the audit prefers the live stop read from the book, |
+   //| because this whole watchdog exists to measure what the broker really |
+   //| holds rather than what the sizing code believes it wrote.            |
+   //|                                                                     |
+   //| m_trailPeakRR is the auditor's OWN observation, not a pushed fact:   |
+   //| the running maximum of the live excursion, in R, since the tracked   |
+   //| ticket last changed. It has to be recorded here because the question |
+   //| "should the trail have armed by now?" must be answered from PRICE,   |
+   //| never from the stop -- reading the stop to decide whether the stop   |
+   //| is stale is circular, and a stop that never moved would report a     |
+   //| negative R and silence the very alert this check exists to raise.    |
+   bool              m_haveGeometry;         // false until the first geometry push
+   double            m_trackedEntry;         // pushed entry price of the tracked primary
+   double            m_trackedRRUnit;        // pushed basket 1R (m_basketRRUnit)
+   ENUM_TRADE_DIRECTION m_trackedDir;        // pushed direction of the tracked primary
+   double            m_trackedSL;            // pushed working stop (fallback for the book read)
+   double            m_trailPeakRR;          // auditor-observed peak excursion, in R
+   ulong             m_trailPeakTicket;      // ticket m_trailPeakRR belongs to
 
    //+------------------------------------------------------------------+
    //| CSV field sanitizer.                                              |
@@ -315,6 +347,7 @@ public:
       m_trackedAdopted         = false;
       m_stateSkewSeen          = false;
       m_adoptionSeen           = false;
+      m_aggRiskSeen            = false;
       m_dailyResetBalance      = 0.0;
       m_equityHwm              = 0.0;
       m_totalHalted            = false;
@@ -326,6 +359,15 @@ public:
       m_alertSent_StopModifyFailure  = false;
       m_alertSent_StateInconsistency = false;
       m_alertSent_RiskBreach         = false;
+      m_alertSent_StaleTrail         = false;
+      m_alertSent_AggRiskBreach      = false;
+      m_haveGeometry                 = false;
+      m_trackedEntry                 = 0.0;
+      m_trackedRRUnit                = 0.0;
+      m_trackedDir                   = DIR_NONE;
+      m_trackedSL                    = 0.0;
+      m_trailPeakRR                  = 0.0;
+      m_trailPeakTicket              = 0;
      }
                     ~CHighTableAuditor(void) { }
 
@@ -458,6 +500,61 @@ public:
      }
 
    //+------------------------------------------------------------------+
+   //| SetTrackedGeometry - the 1R unit and entry the trail keys off.    |
+   //|                                                                   |
+   //| Pushed, for the same reason SetTrackedLegs is: m_basketRRUnit is   |
+   //| the order layer's private divisor and re-deriving it here would    |
+   //| create a second source of truth for every RR decision.            |
+   //|                                                                   |
+   //| This is also where the auditor resets its own peak-excursion       |
+   //| memory: the two facts arrive together, so the moment the tracked   |
+   //| ticket changes -- or the geometry is re-seeded for the same        |
+   //| ticket after a basket rebuild -- any high-water mark carried over   |
+   //| from the previous trade would be measured against a different      |
+   //| entry and 1R. Dropping it costs at most one audit cycle of         |
+   //| observation and can never manufacture an alert, because a peak     |
+   //| that resets to zero is below every arm threshold.                  |
+   //|                                                                   |
+   //| A push that comes in carrier-less (no ticket, or a non-positive    |
+   //| 1R) is recorded as NO geometry rather than as geometry of zero:    |
+   //| a zero 1R would divide into infinity and turn the stale-trail      |
+   //| test into a permanent false CRITICAL.                              |
+   //+------------------------------------------------------------------+
+   void              SetTrackedGeometry(ulong ticket, ENUM_TRADE_DIRECTION dir,
+                                        double entry, double rrUnit, double workingSL)
+     {
+      if(ticket == 0 || rrUnit <= 0.0 || entry <= 0.0)
+        {
+         m_haveGeometry = false;
+         m_trailPeakRR  = 0.0;
+         m_trailPeakTicket = 0;
+         return;
+        }
+
+      m_trackedEntry  = entry;
+      m_trackedRRUnit = rrUnit;
+      m_trackedDir    = dir;
+      m_trackedSL     = workingSL;
+      m_haveGeometry  = true;
+
+      if(ticket != m_trailPeakTicket)
+        {
+         m_trailPeakTicket = ticket;
+         m_trailPeakRR     = 0.0;
+        }
+     }
+
+   //+------------------------------------------------------------------+
+   //| Feed the peak-excursion memory. Called by AuditTrailingHealth     |
+   //| for the tracked ticket only, so an unrelated book leg can never    |
+   //| inflate the high-water mark the trail test reads.                  |
+   //+------------------------------------------------------------------+
+   void              NoteExcursion(double rr)
+     {
+      if(rr > m_trailPeakRR) m_trailPeakRR = rr;
+     }
+
+   //+------------------------------------------------------------------+
    //| DispatchAlert - unconditional alert.                              |
    //|                                                                   |
    //|  * logs every alert to the audit CSV (evidence survives a console |
@@ -578,6 +675,7 @@ public:
       AuditOrderHealth();       // PART 2 - rejects + SL modify failures
       AuditStateConsistency();  // PART 2 - book vs tracked basket
       AuditRiskExposure();      // PART 2 - dynamic position risk audit
+      AuditTrailingHealth();    // v5.63 - is the armed trail actually tightening?
 
       m_lastAudit = TimeCurrent();
      }
@@ -587,7 +685,7 @@ public:
    datetime          GetLastAudit(void)        const { return m_lastAudit; }
 
    //+------------------------------------------------------------------+
-   //| PART 2 - the four observation bodies.                             |
+   //| PART 2 - the six observation bodies.                              |
    //|                                                                   |
    //| Each body is self-contained, purely observational, and dispatches |
    //| at most one LATCHED alert. The latch lifecycle is uniform: raise  |
@@ -758,6 +856,160 @@ public:
      }
 
    //+------------------------------------------------------------------+
+   //+------------------------------------------------------------------+
+   //| AuditTrailingHealth - is the ARMED trail actually tightening?     |
+   //|                                                                   |
+   //| Added in v5.63, when InpTrailStartRR went 2.0 -> 1.0. That change  |
+   //| makes the ATR trail arm on the SAME +1.0R rung as the ladder's     |
+   //| first floor, which is the intended behaviour -- but it also makes  |
+   //| the two contributors to the basket stop overlap for the whole life |
+   //| of the trade, and a trail that silently arms and then never writes |
+   //| is indistinguishable from a healthy one on any single tick. This   |
+   //| body is the independent witness for that: it re-derives the        |
+   //| excursion from PRICES and asks whether a stop that claims to be    |
+   //| live is still on the losing side of entry.                         |
+   //|                                                                   |
+   //| WHY THE PEAK IS MEASURED, NOT THE STOP. The tempting test is       |
+   //| "the stop reads +0.4R, so the trail must be lagging". It is        |
+   //| circular: the only reason a stop reads below the arm threshold is  |
+   //| that it has not moved -- which is the hypothesis under test. Such  |
+   //| a test reports exactly the condition it is meant to detect as      |
+   //| healthy, and a fully frozen stop reads NEGATIVE R and passes. So   |
+   //| the excursion is taken from the live price every cycle and kept as |
+   //| a running maximum (m_trailPeakRR) across cycles. A stop can then   |
+   //| be judged stale against a fact that does not depend on it.         |
+   //|                                                                   |
+   //| WHY TWO CYCLES. Same reason AuditStateConsistency uses two: the    |
+   //| audit runs on its own timer, so the tick that first pushes price   |
+   //| through the arm threshold and the tick that first writes the stop  |
+   //| need not land in the same audit window. One cycle of lag is the    |
+   //| normal shape of a fill, not an incident -- and an audit that       |
+   //| emails on it would be wrong every time.                            |
+   //|                                                                   |
+   //| WHAT IS *NOT* CLAIMED. This body does not assert the stop equals   |
+   //| the trail value, does not know the ATR, and does not measure how   |
+   //| far the stop lags. It asserts only the structural invariant that   |
+   //| makes the rest of the design meaningful: once price has been       |
+   //| available past InpTrailStartRR, the basket's stop must have left   |
+   //| the losing side of entry. Anything stricter would duplicate the    |
+   //| trade manager's arithmetic here and drift from it silently.        |
+   //+------------------------------------------------------------------+
+   void              AuditTrailingHealth(void)
+     {
+      // No geometry pushed yet, or no tracked trade: nothing to judge. The
+      // peak is also dropped, so a re-arm begins from a clean slate.
+      if(!m_haveGeometry || !m_trackedActive || m_trackedPrimary == 0)
+        {
+         ClearLatch(m_alertSent_StaleTrail);
+         m_trailPeakRR = 0.0;
+         return;
+        }
+
+      bool isLong = (m_trackedDir == DIR_LONG);
+      if(!isLong && m_trackedDir != DIR_SHORT)
+        {
+         // DIR_NONE: the order layer has a trade but no resolved direction.
+         // Treat as unjudgeable rather than guessing a side.
+         ClearLatch(m_alertSent_StaleTrail);
+         return;
+        }
+
+      // The excursion, in R, of the price the EA would actually pay to exit
+      // on now: BID for a long and ASK for a short, i.e. the same side the
+      // trail's own ATR formula is driven from.
+      double price = isLong ? SymbolInfoDouble(m_symbol, SYMBOL_BID)
+                            : SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+      if(price <= 0.0)
+        {
+         ClearLatch(m_alertSent_StaleTrail);
+         return;
+        }
+
+      double rr = (isLong ? (price - m_trackedEntry)
+                          : (m_trackedEntry - price)) / m_trackedRRUnit;
+      NoteExcursion(rr);
+
+      // Not yet armed: the trail gate in Update() is still closed, so no
+      // stop movement is owed and any stop is by definition not stale.
+      if(m_trailPeakRR < InpTrailStartRR)
+        {
+         ClearLatch(m_alertSent_StaleTrail);
+         return;
+        }
+
+      // The trail is armed: price has been past InpTrailStartRR at some point
+      // since the tracked ticket changed. Read the LIVE stop from the book --
+      // the broker is the authority on what is really in force -- and fall
+      // back to the pushed working stop only when the book has no stop for
+      // this ticket.
+      double sl = BookStopForTicket(m_trackedPrimary);
+      if(sl <= 0.0) sl = m_trackedSL;
+      if(sl <= 0.0)
+        {
+         DispatchAlertOnce(m_alertSent_StaleTrail,
+                           "HighTable: trail armed but basket carries NO stop",
+                           "Trail armed at +" + DoubleToString(InpTrailStartRR, 2) +
+                           "R and price has since reached +" +
+                           DoubleToString(m_trailPeakRR, 2) +
+                           "R, but ticket #" + IntegerToString((long)m_trackedPrimary) +
+                           " has no stop attached at the broker and the order layer" +
+                           " has none recorded either. Entry " +
+                           DoubleToString(m_trackedEntry, _Digits) + ", 1R = " +
+                           DoubleToString(m_trackedRRUnit, _Digits) +
+                           ". The basket is running unprotected.",
+                           HT_SEV_WARN);
+         return;
+        }
+
+      // The invariant. A trail that has genuinely armed must have moved the
+      // stop to at least entry, i.e. off the losing side. A stop still
+      // reading on the losing side after the peak cleared the arm threshold
+      // means the trail never wrote -- the exact failure this check exists
+      // to surface.
+      double stopRR = (isLong ? (sl - m_trackedEntry)
+                              : (m_trackedEntry - sl)) / m_trackedRRUnit;
+      if(stopRR >= 0.0)
+        {
+         ClearLatch(m_alertSent_StaleTrail);
+         return;
+        }
+
+      DispatchAlertOnce(m_alertSent_StaleTrail,
+                        "HighTable: trail armed but stop never moved",
+                        "Trail armed at +" + DoubleToString(InpTrailStartRR, 2) +
+                        "R and price reached +" + DoubleToString(m_trailPeakRR, 2) +
+                        "R, yet the stop on ticket #" +
+                        IntegerToString((long)m_trackedPrimary) + " still sits at " +
+                        DoubleToString(stopRR, 2) + "R (stop " +
+                        DoubleToString(sl, _Digits) + ", entry " +
+                        DoubleToString(m_trackedEntry, _Digits) + ", 1R = " +
+                        DoubleToString(m_trackedRRUnit, _Digits) +
+                        ") - it has not left the losing side of entry, so the" +
+                        " armed trail is not tightening the basket. Divergence" +
+                        " persisted across an audit cycle.",
+                        HT_SEV_WARN);
+     }
+
+   //+------------------------------------------------------------------+
+   //| Read-only book query: the stop attached to one ticket.            |
+   //|                                                                   |
+   //| Returns 0 when the ticket is not in the symbol book or carries no  |
+   //| stop, so callers must treat 0 as "no stop visible" and never as a  |
+   //| stop at price zero. Scanned from the END of the book, the same     |
+   //| idiom every other book read in this class uses.                    |
+   //+------------------------------------------------------------------+
+   double            BookStopForTicket(ulong ticket)
+     {
+      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
+        {
+         if(PositionGetTicket(idx) <= 0) continue;
+         if((ulong)PositionGetInteger(POSITION_TICKET) != ticket) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         return PositionGetDouble(POSITION_SL);
+        }
+      return 0.0;
+     }
+
    //| AuditRiskExposure - independent position risk audit.              |
    //|                                                                   |
    //| Reads the terminal book directly, never the order layer, so it    |
@@ -794,6 +1046,15 @@ public:
    //|      The exception is keyed to the EXACT tracked ticket, so an     |
    //|      unrelated manual or foreign-EA magic-0 leg still cannot be    |
    //|      counted -- the blast radius stays one position.              |
+   //|                                                                   |
+   //| v5.63 adds a SECOND, independent leg to this body: the SUM of the  |
+   //| loss-side risk across the basket, measured against the stacked     |
+   //| design budget (RiskPercent + InpRiskT2Pct + InpRiskT3Pct +        |
+   //| InpRiskT4Pct, plus the same 50% tolerance). The per-leg peak above |
+   //| cannot see it: four legs each comfortably inside 1.5% can still    |
+   //| sum past what the pyramid was designed to carry. The two checks    |
+   //| share the loop and the loss-side guard, and each owns its own      |
+   //| latch, so a basket can report either, both, or neither.            |
    //+------------------------------------------------------------------+
    void              AuditRiskExposure(void)
      {
@@ -808,6 +1069,13 @@ public:
       double maxAllowedRiskPct = RiskPercent * 1.50;
       double peakRiskPct = 0.0;
       ulong  peakTicket  = 0;
+      // v5.63: the SUMMED loss-side exposure of the basket. peakRiskPct above
+      // measures the worst SINGLE leg and is deliberately blind to how many
+      // legs are stacked behind the shared stop; this accumulates them. Both
+      // are needed because they fail differently -- a single oversized leg is
+      // a sizing bug, while four correctly-sized legs summing past the design
+      // budget is a pyramid bug, and only the sum can see the second one.
+      double sumRiskPct = 0.0;
 
       for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
         {
@@ -846,6 +1114,11 @@ public:
             peakRiskPct = posRiskPct;
             peakTicket  = ticket;
            }
+
+         // v5.63: accumulate the same loss-side percentage into the basket sum.
+         // Only legs already past the lossDist > 0 guard above reach here, so a
+         // stop on the profit side contributes nothing on either measure.
+         sumRiskPct += posRiskPct;
         }
 
       if(peakRiskPct > maxAllowedRiskPct)
@@ -862,6 +1135,46 @@ public:
       else
         {
          ClearLatch(m_alertSent_RiskBreach);
+        }
+
+      // ---- v5.63: the AGGREGATE leg --------------------------------------
+      // The per-leg test above is blind to how many legs are stacked behind
+      // the shared stop: four legs each inside their own budget can still sum
+      // past the design. The stacked budget is the same 50% tolerance applied
+      // to the SUM of the nominal rung risks, so a correctly-sized pyramid at
+      // full size sits exactly at it and never alerts. Confirmed across two
+      // cycles for the same reason as the trail check: a tranche landing just
+      // before its stop is pushed reads high for one cycle, and that is the
+      // normal shape of a fill rather than an incident.
+      double nominalStackPct    = RiskPercent + InpRiskT2Pct + InpRiskT3Pct + InpRiskT4Pct;
+      double maxAllowedStackPct = nominalStackPct * 1.50;
+      if(sumRiskPct > maxAllowedStackPct)
+        {
+         if(m_aggRiskSeen)
+           {
+            DispatchAlertOnce(m_alertSent_AggRiskBreach,
+                              "HighTable: aggregate basket risk breach",
+                              "Summed loss-side risk across the basket is " +
+                              DoubleToString(sumRiskPct, 2) +
+                              "% of equity, above the stacked-pyramid allowance " +
+                              DoubleToString(maxAllowedStackPct, 2) + "% (" +
+                              DoubleToString(nominalStackPct, 2) +
+                              "% nominal design + 50% tolerance). The worst single" +
+                              " leg is " + DoubleToString(peakRiskPct, 2) +
+                              "%, so every leg may be individually in budget - the" +
+                              " problem is how many of them are stacked behind the" +
+                              " shared stop.",
+                              HT_SEV_WARN);
+           }
+         else
+           {
+            m_aggRiskSeen = true;
+           }
+        }
+      else
+        {
+         ClearLatch(m_alertSent_AggRiskBreach);
+         m_aggRiskSeen = false;
         }
      }
   };

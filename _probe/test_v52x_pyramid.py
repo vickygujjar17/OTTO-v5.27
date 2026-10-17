@@ -13,11 +13,13 @@ Pins the behaviour that the MQL5 compiler gate CANNOT exercise:
      the success path, so a rung can neither be re-armed nor skipped.
   4. A successful scale-in raises the shared per-tick guard on every rung, so
      the freshly-filled ticket keeps its protective stop for one tick.
-  5. The ATR trail arms at +2.0R on both directions, read from
+  5. The ATR trail arms at +1.0R on both directions, read from
      InpTrailStartRR (v5.62: that input now gates the ATR formula and the trail
-     tally ONLY); InpLock3RRR survives only as a declared-but-unused input. The
-     sibling +1.0R milestone floor is applied to the basket unconditionally, so
-     retuning the trail's activation R:R can no longer darken the ladder.
+     tally ONLY; v5.63: its value is 1.0, so the trail arms on the same rung as
+     the ladder's first floor); InpLock3RRR survives only as a declared-but-unused
+     input. The sibling +1.0R milestone floor is applied to the basket
+     unconditionally, so retuning the trail's activation R:R can no longer darken
+     the ladder.
   6. The lot-sizing floor is epsilon-safe, so a raw lot that is mathematically
      an exact multiple of the volume step is not silently dropped one step.
   7. The worst SINGLE leg sits inside the SafetyMaxRiskPct per-leg budget, and
@@ -347,14 +349,14 @@ check("no rung ever hands the dynamic ATR trail to AddPyramidTranche",
 
 
 # ----------------------------------------------------------------------
-# 6. The ATR trail arms at +2.0R on BOTH directions, InpLock3RRR is no longer
+# 6. The ATR trail arms at +1.0R on BOTH directions, InpLock3RRR is no longer
 #    read anywhere, and (v5.62) InpTrailStartRR gates the ATR formula + tally
 #    ONLY -- never the application of the milestone ladder.
 # ----------------------------------------------------------------------
 TRAIL_RR = num_input(DEFS_T, "InpTrailStartRR")
 BE_RR = num_input(DEFS_T, "InpBreakEvenRR")
 check("InpTrailStartRR exists", TRAIL_RR is not None)
-check("InpTrailStartRR defaults to +2.0R", TRAIL_RR == 2.0, TRAIL_RR)
+check("InpTrailStartRR defaults to +1.0R", TRAIL_RR == 1.0, TRAIL_RR)
 
 # Three live sites still read the trail trigger: the LONG ATR arm gate, the
 # SHORT ATR arm gate, and the single-ticket push counter at the bottom of
@@ -513,8 +515,8 @@ check("each rung target sits strictly below its own trigger (descending ladder)"
       None not in (L2_TGT, L3_TGT, L2_TRIG, L3_TRIG) and
       0.0 < L2_TGT < L3_TGT and L2_TGT < L2_TRIG and L3_TGT < L3_TRIG,
       (L2_TGT, L3_TGT, L2_TRIG, L3_TRIG))
-check("breakeven / T2 scale-in arm on the +1.0R rung; the ATR trail waits for +2.0R",
-      BE_RR == 1.0 and T2_RR == 1.0 and TRAIL_RR == 2.0,
+check("breakeven / T2 scale-in arm on the +1.0R rung; the ATR trail arms there too (v5.63)",
+      BE_RR == 1.0 and T2_RR == 1.0 and TRAIL_RR == 1.0,
       (BE_RR, T2_RR, TRAIL_RR))
 
 # --- group B: the floor arithmetic exactly as shipped -----------------
