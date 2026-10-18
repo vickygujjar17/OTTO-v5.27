@@ -1,0 +1,127 @@
+567: fix — journal printed the SUPPORT stop on the wrong side of its zone
+
+RATIONALE
+
+  No trading geometry changes. The entry remains NEAR edge +/-
+  (2.0*blockHeight + 1.5*ATR), the BREAK veto remains anchored on
+  BlockEntryPrice(), and slDist remains blockHeight + 0.5*ATR. One printed
+  sign moved.
+
+  slDist is IDENTICAL in both directions, so with the far edge pinned at 0.0
+  and the near edge one blockHeight inside it:
+
+    LONG  (RESISTANCE): near = -bh, entry = -bh + gap =  bh + 1.5*ATR
+                        stop  = entry - slDist      =  +1.0*ATR   ABOVE
+    SHORT (SUPPORT)   : near = +bh, entry = +bh - gap = -bh - 1.5*ATR
+                        stop  = entry + slDist      =  -1.0*ATR   BELOW
+
+  The blockHeight terms cancel exactly, so the stop always lands one full ATR
+  past the far edge and only the SIGN follows the direction. v5.57..v5.66
+  printed "SL at Far Edge + 1.0*ATR" for BOTH rows. The RESISTANCE row was
+  correct; the SUPPORT row described a stop 1.0*ATR on the wrong side of its
+  own zone -- the mirror image of where the broker stop actually sits. An
+  operator reading "SL at Far Edge + 1.0*ATR" beside "Zone Top=T | Bottom=B"
+  computes a SUPPORT stop ABOVE the block when the code places it BELOW.
+
+  Nothing tied that caption to CalcSLDistance(), which is why it survived four
+  releases. v5.58 synced the journal to the anticipation model and pinned the
+  entry clauses; the SL half was copied across with the sign unexamined.
+
+CONSIDERED AND REJECTED: INVERTING THE ENTRY SIGNS
+
+  The report this release answers asked for the ENTRY signs to flip:
+  b.bottom - gap for LONG, b.top + gap for SHORT. That would be a regression,
+  not a fix, and was declined on evidence:
+
+  * git log -S 'block.bottom - gap' returns NOTHING. The requested LONG form
+    has never existed in this repository, so it cannot be a restore.
+  * e2568aa^ (v5.65) carried `(BlockDirection(b) == DIR_LONG) ? (b.bottom +
+    slDist) : (b.top - slDist)` -- the SAME polarity as today. v5.66 widened
+    slDist into gap; no sign has ever flipped.
+  * `+gap` is the documented design, not a slip: the entry is measured OUT
+    from the NEAR edge, which at arm time the breakout has only just cleared,
+    so price is still short of it and the trigger is a genuine STOP cross.
+    OttoDefines.mqh states the fill lands blockHeight + 1.5*ATR BEYOND the
+    far edge, and CheckVirtualTriggers() fires a LONG only when the ask RISES
+    to the level (`isLong ? (ask < triggerPrice)`).
+  * Under the requested signs breakLevel for a LONG becomes b.bottom - gap,
+    which sits BELOW spot. The re-anchored test at ProcessBlocks
+    (close1 > breakLevel + ATRBufferBreak*atrNow) is then TRUE on the first
+    close after arming: SetVeto(i, VETO_BROKEN) fires and
+    CancelOrdersForInvalidBlocks() drops the pending before price can reach
+    it. Every LONG dies instantly, mirrored for every SHORT -- reintroducing
+    on 100% of blocks exactly the failure e2568aa fixed on a subset.
+  * GetOrderTypeForBlock() returns BUY_LIMIT/SELL_LIMIT, so a LONG entry
+    below a RESISTANCE zone would rest as a pullback limit, which the v5.52
+    pure-continuation mapping deliberately retired.
+
+  A pre-breakout limit entry is a legitimate but DIFFERENT feature. It needs
+  its own entry style with inverted break-veto polarity, an inverted cross
+  test, and STOP/LIMIT dispatch. It is not a two-line sign change and is out
+  of scope here.
+
+SOURCE
+
+  COttoJournal.mqh -- the SUPPORT SL clause, in BOTH writers
+    "Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge + 1.0*ATR)"
+    "Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge - 1.0*ATR)"
+    LogSetupArmed() and LogEntry() carry byte-identical actionDesc rows, so
+    one literal covers both (count asserted at 2). The RESISTANCE rows are
+    CORRECT as shipped and were left alone. The entry half of each row
+    ("Sell at Near Edge - 2.0*H - 1.5*ATR") was already right and is
+    unchanged -- only the SL half was mirrored.
+
+  _probe/test_v557_frontrun.py -- the pin that should have existed
+    * Module docstring gains property 5, recording the derived sign so the
+      next reader does not have to re-derive it.
+    * Section 10's header pin flips for SUPPORT only (still count == 2).
+    * NEW: sl_offset_from_far_edge(bh, atr, is_long) DERIVES the offset from
+      the shipped gap and slDist instead of restating a caption, asserted to
+      be exactly +/- 1.0*ATR across all four CASES.
+    * NEW: the journal is asserted to print that derived sign -- SUPPORT "-",
+      RESISTANCE "+", and the retired SUPPORT "+" form asserted ABSENT.
+
+  _tools/_patch567.py -- committed one-shot, following the _patch566.py
+    precedent: exact literals with asserted match counts, so a drifted anchor
+    aborts instead of patching the wrong line. CRLF-guarded on load and save.
+
+  _tools/_commit567.txt -- this note.
+
+GATES
+
+  * build_check.ps1 : 0 errors / 0 warnings, GATE PASSED, headers verified from
+    the staging tree; all 11 OTTO modules resolved [STAGED], zero [TERMINAL] /
+    [MISSING] (binary 255150 bytes).
+  * test_v557_frontrun.py 114/114 (was 112/112) -- the two new checks are the
+    derived sign and the printed row, so the pin cannot pass while the code
+    disagrees.
+  * _bump_probe.ps1 : 20 rows, bump_exit=0, restored_identical=True,
+    guard_verdict=PASS (0 stale).
+  * _vercensus.py : all 20 rows resolve at 5.67, exit 0.
+  * normalize_eol.py . --check : files=11, rewritten=0, strict CRLF preserved
+    (bareLF=0, bareCR=0 on every shipped source).
+  * verify_integrity.py : HEADna == WORKna and CRLF clean on all 11 files
+    (0/0, 51/51, 78/78, 6/6, 15/15, 12/12, 213/213, 9/9, 15/15, 3973/3973,
+    166/166). The 11 DIFFERS verdicts are "worktree vs HEAD", i.e. exactly
+    this commit, and resolve on commit.
+  * Full probe suite: 25 GREEN / 4 RED, the four reds at their documented
+    counts and identical to the v5.66 baseline: test_v528_hotfix 57/68,
+    test_v531_smart_trim 15/38, test_v532_hightable 125/135, test_v543_session
+    27/29. No new red, no green-count drop; only v557 moved (112 -> 114).
+
+KNOWN RED, OUT OF SCOPE
+
+  * AuditTrimHealth repair (the 10 [FAIL] in the trim silo).
+  * The floating-loss trim silo's disagreement with AuditTrimHealth.
+  * NY-DST session helpers (test_v543_session).
+  * The v5.543 cancel-write count.
+
+ROLLBACK
+
+  Single-commit revert. Two literals in COttoJournal.mqh and the section 10
+  pins that describe them -- no runtime behaviour is carried by this commit, so
+  a revert restores the v5.66 journal EXACTLY and cannot affect any trade. That
+  is precisely why this shipped as its own commit rather than folded into a
+  geometry change: the diff is provably inert at runtime and independently
+  verifiable.
+

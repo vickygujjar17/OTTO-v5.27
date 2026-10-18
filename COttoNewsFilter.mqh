@@ -4,7 +4,7 @@
 //|              OTTO EA — Institutional news blackout filter        |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.66"
+#property version   "5.67"
 
 #ifndef __OTTO_NEWS_FILTER__
 #define __OTTO_NEWS_FILTER__
