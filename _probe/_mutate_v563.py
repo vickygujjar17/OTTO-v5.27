@@ -116,15 +116,17 @@ MUTATIONS = [
      ''),
 
     ("the stale-trail latch never re-arms on the not-yet-armed path", AUD,
-     "      if(m_trailPeakRR < InpTrailStartRR)\n"
-     "        {\n"
      "         ClearLatch(m_alertSent_StaleTrail);\n"
+     "         ClearLatch(m_alertSent_LaggingFloor);\n"
+     "         m_lagFloorSeen = false;\n"
      "         return;\n"
-     "        }",
-     "      if(m_trailPeakRR < InpTrailStartRR)\n"
-     "        {\n"
+     "        }\n"
+     "\n"
+     "      // The trail is armed",
      "         return;\n"
-     "        }"),
+     "        }\n"
+     "\n"
+     "      // The trail is armed"),
 
     ("DIR_NONE is guessed as a long instead of standing down", AUD,
      "      if(!isLong && m_trackedDir != DIR_SHORT)\n"
@@ -132,6 +134,8 @@ MUTATIONS = [
      "         // DIR_NONE: the order layer has a trade but no resolved direction.\n"
      "         // Treat as unjudgeable rather than guessing a side.\n"
      "         ClearLatch(m_alertSent_StaleTrail);\n"
+     "         ClearLatch(m_alertSent_LaggingFloor);\n"
+     "         m_lagFloorSeen = false;\n"
      "         return;\n"
      "        }",
      "      ;"),
@@ -145,9 +149,11 @@ MUTATIONS = [
      "      if(ticket != m_trailPeakTicket)\n"
      "        {\n"
      "         m_trailPeakTicket = ticket;\n"
-     "         m_trailPeakRR     = 0.0;\n"
-     "        }",
-     "      m_trailPeakTicket = ticket;"),
+     "         m_trailPeakRR     = 0.0;\n",
+     "      m_trailPeakTicket = ticket;\n"
+     "      if(false)\n"
+     "        {\n"
+     "         m_trailPeakRR     = 0.0;\n"),
 
     ("the geometry push stores the 1R but forgets to mark it available", AUD,
      "      m_haveGeometry  = true;",
@@ -242,6 +248,87 @@ MUTATIONS += [
     ("the geometry push is moved out of the active-trade branch", MAIN,
      "      g_highTable.SetTrackedGeometry(active.ticket, active.direction,",
      "      }\n   g_highTable.SetTrackedGeometry(active.ticket, active.direction,"),
+
+    # ---- D. v5.68: the milestone floor --------------------------------
+    # THE defect this release exists to fix: restore the pre-v5.68 terminal
+    # pass, so any stop at or past entry reads healthy forever.
+    ("v5.68: the floor test is replaced by the old stopRR >= 0.0 pass", AUD,
+     "      bool   owesFloor = false;\n"
+     "      double floorRR   = ExpectedFloorRR(m_trailPeakRR, owesFloor);",
+     "      bool   owesFloor = (stopRR >= 0.0);\n"
+     "      double floorRR   = 0.0;"),
+
+    # The ladder resolved lowest-first under-states the floor at +2.0R..+3.0R.
+    ("v5.68: the ladder is resolved lowest rung first", AUD,
+     "      if(InpLockProfitRR > 0.0 && InpLockProfitTargetRR > 0.0 &&\n"
+     "         peakRR >= InpLockProfitRR)\n"
+     "         return InpLockProfitTargetRR;\n"
+     "\n"
+     "      if(InpLockProfit2RR > 0.0 && InpLockProfit2TargetRR > 0.0 &&\n"
+     "         peakRR >= InpLockProfit2RR)\n"
+     "         return InpLockProfit2TargetRR;",
+     "      if(InpLockProfit2RR > 0.0 && InpLockProfit2TargetRR > 0.0 &&\n"
+     "         peakRR >= InpLockProfit2RR)\n"
+     "         return InpLockProfit2TargetRR;\n"
+     "\n"
+     "      if(InpLockProfitRR > 0.0 && InpLockProfitTargetRR > 0.0 &&\n"
+     "         peakRR >= InpLockProfitRR)\n"
+     "         return InpLockProfitTargetRR;"),
+
+    # A rung with a disabled TARGET would demand a stop the EA never sets.
+    ("v5.68: rung 3 drops its target guard, demanding a disabled floor", AUD,
+     "      if(InpLockProfitRR > 0.0 && InpLockProfitTargetRR > 0.0 &&",
+     "      if(InpLockProfitRR > 0.0 &&"),
+
+    # Without the tolerance a correctly-applied cost-covering BE reads lagging.
+    ("v5.68: the floor tolerance is removed, so BE false-alarms", AUD,
+     "stopRR >= floorRR - HT_FLOOR_TOLERANCE_R",
+     "stopRR >= floorRR"),
+
+    # An unbounded tolerance excuses EVERY lag, including a wholly frozen stop.
+    ("v5.68: the floor tolerance is made unbounded", AUD,
+     "#define HT_FLOOR_TOLERANCE_R  0.10",
+     "#define HT_FLOOR_TOLERANCE_R  99.0"),
+
+    ("v5.68: the lagging-floor latch is never initialised", AUD,
+     "      m_alertSent_LaggingFloor       = false;\n", ""),
+
+    ("v5.68: the lagging-floor two-cycle confirmation is dropped", AUD,
+     "      if(!m_lagFloorSeen)\n"
+     "        {\n"
+     "         m_lagFloorSeen = true;\n"
+     "         return;\n"
+     "        }\n",
+     ""),
+
+    # ---- D. v5.68: the orphan sweep ----------------------------------
+    # Drop the magic filter from the COUNT scan only: every foreign/manual leg on
+    # the symbol would be counted as an orphan. Anchored on `n++` so it cannot
+    # hit FirstOrphanLegTicket, whose body has no counter.
+    ("v5.68: the orphan COUNT drops its magic scope", AUD,
+     "         if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;\n"
+     "         if(PositionGetDouble(POSITION_SL) > 0.0) continue;\n"
+     "         n++;",
+     "         if(PositionGetDouble(POSITION_SL) > 0.0) continue;\n"
+     "         n++;"),
+
+    # Invert the stop test so a PROTECTED leg is reported as the orphan.
+    ("v5.68: the orphan sweep reports PROTECTED legs instead", AUD,
+     "         if(PositionGetDouble(POSITION_SL) > 0.0) continue;\n"
+     "         n++;",
+     "         if(PositionGetDouble(POSITION_SL) <= 0.0) continue;\n"
+     "         n++;"),
+
+    # Bury the sweep behind the phantom gate: the blind spot returns. Expressed
+    # as a conditional call, which is exactly "only run when the phantom path
+    # would fire" -- the burial this check exists to prevent.
+    ("v5.68: the orphan sweep only runs on the phantom path", AUD,
+     "      int orphans = CountOrphanLegs();",
+     "      int orphans = (m_trackedActive && !BookHasTicket(m_trackedPrimary))\n"
+     "                     ? CountOrphanLegs() : 0;"),
+
+    ("v5.68: the orphan latch is never initialised", AUD,
+     "      m_alertSent_OrphanLeg          = false;\n", ""),
 ]
 
 

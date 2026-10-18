@@ -229,9 +229,17 @@ check("the live stop is preferred from the book, with the pushed value as fallba
 check("the stop's own R is derived with the debug-vs-long sign convention",
       re.search(r"stopRR\s*=\s*\(isLong\s*\?\s*\(sl\s*-\s*m_trackedEntry\)", TRAIL_C)
       is not None)
-check("a stop still on the losing side is what raises the alert",
-      re.search(r"if\s*\(\s*stopRR\s*>=\s*0\.0\s*\)\s*\{[^}]*ClearLatch", TRAIL_C, re.S)
-      is not None)
+check("a stop still on the losing side is what raises the v5.63 alert",
+      re.search(r"if\s*\(\s*stopRR\s*<\s*0\.0\s*\)\s*\{[^}]*DispatchAlertOnce"
+                r"\(\s*m_alertSent_StaleTrail", TRAIL_C, re.S) is not None)
+# v5.68: `stopRR >= 0.0` must no longer be a terminal pass. Clearing the latch
+# and returning there is exactly what let a stop frozen at +0.01R read healthy
+# forever, so the absence of that shape is itself a requirement.
+check("v5.68: leaving the losing side is NOT the whole test any more",
+      re.search(r"if\s*\(\s*stopRR\s*>=\s*0\.0\s*\)\s*\{\s*ClearLatch"
+                r"\(\s*m_alertSent_StaleTrail\s*\)\s*;\s*return\s*;\s*\}",
+                TRAIL_C) is None,
+      "the pre-v5.68 terminal pass is still present")
 check("a missing stop entirely is reported rather than skipped",
       re.search(r"if\s*\(\s*sl\s*<=\s*0\.0\s*\)\s*\{[^}]*DispatchAlertOnce", TRAIL_C, re.S)
       is not None)
@@ -283,13 +291,18 @@ check("AuditTrailingHealth re-arms its latch on every healthy path",
       "found %d" % TRAIL_C.count("ClearLatch(m_alertSent_StaleTrail)"))
 check("the latch lifecycle pairing holds (raise + re-arm in the same body)",
       latch_lifecycle_ok(TRAIL_C, "StaleTrail"))
+check("v5.68: the lagging-floor latch has the same pairing",
+      latch_lifecycle_ok(TRAIL_C, "LaggingFloor"))
 # Every healthy exit of the body must re-arm, or the incident is reported once
-# and then silenced for the rest of the session.
+# and then silenced for the rest of the session. The body now owns TWO latches,
+# so the bound is on the sum: at most one exit may stand down without a re-arm,
+# and that one is the deliberate first-sighting wait (which has raised nothing).
 _returns = len(re.findall(r"\breturn\s*;", TRAIL_C))
+_clears = sum(len(re.findall(r"ClearLatch\(\s*m_alertSent_%s\b" % _l, TRAIL_C))
+              for _l in ("StaleTrail", "LaggingFloor"))
 check("every early exit in the body is paired with a re-arm",
-      TRAIL_C.count("ClearLatch(m_alertSent_StaleTrail)") >= _returns - 2,
-      "clears=%d returns=%d"
-      % (TRAIL_C.count("ClearLatch(m_alertSent_StaleTrail)"), _returns))
+      _clears >= _returns - 1,
+      "clears=%d returns=%d" % (_clears, _returns))
 
 
 
@@ -514,6 +527,207 @@ check("GetActiveTradeRef is still a const read of the active record",
 # The auditor must remain structurally read-only: no trade module may appear.
 check("the auditor still includes NO trade module",
       not re.search(r"#include\s+\"COtto\w+\.mqh\"", AUD_T))
+
+
+# ----------------------------------------------------------------------
+# D. v5.68 -- the milestone floor, the orphan sweep
+# ----------------------------------------------------------------------
+print("\n-- D. v5.68 milestone floor + orphan sweep --")
+
+check("the auditor is stamped v5.68",
+      re.search(r'#property\s+version\s+"5\.68"', AUD_T) is not None)
+
+# --- The floor helper --------------------------------------------------
+FLOOR = func_body(AUD_T, r"double\s+ExpectedFloorRR\s*\(\s*const\s+double\s+peakRR\s*,"
+                          r"\s*bool\s*&\s*owesFloor\s*\)\s*const")
+check("ExpectedFloorRR is a const member taking an out-parameter", FLOOR is not None)
+FLOOR_C = strip_comments(FLOOR) if FLOOR else ""
+
+# The rungs are read from the LIVE inputs, never from literals. This is the same
+# rule the rest of the class follows and it is what keeps the auditor honest if
+# the ladder is retuned.
+for _inp in ("InpLockProfitRR", "InpLockProfitTargetRR",
+             "InpLockProfit2RR", "InpLockProfit2TargetRR", "InpBreakEvenRR"):
+    check("the floor reads the live input %s" % _inp, _inp in FLOOR_C)
+
+# Both inputs of a rung must gate it, so a rung disabled by setting its trigger
+# OR its target to 0.0 cannot manufacture an expectation the EA will never meet.
+check("rung 3 is guarded by BOTH its trigger and its target",
+      re.search(r"InpLockProfitRR\s*>\s*0\.0\s*&&\s*InpLockProfitTargetRR\s*>\s*0\.0",
+                FLOOR_C) is not None)
+check("rung 2 is guarded by BOTH its trigger and its target",
+      re.search(r"InpLockProfit2RR\s*>\s*0\.0\s*&&\s*InpLockProfit2TargetRR\s*>\s*0\.0",
+                FLOOR_C) is not None)
+check("the breakeven rung is guarded by its own trigger",
+      re.search(r"InpBreakEvenRR\s*>\s*0\.0\s*&&\s*peakRR\s*>=\s*InpBreakEvenRR",
+                FLOOR_C) is not None)
+
+# Highest rung first: at +3.0R the stop is already at +2.0R, so testing the lower
+# rung first would under-state the floor and let a lagging stop through.
+_i3 = FLOOR_C.find("InpLockProfitRR > 0.0")
+_i2 = FLOOR_C.find("InpLockProfit2RR > 0.0")
+_ib = FLOOR_C.find("InpBreakEvenRR > 0.0")
+check("the ladder is resolved highest rung first",
+      -1 < _i3 < _i2 < _ib, "positions: 3.0R=%d 2.0R=%d BE=%d" % (_i3, _i2, _ib))
+
+check("below the first rung the helper reports that NO floor is owed",
+      re.search(r"owesFloor\s*=\s*false\s*;", FLOOR_C) is not None
+      and re.search(r"owesFloor\s*=\s*true\s*;", FLOOR_C) is not None)
+check("the breakeven rung owes exactly 0.0R, not a re-derived offset",
+      re.search(r"peakRR\s*>=\s*InpBreakEvenRR\s*\)\s*return\s+0\.0\s*;", FLOOR_C)
+      is not None)
+
+# ANTI-DUPLICATION. The helper must not re-derive the trade manager's
+# arithmetic: beOffset, the ATR trail and the half-risk rung are its private
+# business, and a second copy here would drift silently.
+check("the floor does not re-derive the trade manager's beOffset/ATR/half-risk",
+      not re.search(r"beOffset|ATR|InpCutRiskRR|HalfRisk", FLOOR_C),
+      "the helper duplicates trade-manager arithmetic")
+
+# --- The derived table: recomputed from the live defines, never pinned ----
+_lp3r = num_input(DEFS_T, "InpLockProfitRR")
+_lp3t = num_input(DEFS_T, "InpLockProfitTargetRR")
+_lp2r = num_input(DEFS_T, "InpLockProfit2RR")
+_lp2t = num_input(DEFS_T, "InpLockProfit2TargetRR")
+_ber = num_input(DEFS_T, "InpBreakEvenRR")
+check("every ladder input resolves from OttoDefines",
+      None not in (_lp3r, _lp3t, _lp2r, _lp2t, _ber),
+      str((_lp3r, _lp3t, _lp2r, _lp2t, _ber)))
+
+
+def expected_floor(peak, r3, t3, r2, t2, be):
+    """Independent re-implementation of the SPEC, not a copy of the MQL."""
+    if r3 > 0.0 and t3 > 0.0 and peak >= r3:
+        return t3
+    if r2 > 0.0 and t2 > 0.0 and peak >= r2:
+        return t2
+    if be > 0.0 and peak >= be:
+        return 0.0
+    return None  # nothing owed
+
+
+# The peaks span below-BE, each rung boundary, and well past the top.
+_PEAKS = [0.0, 0.5, 0.99, 1.0, 1.5, 1.99, 2.0, 2.5, 2.99, 3.0, 4.0, 9.0]
+_ROWS = [(p, expected_floor(p, _lp3r, _lp3t, _lp2r, _lp2t, _ber)) for p in _PEAKS]
+
+# Sanity on the spec itself, before it is used as an oracle: the ladder must be
+# monotone -- a wider excursion can never EARN a looser floor.
+_owed = [f for _, f in _ROWS if f is not None]
+check("the floor spec is monotone non-decreasing in the peak",
+      all(b >= a for a, b in zip(_owed, _owed[1:])), str(_ROWS))
+check("below InpBreakEvenRR no floor is owed",
+      all(f is None for p, f in _ROWS if p < _ber))
+check("at InpBreakEvenRR the floor is 0.0R (cost-covering breakeven)",
+      expected_floor(_ber, _lp3r, _lp3t, _lp2r, _lp2t, _ber) == 0.0)
+check("at InpLockProfit2RR the floor is the +1.0R rung",
+      expected_floor(_lp2r, _lp3r, _lp3t, _lp2r, _lp2t, _ber) == _lp2t)
+check("at InpLockProfitRR the floor is the +2.0R rung",
+      expected_floor(_lp3r, _lp3r, _lp3t, _lp2r, _lp2t, _ber) == _lp3t)
+
+# The shipped values, asserted as the ladder the EA actually ships.
+check("the shipped ladder is +1.0R->BE, +2.0R->+1.0R, +3.0R->+2.0R",
+      (_ber, _lp2r, _lp2t, _lp3r, _lp3t) == (1.0, 2.0, 1.0, 3.0, 2.0),
+      str((_ber, _lp2r, _lp2t, _lp3r, _lp3t)))
+
+# --- The tolerance -----------------------------------------------------
+_tol = re.search(r"#define\s+HT_FLOOR_TOLERANCE_R\s+([0-9.]+)", AUD_T)
+check("HT_FLOOR_TOLERANCE_R is defined", _tol is not None)
+TOL = float(_tol.group(1)) if _tol else -1.0
+check("the tolerance is positive, so one cycle of ratchet lag is absorbed",
+      TOL > 0.0, "tolerance=%s" % TOL)
+# The tolerance exists to absorb lag, not to excuse a missing rung. The tightest
+# rung spacing in the ladder is the gap between consecutive floors.
+_gaps = [abs(b - a) for a, b in zip(_owed, _owed[1:]) if b != a]
+check("the tolerance is far smaller than the tightest rung gap",
+      bool(_gaps) and TOL < min(_gaps) / 2.0,
+      "tolerance=%s tightest gap=%s" % (TOL, min(_gaps) if _gaps else None))
+
+# --- The body actually uses it ----------------------------------------
+check("AuditTrailingHealth calls ExpectedFloorRR on the PEAK",
+      re.search(r"ExpectedFloorRR\s*\(\s*m_trailPeakRR\s*,", TRAIL_C) is not None)
+check("the floor test honours the tolerance",
+      re.search(r"stopRR\s*>=\s*floorRR\s*-\s*HT_FLOOR_TOLERANCE_R", TRAIL_C)
+      is not None)
+check("the floor test is a LOWER bound (a tighter trail still passes)",
+      "stopRR >= floorRR" in TRAIL_C and "MathAbs" not in TRAIL_C,
+      "the floor test is not one-sided")
+check("the lagging-floor alert is WARN, not CRITICAL",
+      re.search(r"DispatchAlertOnce\(\s*m_alertSent_LaggingFloor[\s\S]{0,1600}?HT_SEV_WARN",
+                TRAIL_C) is not None)
+check("the lagging-floor alert names the floor it owes and the stop it found",
+      "floorRR" in TRAIL_C and "stopRR" in TRAIL_C)
+check("the lagging-floor alert is confirmed across two cycles",
+      re.search(r"if\s*\(\s*!\s*m_lagFloorSeen\s*\)", TRAIL_C) is not None)
+
+# --- Latch initialisation ---------------------------------------------
+# Scoped to the CONSTRUCTOR body: a tree-wide search would also match the
+# healthy-path assignment inside the audit bodies, so deleting the constructor
+# line would still "pass" against a file-scope artefact elsewhere.
+CTOR = func_body(AUD_T, r"CHighTableAuditor\s*\(\s*void\s*\)")
+check("the constructor is defined", CTOR is not None)
+CTOR_C = strip_comments(CTOR) if CTOR else ""
+
+check("the lagging-floor latch and its confirm flag start false",
+      re.search(r"m_alertSent_LaggingFloor\s*=\s*false\s*;", CTOR_C) is not None
+      and re.search(r"m_lagFloorSeen\s*=\s*false\s*;", CTOR_C) is not None,
+      "an uninitialised latch would silence the first incident")
+check("the orphan latch and its confirm flag start false",
+      re.search(r"m_alertSent_OrphanLeg\s*=\s*false\s*;", CTOR_C) is not None
+      and re.search(r"m_orphanSeen\s*=\s*false\s*;", CTOR_C) is not None,
+      "an uninitialised latch would silence the first incident")
+check("both v5.68 latches are declared INSIDE the class, before the guard",
+      AUD_T.find("m_alertSent_LaggingFloor;") > 0
+      and AUD_T.find("m_alertSent_OrphanLeg;") > 0
+      and AUD_T.find("#endif  // __OTTO_HIGH_TABLE_AUDITOR__") > 0
+      and AUD_T.find("m_alertSent_LaggingFloor;")
+      < AUD_T.find("#endif  // __OTTO_HIGH_TABLE_AUDITOR__")
+      and AUD_T.find("m_alertSent_OrphanLeg;")
+      < AUD_T.find("#endif  // __OTTO_HIGH_TABLE_AUDITOR__"))
+
+# --- The orphan sweep --------------------------------------------------
+CONS = func_body(AUD_T, r"void\s+AuditStateConsistency\s*\(\s*void\s*\)")
+check("AuditStateConsistency is defined", CONS is not None)
+CONS_C = strip_comments(CONS) if CONS else ""
+
+COUNT_C = strip_comments(func_body(AUD_T,
+                                   r"int\s+CountOrphanLegs\s*\(\s*void\s*\)\s*const") or "")
+FIRST_C = strip_comments(func_body(AUD_T,
+                                   r"ulong\s+FirstOrphanLegTicket\s*\(\s*void\s*\)\s*const") or "")
+check("the orphan sweep reads the live broker stop", "POSITION_SL" in COUNT_C)
+check("the orphan sweep is magic-scoped, so adopted -MAN legs cannot trip it",
+      re.search(r"POSITION_MAGIC\)\s*!=\s*\(long\)m_magic", COUNT_C) is not None,
+      "the sweep is not magic-scoped")
+check("the orphan sweep treats a NON-POSITIVE stop as the fault",
+      re.search(r"POSITION_SL\)\s*>\s*0\.0\s*\)\s*continue\s*;", COUNT_C) is not None
+      and re.search(r"POSITION_SL\)\s*>\s*0\.0\s*\)\s*continue\s*;", FIRST_C) is not None)
+check("the orphan sweep is symbol-scoped too",
+      "POSITION_SYMBOL" in COUNT_C and "POSITION_SYMBOL" in FIRST_C)
+check("the sweep runs in AuditStateConsistency, not behind the phantom branch",
+      "CountOrphanLegs()" in CONS_C
+      and CONS_C.find("CountOrphanLegs()") < CONS_C.find("bool phantom"))
+# ...and it must run UNCONDITIONALLY. An ordering test alone cannot see this:
+# a conditional call still sits textually above `bool phantom`. The statement
+# has to be a plain assignment with no gate of its own.
+check("the sweep call is unconditional, not gated on the phantom test",
+      re.search(r"int\s+orphans\s*=\s*CountOrphanLegs\(\)\s*;", CONS_C) is not None,
+      "the sweep is called conditionally")
+check("the orphan alert is WARN, not CRITICAL",
+      re.search(r"DispatchAlertOnce\(\s*m_alertSent_OrphanLeg[\s\S]{0,900}?HT_SEV_WARN",
+                CONS_C) is not None)
+check("the orphan alert names the offending ticket",
+      "FirstOrphanLegTicket()" in CONS_C)
+check("the orphan alert is confirmed across two cycles",
+      re.search(r"if\s*\(\s*orphans\s*>\s*0\s*&&\s*m_orphanSeen\s*\)", CONS_C) is not None
+      and re.search(r"m_orphanSeen\s*=\s*\(\s*orphans\s*>\s*0\s*\)", CONS_C) is not None,
+      "the first sighting must only advance the confirm flag")
+check("the orphan latch re-arms when the book is clean",
+      latch_lifecycle_ok(CONS_C, "OrphanLeg"))
+
+# The auditor must STILL be structurally read-only after all of this.
+check("v5.68 added no trade-module include",
+      not re.search(r"#include\s+\"COtto\w+\.mqh\"", AUD_T))
+check("the orphan sweep declares itself read-only (no CTrade, no COtto type)",
+      not re.search(r"\bCTrade\b|\bCOtto\w+", COUNT_C + FIRST_C))
 
 
 # ----------------------------------------------------------------------

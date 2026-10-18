@@ -572,8 +572,16 @@ check("MODELLED: a known primary that IS in the book never alerts",
       model_cycles([(True, True, True)] * 4)[0] == 0)
 
 if SC is not None:
+    # v5.68: anchored on the STATE-INCONSISTENCY dispatch specifically. The body
+    # now also carries an orphan-tranche dispatch ABOVE the phantom logic (it is
+    # deliberately independent of the phantom early-returns), so a bare
+    # `DispatchAlertOnce(` search would find that one first and this ordering
+    # assertion would be measuring the wrong incident.
     check("the shipped body confirms the skew before it dispatches",
-          SC.find("m_stateSkewSeen") < SC.find("DispatchAlertOnce("))
+          SC.find("m_stateSkewSeen") >= 0
+          and SC.find("DispatchAlertOnce(m_alertSent_StateInconsistency") >= 0
+          and SC.find("m_stateSkewSeen")
+          < SC.find("DispatchAlertOnce(m_alertSent_StateInconsistency"))
 
 
 # ----------------------------------------------------------------------

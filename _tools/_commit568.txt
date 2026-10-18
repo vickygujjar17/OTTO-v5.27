@@ -1,0 +1,212 @@
+568: feat — comprehensive upgrade of High Table Auditor to monitor deep geometry and stacked risk
+
+RATIONALE
+
+  No trading-logic changes. Every entry, stop, ladder rung, tranche size and
+  trail formula is byte-identical to v5.67. What ships here is the WATCHDOG
+  catching up to the geometry it is supposed to be watching.
+
+  The recon found four things. Two were already correct, one was a live
+  defect, and one was an unmonitored failure mode:
+
+  1. DEEP ENTRY GAP -- ALREADY SYNCED, no change needed.
+     COttoBlockManager.mqh:186 and COttoOrderManager.mqh:691/701 already carry
+     gap = 2.0*blockHeight + 1.5*ATR in both twins.
+
+  2. STACKED RISK -- ALREADY SYNCED, no change needed.
+     nominalStackPct (line 1149) already sums RiskPercent + InpRiskT2Pct +
+     InpRiskT3Pct + InpRiskT4Pct = 1.0 + 1.0 + 0.5 + 0.25 = 2.75% nominal,
+     4.125% with the 50% tolerance. The deep entry cannot inflate it: both the
+     per-leg and the aggregate measure read entry-to-LIVE-STOP distance, and a
+     freshly stacked tranche starts at m_basketRRUnit (bh + 0.5*ATR), which is
+     1R by construction regardless of how wide the entry gap is. A correctly
+     sized scale-in reads at its nominal rung, so the existing body covers the
+     pyramid without a new check. Documented in the body rather than churned.
+
+  3. THE TRAILING LADDER -- THIS WAS THE DEFECT.
+     AuditTrailingHealth asserted only that the stop had LEFT THE LOSING SIDE
+     (`stopRR >= 0.0`) once the trail armed. That invariant is satisfied by a
+     stop frozen at +0.01R. A basket that ran to +2.0R -- where the shipped
+     ladder owes a +1.0R floor -- and then never ratcheted again read HEALTHY
+     FOREVER. m_trailPeakRR was computed correctly and then used ONLY as a gate
+     opener, never as an expectation. The watchdog could see the peak and never
+     compared anything against it.
+
+     InpTrailStartRR is confirmed to stay 1.0 (OttoDefines.mqh:343-365, pinned
+     by the v5.63 probe); the ladder audited is the shipped one:
+     +1.0R -> cost-covering BE, +2.0R -> +1.0R, +3.0R -> +2.0R.
+
+  4. A TRANCHE DROPPED BY A PARTIAL STOP PUSH -- WAS INVISIBLE.
+     AuditStateConsistency only asked whether the PRIMARY ticket still existed,
+     which is a statement about the basket's identity and says nothing about
+     whether each leg inside it is protected. COttoOrderManager.mqh:3561-3579
+     walks every tranche, sets allApplied = false when a modify is rejected,
+     and STILL advances the session ratchet; the one-way guard at 3551 then
+     early-returns on every later tick. So a push rejected for only one leg
+     leaves that leg at sl == 0 permanently while the EA believes the whole
+     basket wears the unified stop.
+
+SOURCE
+
+  CHighTableAuditor.mqh -- ExpectedFloorRR(peakRR, owesFloor)
+    NEW private const helper. A conservative LOWER BOUND on the stop the
+    milestone ladder must have left in place for an observed peak, resolved
+    HIGHEST RUNG FIRST so the strictest earned rung always wins:
+
+        peak >= InpLockProfitRR  -> InpLockProfitTargetRR   (+2.0R)
+        peak >= InpLockProfit2RR -> InpLockProfit2TargetRR  (+1.0R)
+        peak >= InpBreakEvenRR   -> 0.0R (cost-covering BE)
+        otherwise                -> owesFloor = false
+
+    Highest-first matters: at +3.0R the stop already sits at +2.0R, which is
+    forward of the +1.0R the next rung would set, so testing the lower rung
+    first would UNDER-state the floor and let a lagging stop through.
+
+    Each rung is guarded by BOTH of its inputs, matching the trade manager,
+    where a 0.0 trigger OR a 0.0 target disables the rung outright -- so
+    disabling a rung here cannot manufacture an expectation the EA never meets.
+
+    Deliberately does NOT re-derive beOffset, the ATR trail value or the
+    half-risk rung. Those are the trade manager's private arithmetic and a
+    second copy here would drift silently the first time the ATR multiplier or
+    the friction model changed -- the second-source-of-truth failure the
+    decoupling contract at the top of the file forbids. Because this is a LOWER
+    bound, a stop the ATR trail pushed TIGHTER than the milestone floor still
+    passes; the check can only fire when the stop is genuinely BEHIND a rung
+    its peak already cleared.
+
+  CHighTableAuditor.mqh -- HT_FLOOR_TOLERANCE_R = 0.10
+    The ladder is a ONE-WAY ratchet driven from OnTick while this audit runs on
+    its own timer, so the tick that pushes price past a rung and the tick that
+    writes the wider stop need not share an audit window. The cost-covering BE
+    rung also seats a hair ABOVE entry by construction (beOffset carries
+    commission + swap + half-spread), so an exact comparison would report a
+    correctly-applied BE as lagging. Sized to swallow both and nothing more: it
+    is 10x smaller than the 1.0R gap between any two rungs, so a stop that has
+    genuinely failed to advance a whole rung cannot hide inside it.
+
+  CHighTableAuditor.mqh -- AuditTrailingHealth
+    The losing-side test is inverted into the reporting branch (still the v5.63
+    incident, unchanged message and latch), and the healthy path now FALLS
+    THROUGH to the floor test instead of returning. New alert
+    "HighTable: stop lagging its milestone floor", WARN -- not CRITICAL, because
+    the stop has left the losing side and the basket is still protected; what
+    is owed is an extra rung of locked profit, not survival. Two-cycle confirmed
+    via m_lagFloorSeen, and m_alertSent_LaggingFloor re-arms on every healthy
+    exit including the no-floor-owed case. The latch and its confirm flag are
+    both reset when the tracked ticket changes, so a sighting cannot confirm
+    against a different trade's first cycle.
+
+  CHighTableAuditor.mqh -- CountOrphanLegs() / FirstOrphanLegTicket()
+    NEW read-only book queries: magic-scoped legs on this symbol whose
+    POSITION_SL is <= 0. The magic scope is deliberate -- an adopted magic-0
+    primary is excluded by construction, which is correct, because the adoption
+    contract carries the manual leg's own stop, and flagging it would be a
+    false positive on every adoption cycle. FirstOrphanLegTicket() exists so the
+    alert names a ticket the operator can go straight to.
+
+  CHighTableAuditor.mqh -- AuditStateConsistency
+    The orphan sweep runs BEFORE and independently of the phantom branches. The
+    two findings are orthogonal (a live primary with an orphaned tranche, or a
+    phantom primary with no orphan at all), and folding this behind the phantom
+    early-return would re-create the same blind spot one level down. Its own
+    latch (m_alertSent_OrphanLeg) and its own two-cycle confirm (m_orphanSeen),
+    WARN severity, re-arming through the else-shape the aggregate-risk leg
+    already uses.
+
+  CHighTableAuditor.mqh -- AuditRiskExposure doc only
+    Records that the 2.75% / 4.125% stacked budget ALREADY covers the deep
+    geometry and the pyramiding tranches, and why the deep gap cannot inflate
+    the measure. No code change: the recon found nothing to fix.
+
+TOOLING
+
+  _probe/test_v563_trail_health.py -- 164 checks (was 82)
+    * Section B's re-arm assertions realigned to the inverted shape, plus an
+      ABSENCE check that the pre-v5.68 terminal pass
+      (`if(stopRR >= 0.0) { ClearLatch(...); return; }`) is gone.
+    * NEW section D. The floor TABLE IS DERIVED, not literal-pinned:
+      expected_floor() re-implements the SPEC in Python from the four live
+      defines and is swept across peaks {0, 0.5, 0.99, 1.0, 1.5, 1.99, 2.0, 2.5,
+      2.99, 3.0, 4.0, 9.0}. The spec is separately asserted monotone, so the
+      oracle cannot itself be wrong in a way that passes.
+    * The tolerance is asserted > 0 AND smaller than half the tightest rung gap
+      -- an unbounded tolerance would excuse every lag.
+    * Both new latches asserted initialised INSIDE THE CONSTRUCTOR (scoped via
+      func_body, so a file-scope line elsewhere cannot mask a deleted init),
+      and declared INSIDE the class before the include guard -- the exact bug
+      class v5.32 had to fix.
+    * Orphan sweep: POSITION_SL read, magic-scoped, symbol-scoped, called
+      UNCONDITIONALLY, WARN, two-cycle, latch lifecycle, and a no-trade-type
+      check proving it stayed read-only.
+
+  _probe/_mutate_v563.py -- 38 mutations (was 27), 38 caught, 0 skipped
+    11 new v5.68 mutations: the old stopRR>=0.0 pass restored, lowest-rung-first,
+    a rung's target guard dropped, tolerance removed, tolerance made unbounded,
+    each latch never initialised, the two-cycle confirm dropped, the orphan
+    magic scope dropped, the orphan stop test inverted, and the sweep made
+    conditional on the phantom path. Three pre-existing anchors rotted when the
+    bodies changed shape and were re-anchored (asserting a count of 1, so they
+    fail loudly rather than silently skipping).
+
+    Two real gaps were found and closed rather than papered over:
+    - The orphan-init check originally searched the whole file, which matched
+      the healthy-path assignment inside the audit body, so deleting the
+      constructor line still passed. Now scoped to the constructor.
+    - The "not behind the phantom branch" check was purely textual, so a
+      CONDITIONAL call still sat textually above `bool phantom` and survived.
+      Now asserts the call is a plain unconditional assignment.
+
+  _probe/test_v532_hightable.py -- one anchor made precise, not weakened
+    "the shipped body confirms the skew before it dispatches" searched a bare
+    `DispatchAlertOnce(`, which now finds the orphan dispatch first because it
+    deliberately sits ABOVE the phantom logic. Re-anchored on
+    `DispatchAlertOnce(m_alertSent_StateInconsistency` -- it is still measuring
+    that confirmation ordering, just no longer measuring the wrong incident.
+
+  Version census: 19 human-facing rows bumped 5.67 -> 5.68 by
+  _tools/_bump_version.py (11 headers + otto.mq5 banner/Print + 4 input groups
+  + README). "no v5.67 literal remains in the shipped sources or docs".
+
+GATES
+
+  * build_check.ps1 : 0 errors / 0 warnings, GATE PASSED, headers verified from
+    the staging tree; all 11 OTTO modules resolved [STAGED], zero [TERMINAL] /
+    [MISSING] (binary 259616 bytes).
+  * test_v563_trail_health.py 164/164 | _mutate_v563.py 38/38 caught, 0 skipped.
+  * test_v532_pyramid.py 87/87 | test_v557_frontrun.py 114/114.
+  * _bump_probe.ps1 : 20 rows, bump_exit=0, restored_identical=True,
+    guard_verdict=PASS (0 stale).
+  * _vercensus.py : all 20 rows resolve at 5.68, exit 0.
+  * normalize_eol.py . --check : files=11, rewritten=0, strict CRLF preserved
+    (bareLF=0, bareCR=0 on every shipped source).
+  * verify_integrity.py : HEADna == WORKna on all 11 files (0/0, 6/6, 12/12,
+    15/15, 15/15, 213/213, 9/9, 15/15, 3973/3973, 166/166). The 11 DIFFERS
+    verdicts are "worktree vs HEAD", i.e. exactly this commit, and resolve on
+    commit.
+  * Full probe suite: 24 GREEN / 4 RED. The four reds are IDENTICAL to the
+    v5.66/v5.67 baseline and were verified so against a clean HEAD worktree
+    (test_v528_hotfix 57/68, test_v531_smart_trim 15/38, test_v543_session
+    27/29, test_v532_hightable 125/135 -> 126/136). On test_v532_hightable the
+    failure SET was diffed against HEAD and is byte-identical: +1 check total,
+    +1 passing, no new red. The only count that changed in the whole suite is
+    v563 (82 -> 164).
+
+KNOWN RED, OUT OF SCOPE
+
+  * AuditTrimHealth repair (the 10 [FAIL] in the trim silo) -- the body the
+    v5.32 probe still expects was never shipped.
+  * "RunAudit drives all four Part 2 bodies" in the same probe (expects a
+    fourth AuditTrimHealth call).
+  * The floating-loss trim silo's disagreement with AuditTrimHealth.
+  * NY-DST session helpers (test_v528_hotfix, test_v543_session).
+  * The v5.543 cancel-write count.
+
+ROLLBACK
+
+  Single-commit revert. The auditor holds no pointer to any trade module and
+  writes nothing outside its own CSV, so a revert removes two WARN observations
+  and restores the v5.67 blind spot -- it cannot affect a single order, stop or
+  size. That is exactly why the read-only contract at the top of the file is
+  worth the constraint: this release adds monitoring without adding any way for
+  the monitor to change the outcome it is monitoring.

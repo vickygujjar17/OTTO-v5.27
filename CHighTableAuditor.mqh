@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.67"
+#property version   "5.68"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -29,6 +29,18 @@
 // email; a cluster is the signature of a broken venue and is. Named rather
 // than inlined so the threshold is greppable and tunable in one place.
 #define HT_REJECT_BURST  3
+
+// Milestone-floor tolerance, in R. The trade manager's milestone ladder is a
+// ONE-WAY ratchet driven from OnTick while this audit runs on its own timer,
+// so the tick that pushes price past a rung and the tick that writes the wider
+// stop need not land in the same audit window. A stop may therefore legitimately
+// read up to one cycle behind the floor it owes -- and the cost-covering
+// breakeven rung sits a hair ABOVE entry (beOffset carries commission + swap +
+// half-spread), so an exact comparison would report a correctly-applied BE as
+// lagging. This tolerance is sized to swallow both effects and nothing more: it
+// is far smaller than the gap between any two rungs (1.0R), so a stop that has
+// genuinely failed to advance a whole rung can never hide inside it.
+#define HT_FLOOR_TOLERANCE_R  0.10
 
 // A single SHARED cooldown caps the mailbox, not any one incident. Every
 // email actually sent on EITHER dispatch path pushes the next permitted
@@ -96,6 +108,8 @@ private:
    bool              m_alertSent_RiskBreach;        // position risk exceeded allowance
    bool              m_alertSent_StaleTrail;        // price ran past the trail's arm R:R, stop never followed (v5.63)
    bool              m_alertSent_AggRiskBreach;     // SUMMED basket risk over the stacked budget (v5.63)
+   bool              m_alertSent_LaggingFloor;      // stop sits below the milestone floor its peak has earned (v5.68)
+   bool              m_alertSent_OrphanLeg;         // a magic-scoped leg carries no stop at all (v5.68)
 
    //+------------------------------------------------------------------+
    //| PART 2 - pushed observation state.                                |
@@ -144,6 +158,8 @@ private:
    bool              m_stateSkewSeen;        // divergence seen once, awaiting confirm
    bool              m_adoptionSeen;         // adoption INFO already dispatched (v5.33)
    bool              m_aggRiskSeen;          // summed-risk breach seen once, awaiting confirm (v5.63)
+   bool              m_lagFloorSeen;        // lagging-floor sighting seen once, awaiting confirm (v5.68)
+   bool              m_orphanSeen;          // orphan-leg sighting seen once, awaiting confirm (v5.68)
 
    //| Tracked RISK GEOMETRY, pushed from the order layer (v5.63).         |
    //|                                                                     |
@@ -258,6 +274,59 @@ private:
      }
 
    //+------------------------------------------------------------------+
+   //| Orphan sweep, part 1: how many magic-scoped legs carry NO stop?   |
+   //|                                                                   |
+   //| v5.68. ApplyUnifiedSL() walks every tranche and reports a partial  |
+   //| application, but a leg it failed to reach is left at sl == 0 with  |
+   //| nothing but a log line to say so -- and the existing phantom test  |
+   //| cannot see it, because it only asks whether the PRIMARY exists.   |
+   //| A pyramid therefore has exactly one failure mode in which a leg   |
+   //| is live, funded and unprotected while the EA believes the basket  |
+   //| is fully managed, and until this release the auditor was blind to |
+   //| it.                                                                |
+   //|                                                                   |
+   //| Deliberately MAGIC-SCOPED. An adopted magic-0 primary is excluded |
+   //| by construction, which is correct: the adoption contract carries  |
+   //| the manual leg's own stop, so "no stop" there would be a finding |
+   //| about the operator's manual position, not about this EA's risk    |
+   //| management, and reporting it would be a false positive on every   |
+   //| adoption cycle.                                                    |
+   //+------------------------------------------------------------------+
+   int               CountOrphanLegs(void) const
+     {
+      int n = 0;
+      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
+        {
+         if(PositionGetTicket(idx) <= 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
+         if(PositionGetDouble(POSITION_SL) > 0.0) continue;
+         n++;
+        }
+      return n;
+     }
+
+   //+------------------------------------------------------------------+
+   //| Orphan sweep, part 2: the first offending ticket, for the alert.  |
+   //|                                                                   |
+   //| Same scan, same magic scope, returning the ticket so the operator |
+   //| can go straight to the leg in the terminal instead of being told  |
+   //| only that a count is non-zero. Returns 0 when there are none.     |
+   //+------------------------------------------------------------------+
+   ulong             FirstOrphanLegTicket(void) const
+     {
+      for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
+        {
+         if(PositionGetTicket(idx) <= 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
+         if(PositionGetDouble(POSITION_SL) > 0.0) continue;
+         return (ulong)PositionGetInteger(POSITION_TICKET);
+        }
+      return 0;
+     }
+
+   //+------------------------------------------------------------------+
    //| Is a given ticket present in the terminal book, for us?           |
    //|                                                                   |
    //| Used to test the order layer's belief against reality. This is    |
@@ -348,6 +417,8 @@ public:
       m_stateSkewSeen          = false;
       m_adoptionSeen           = false;
       m_aggRiskSeen            = false;
+      m_lagFloorSeen           = false;
+      m_orphanSeen             = false;
       m_dailyResetBalance      = 0.0;
       m_equityHwm              = 0.0;
       m_totalHalted            = false;
@@ -361,6 +432,8 @@ public:
       m_alertSent_RiskBreach         = false;
       m_alertSent_StaleTrail         = false;
       m_alertSent_AggRiskBreach      = false;
+      m_alertSent_LaggingFloor       = false;
+      m_alertSent_OrphanLeg          = false;
       m_haveGeometry                 = false;
       m_trackedEntry                 = 0.0;
       m_trackedRRUnit                = 0.0;
@@ -541,6 +614,14 @@ public:
         {
          m_trailPeakTicket = ticket;
          m_trailPeakRR     = 0.0;
+         // v5.68: the floor expectation is derived from the peak, so a new
+         // ticket means the previous trade's sighting must not be able to
+         // confirm against this one's first cycle. Written directly rather
+         // than via ClearLatch(): that helper is declared further down the
+         // class body, and this push path is the one place it would be a
+         // forward reference.
+         m_alertSent_LaggingFloor = false;
+         m_lagFloorSeen           = false;
         }
      }
 
@@ -796,7 +877,60 @@ public:
       // CloseEntireBasket() leaves m_hasActiveTrade set until the caller's
       // next sync (see COttoOrderManager.mqh:2137) -- so a one-cycle sighting
       // is an artifact of the close path, not a desync.
+      //
+      // v5.68 WIDENS THE QUESTION. Everything below asks whether the ticket
+      // the order layer THINKS it manages still exists. That is a statement
+      // about the basket's identity, and it says nothing about whether each
+      // leg inside the basket is actually protected. So this body now also
+      // runs an independent orphan sweep over the magic-scoped book, above.
       int book = CountBookLegs();
+
+      // ---- v5.68: ORPHANED-TRANCHE SWEEP ---------------------------------
+      // The phantom test below asks a single question -- does the PRIMARY
+      // still exist -- so a basket where the primary is alive but one of the
+      // scaled-in tranches was left unprotected is completely invisible to it.
+      // That is a real pyramid failure mode: COttoOrderManager::ApplyUnifiedSL()
+      // loops every tranche and, when a modify is rejected part-way, moves on
+      // with allApplied == false and no retry on a later tick if the session
+      // ratchet already reached the target -- so the skipped leg keeps sl == 0
+      // while the EA believes the whole basket is wearing the unified stop.
+      //
+      // Checked BEFORE the phantom branches and independently of them: the two
+      // findings are orthogonal (a basket can have a live primary and an
+      // orphaned tranche, or a phantom primary and no orphan at all) and
+      // folding this behind the phantom test's early return would re-create
+      // the same blind spot one level down.
+      //
+      // Two-cycle confirmed for the same reason as everything else in this
+      // file: a tranche is filled and then stopped by the very next
+      // ApplyUnifiedSL(), and those two events need not land in one audit
+      // window. One cycle of bare SL is the shape of a fill, not an incident.
+      int orphans = CountOrphanLegs();
+      if(orphans > 0 && m_orphanSeen)
+        {
+         DispatchAlertOnce(m_alertSent_OrphanLeg,
+                           "HighTable: unprotected leg in the basket",
+                           IntegerToString(orphans) + " of " +
+                           IntegerToString(book) + " magic-scoped leg(s) on " +
+                           m_symbol + " (magic " + IntegerToString(m_magic) +
+                           ") carry NO stop at the broker. First offender: ticket #" +
+                           IntegerToString((long)FirstOrphanLegTicket()) +
+                           ". The unified-stop push reaches every tranche in one" +
+                           " pass, so a leg left without a stop is a partial" +
+                           " application that will not be retried while the session" +
+                           " ratchet already holds the target. That leg is live and" +
+                           " unprotected. Persisted across an audit cycle.",
+                           HT_SEV_WARN);
+        }
+      else
+        {
+         // Either the book is clean (re-arm, the next incident emails again) or
+         // this is the FIRST sighting of an orphan -- in which case nothing has
+         // been raised yet, so re-arming is a no-op and only the confirm flag
+         // advances. Same else-shape the aggregate-risk leg uses.
+         ClearLatch(m_alertSent_OrphanLeg);
+         m_orphanSeen = (orphans > 0);
+        }
 
       // ---- v5.33: the ADOPTED (magic-0) primary ------------------------
       // BookHasTicket() demands POSITION_MAGIC == m_magic, so for a primary
@@ -856,6 +990,70 @@ public:
      }
 
    //+------------------------------------------------------------------+
+   //| ExpectedFloorRR - the LOWEST stop, in R, the milestone ladder is  |
+   //| allowed to have left in place for an observed peak excursion.     |
+   //|                                                                   |
+   //| v5.68. Before this, AuditTrailingHealth asserted only that the     |
+   //| stop had LEFT THE LOSING SIDE (`stopRR >= 0.0`) once the trail was |
+   //| armed. That invariant is satisfied by a stop frozen at +0.01R, so  |
+   //| a basket that reached +2.0R -- where the ladder owes a +1.0R       |
+   //| floor -- and then never ratcheted again read as HEALTHY FOREVER.   |
+   //| The peak was measured correctly and then used only as a gate,      |
+   //| never as an expectation, which is exactly the blind spot this      |
+   //| helper closes.                                                     |
+   //|                                                                   |
+   //| WHAT IT IS. A conservative LOWER BOUND derived from the four live  |
+   //| milestone inputs, resolved highest-first so the strictest rung the |
+   //| peak has earned always wins:                                       |
+   //|                                                                   |
+   //|     peak >= InpLockProfitRR    -> InpLockProfitTargetRR  (+2.0R)   |
+   //|     peak >= InpLockProfit2RR   -> InpLockProfit2TargetRR (+1.0R)   |
+   //|     peak >= InpBreakEvenRR     -> 0.0R (cost-covering breakeven)   |
+   //|     otherwise                  -> not judgeable, see below         |
+   //|                                                                   |
+   //| Each rung is guarded by BOTH of its inputs, matching the trade     |
+   //| manager, where setting either trigger or either target to 0.0      |
+   //| disables that rung outright -- so disabling a rung here cannot     |
+   //| manufacture an expectation the EA will never satisfy.              |
+   //|                                                                   |
+   //| WHAT IT DELIBERATELY DOES NOT DO. It does not re-derive beOffset,   |
+   //| the ATR trail value, or the half-risk rung. Those are the trade     |
+   //| manager's arithmetic, and duplicating them here would create the   |
+   //| second source of truth the decoupling contract forbids -- it would |
+   //| drift silently the first time the ATR multiplier or friction model |
+   //| changed. Because this is a lower bound, a stop the ATR trail has   |
+   //| pushed TIGHTER than the milestone floor still passes: the check can|
+   //| only fire when the stop is genuinely BEHIND the rung its peak      |
+   //| already cleared.                                                   |
+   //|                                                                   |
+   //| Return value. The second parameter reports whether a floor is      |
+   //| owed at all. Below InpBreakEvenRR nothing has been earned, so the  |
+   //| caller must not judge the stop -- that is a healthy trade still in |
+   //| its initial risk, not a lagging one.                               |
+   //+------------------------------------------------------------------+
+   double            ExpectedFloorRR(const double peakRR, bool &owesFloor) const
+     {
+      owesFloor = true;
+
+      // Resolved HIGHEST rung first: at or past +3.0R the stop already sits at
+      // +2.0R, which is forward of the +1.0R the next rung would set, so the
+      // lower rung is a no-op and testing it first would under-state the floor.
+      if(InpLockProfitRR > 0.0 && InpLockProfitTargetRR > 0.0 &&
+         peakRR >= InpLockProfitRR)
+         return InpLockProfitTargetRR;
+
+      if(InpLockProfit2RR > 0.0 && InpLockProfit2TargetRR > 0.0 &&
+         peakRR >= InpLockProfit2RR)
+         return InpLockProfit2TargetRR;
+
+      if(InpBreakEvenRR > 0.0 && peakRR >= InpBreakEvenRR)
+         return 0.0;
+
+      owesFloor = false;
+      return 0.0;
+     }
+
+   //+------------------------------------------------------------------+
    //+------------------------------------------------------------------+
    //| AuditTrailingHealth - is the ARMED trail actually tightening?     |
    //|                                                                   |
@@ -888,11 +1086,15 @@ public:
    //|                                                                   |
    //| WHAT IS *NOT* CLAIMED. This body does not assert the stop equals   |
    //| the trail value, does not know the ATR, and does not measure how   |
-   //| far the stop lags. It asserts only the structural invariant that   |
-   //| makes the rest of the design meaningful: once price has been       |
-   //| available past InpTrailStartRR, the basket's stop must have left   |
-   //| the losing side of entry. Anything stricter would duplicate the    |
-   //| trade manager's arithmetic here and drift from it silently.        |
+   //| far the stop lags in absolute terms. It asserts two structural     |
+   //| invariants: once price has been available past InpTrailStartRR,    |
+   //| the basket's stop must have left the losing side of entry; and     |
+   //| once the excursion has cleared a milestone rung, the stop must     |
+   //| have advanced to that rung's floor (v5.68). The floor is taken     |
+   //| from the ladder's own live inputs via ExpectedFloorRR() and used   |
+   //| as a LOWER BOUND, so a trail that has run ahead of the ladder is   |
+   //| never reported. Anything stricter would duplicate the trade        |
+   //| manager's arithmetic here and drift from it silently.              |
    //+------------------------------------------------------------------+
    void              AuditTrailingHealth(void)
      {
@@ -901,6 +1103,8 @@ public:
       if(!m_haveGeometry || !m_trackedActive || m_trackedPrimary == 0)
         {
          ClearLatch(m_alertSent_StaleTrail);
+         ClearLatch(m_alertSent_LaggingFloor);
+         m_lagFloorSeen = false;
          m_trailPeakRR = 0.0;
          return;
         }
@@ -911,6 +1115,8 @@ public:
          // DIR_NONE: the order layer has a trade but no resolved direction.
          // Treat as unjudgeable rather than guessing a side.
          ClearLatch(m_alertSent_StaleTrail);
+         ClearLatch(m_alertSent_LaggingFloor);
+         m_lagFloorSeen = false;
          return;
         }
 
@@ -922,6 +1128,8 @@ public:
       if(price <= 0.0)
         {
          ClearLatch(m_alertSent_StaleTrail);
+         ClearLatch(m_alertSent_LaggingFloor);
+         m_lagFloorSeen = false;
          return;
         }
 
@@ -934,6 +1142,8 @@ public:
       if(m_trailPeakRR < InpTrailStartRR)
         {
          ClearLatch(m_alertSent_StaleTrail);
+         ClearLatch(m_alertSent_LaggingFloor);
+         m_lagFloorSeen = false;
          return;
         }
 
@@ -946,6 +1156,13 @@ public:
       if(sl <= 0.0) sl = m_trackedSL;
       if(sl <= 0.0)
         {
+         // A basket with no stop at all is reported by the v5.63 test below;
+         // there is no stop to judge against a floor, so the floor sighting is
+         // dropped rather than left to mature into a second alert for what is
+         // really one incident.
+         ClearLatch(m_alertSent_LaggingFloor);
+         m_lagFloorSeen = false;
+
          DispatchAlertOnce(m_alertSent_StaleTrail,
                            "HighTable: trail armed but basket carries NO stop",
                            "Trail armed at +" + DoubleToString(InpTrailStartRR, 2) +
@@ -968,25 +1185,88 @@ public:
       // to surface.
       double stopRR = (isLong ? (sl - m_trackedEntry)
                               : (m_trackedEntry - sl)) / m_trackedRRUnit;
-      if(stopRR >= 0.0)
+      if(stopRR < 0.0)
         {
-         ClearLatch(m_alertSent_StaleTrail);
+         // Still on the losing side: the original v5.63 incident. The floor
+         // test below is meaningless here (every rung is forward of this
+         // stop), so this branch owns the report and the lagging-floor latch
+         // is re-armed -- the next healthy cycle should judge the floor from
+         // scratch rather than inherit a sighting from before the stop moved.
+         ClearLatch(m_alertSent_LaggingFloor);
+         m_lagFloorSeen = false;
+
+         DispatchAlertOnce(m_alertSent_StaleTrail,
+                           "HighTable: trail armed but stop never moved",
+                           "Trail armed at +" + DoubleToString(InpTrailStartRR, 2) +
+                           "R and price reached +" + DoubleToString(m_trailPeakRR, 2) +
+                           "R, yet the stop on ticket #" +
+                           IntegerToString((long)m_trackedPrimary) + " still sits at " +
+                           DoubleToString(stopRR, 2) + "R (stop " +
+                           DoubleToString(sl, _Digits) + ", entry " +
+                           DoubleToString(m_trackedEntry, _Digits) + ", 1R = " +
+                           DoubleToString(m_trackedRRUnit, _Digits) +
+                           ") - it has not left the losing side of entry, so the" +
+                           " armed trail is not tightening the basket. Divergence" +
+                           " persisted across an audit cycle.",
+                           HT_SEV_WARN);
          return;
         }
 
-      DispatchAlertOnce(m_alertSent_StaleTrail,
-                        "HighTable: trail armed but stop never moved",
-                        "Trail armed at +" + DoubleToString(InpTrailStartRR, 2) +
-                        "R and price reached +" + DoubleToString(m_trailPeakRR, 2) +
-                        "R, yet the stop on ticket #" +
-                        IntegerToString((long)m_trackedPrimary) + " still sits at " +
+      // The stop has left the losing side, so the v5.63 incident is over and
+      // its latch re-arms. That is NOT the end of the question any more.
+      ClearLatch(m_alertSent_StaleTrail);
+
+      // ---- v5.68: THE MILESTONE FLOOR ---------------------------------
+      // `stopRR >= 0.0` was the whole test before this release, which made
+      // ANY stop at or past entry read healthy forever -- including a stop
+      // frozen at +0.01R while the basket ran to +2.0R, where the ladder owes
+      // +1.0R (InpLockProfit2TargetRR). The peak is judged against the floor
+      // it has EARNED, which is a fact about price and not about the stop,
+      // so the test stays non-circular.
+      bool   owesFloor = false;
+      double floorRR   = ExpectedFloorRR(m_trailPeakRR, owesFloor);
+      if(!owesFloor)
+        {
+         // Below InpBreakEvenRR nothing has been earned: no floor is owed, so
+         // no stop can be behind one. Healthy.
+         ClearLatch(m_alertSent_LaggingFloor);
+         m_lagFloorSeen = false;
+         return;
+        }
+
+      // Tolerance absorbs one audit cycle of ratchet lag plus the cost-covering
+      // offset that legitimately seats the breakeven rung just above entry.
+      if(stopRR >= floorRR - HT_FLOOR_TOLERANCE_R)
+        {
+         ClearLatch(m_alertSent_LaggingFloor);
+         m_lagFloorSeen = false;
+         return;
+        }
+
+      // First sighting: remember it and wait one cycle, exactly as the phantom
+      // and aggregate-risk tests do -- a tranche landing just before its stop
+      // is pushed is the normal shape of a fill, not an incident.
+      if(!m_lagFloorSeen)
+        {
+         m_lagFloorSeen = true;
+         return;
+        }
+
+      DispatchAlertOnce(m_alertSent_LaggingFloor,
+                        "HighTable: stop lagging its milestone floor",
+                        "Price on ticket #" + IntegerToString((long)m_trackedPrimary) +
+                        " has reached +" + DoubleToString(m_trailPeakRR, 2) +
+                        "R, which earns a hard floor of +" +
+                        DoubleToString(floorRR, 2) + "R, but the live stop sits at " +
                         DoubleToString(stopRR, 2) + "R (stop " +
                         DoubleToString(sl, _Digits) + ", entry " +
                         DoubleToString(m_trackedEntry, _Digits) + ", 1R = " +
                         DoubleToString(m_trackedRRUnit, _Digits) +
-                        ") - it has not left the losing side of entry, so the" +
-                        " armed trail is not tightening the basket. Divergence" +
-                        " persisted across an audit cycle.",
+                        ", tolerance " + DoubleToString(HT_FLOOR_TOLERANCE_R, 2) +
+                        "R). The stop has left the losing side -- so the armed trail" +
+                        " is not wholly frozen -- but it has not advanced to the rung" +
+                        " the excursion already cleared. Divergence persisted across" +
+                        " an audit cycle.",
                         HT_SEV_WARN);
      }
 
@@ -1055,6 +1335,19 @@ public:
    //| sum past what the pyramid was designed to carry. The two checks    |
    //| share the loop and the loss-side guard, and each owns its own      |
    //| latch, so a basket can report either, both, or neither.            |
+   //|                                                                   |
+   //| v5.68 DELIBERATELY CHANGED NOTHING HERE. With the shipped inputs    |
+   //| the stacked budget resolves to 1.0 + 1.0 + 0.5 + 0.25 = 2.75%      |
+   //| nominal, 4.125% with tolerance, which is the pyramid's design      |
+   //| ceiling -- so the deep entry geometry (2.0*bh + 1.5*ATR) and the   |
+   //| pyramiding tranches are already fully covered by this body and     |
+   //| needed no new check. Note in particular that the DEEP ENTRY GAP     |
+   //| cannot inflate either measure: both read the distance from entry   |
+   //| to the LIVE broker stop, and that leg starts as m_basketRRUnit     |
+   //| (bh + 0.5*ATR), which is 1R by construction and independent of how |
+   //| wide the entry gap is. A correctly-sized scale-in therefore reads  |
+   //| at its nominal rung and can never false-alarm here, while a real   |
+   //| sizing bug still does.                                             |
    //+------------------------------------------------------------------+
    void              AuditRiskExposure(void)
      {
