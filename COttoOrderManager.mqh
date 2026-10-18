@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.68"
+#property version   "5.69"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -61,8 +61,11 @@ private:
    // --- Virtual Order Engine (v5.37 Part 1) ---------------------------
    // Armed setups are held in memory and executed as MARKET orders when price
    // crosses the continuation level, bypassing broker pending-price rules.
-   // v5.52 makes this the ORDINARY path: the FRONT-EDGE continuation entry is
-   // a breakout (STOP-style), which a broker limit cannot legitimately rest.
+   // v5.69 makes this the FALLBACK path: the TRUE FRONT-EDGE entry sits on the
+   // NEAR side of the zone (below the market for a LONG, above it for a SHORT),
+   // so a broker BUY_LIMIT / SELL_LIMIT can legitimately rest there and the
+   // physical route carries the ordinary case. The virtual arm still exists for
+   // the tick where price has already run through the entry.
    struct SVirtualOrder
      {
       int                  blockIndex;
@@ -651,46 +654,54 @@ private:
 
    //+------------------------------------------------------------------+
    //| Entry price per Pine entry_style (Midpoint / Front Edge)        |
-   //| ENTRY_FRONT_EDGE: DEEP FRONT-EDGE ANTICIPATION. The entry is    |
+   //| ENTRY_FRONT_EDGE: TRUE DEEP FRONT-EDGE (v5.69). The entry is    |
    //| measured OUT from the NEAR edge -- the edge the arming close    |
-   //| clears: block.bottom for a RESISTANCE breakout, block.top       |
-   //| for a SUPPORT breakdown -- by 2.0 block heights + 1.5 ATRs      |
-   //| (gap, below). The far edge is one blockHeight past the near     |
-   //| edge, so the fill lands blockHeight + 1.5*ATR BEYOND the FAR    |
-   //| edge the breakout crosses. At arm time price has only just      |
-   //| cleared the NEAR edge, so it is still short of this price and   |
-   //| the trigger is a genuine STOP cross, not a resting limit.       |
+   //| clears: block.bottom for a RESISTANCE arm, block.top for a      |
+   //| SUPPORT arm -- by 2.0 block heights + 1.5 ATRs (gap, below),    |
+   //| landing on the OPPOSITE side of the zone from the target:       |
+   //|   LONG  (RESISTANCE): entry = block.bottom - gap                 |
+   //|   SHORT (SUPPORT)   : entry = block.top    + gap                 |
+   //| Near edge pinned at 0.0, far edge at +blockHeight:               |
+   //|   LONG : entry = -(2.0*bh + 1.5*a), far edge = +bh               |
+   //|   SHORT: entry = +(2.0*bh + 1.5*a), far edge = -bh               |
+   //| At arm time the close has only just cleared the NEAR edge, so    |
+   //| the entry sits BELOW the market for a LONG and ABOVE it for a    |
+   //| SHORT. That is a legal BUY_LIMIT / SELL_LIMIT (see              |
+   //| GetOrderTypeForBlock), so the order RESTS AT THE BROKER -- the   |
+   //| fakeout-pullback fill. Resting is the normal route by           |
+   //| construction; see the router note in PlaceOrArmOrder.            |
    //|                                                                 |
    //| slDist is UNCHANGED at blockHeight + 0.5*ATR, so the stop       |
-   //| lands:                                                          |
-   //|   LONG : block.bottom + gap - slDist = block.top    + 1.0*ATR   |
-   //|   SHORT: block.top    - gap + slDist = block.bottom - 1.0*ATR   |
-   //| -- exactly 1.0*ATR past the FAR edge and a full slDist back     |
-   //| from the entry. entry<->SL therefore stays exactly slDist, so   |
-   //| every 1R rung (pyramid ladder, breakeven, trail) is untouched:  |
-   //| the anticipation offset is carried by the ENTRY alone, never    |
-   //| by a wider stop.                                                |
+   //| lands a full slDist behind the entry in both directions:        |
+   //|   LONG : entry - slDist = -(3.0*bh + 2.0*a)                      |
+   //|   SHORT: entry + slDist = +(3.0*bh + 2.0*a)                      |
+   //| entry<->SL therefore stays exactly slDist, so every 1R rung     |
+   //| (pyramid ladder, breakeven, trail) is untouched: the offset is  |
+   //| carried by the ENTRY alone, never by a wider stop.              |
    //| FIX (v5.57): the TP PROJECTION does NOT follow the entry; it    |
    //| is anchored on the FAR edge (see PlaceOrArmOrder) so the        |
    //| Front-Run veto keeps the strictness of every pre-anticipation   |
-   //| build. The entry being a full blockHeight + 1.5*ATR out is      |
-   //| why InpMaxRR must stay above 3.0: below it the far-edge target  |
-   //| can land BEHIND the entry as the zone height shrinks (see the   |
-   //| ProcessBlocks derivation). Twin of                              |
-   //| COttoBlockManager::BlockEntryPrice(); they must stay identical  |
-   //| or the Front-Run veto would judge a different price from the    |
-   //| order's.                                                        |
+   //| build. With the entry on the NEAR side the reward from the      |
+   //| ENTRY is (3.0 + InpMaxRR) * slDist, so the realized multiple is |
+   //| exactly InpMaxRR + 3.0 at every zone height and ATR -- 7.0R on  |
+   //| the shipped 4.0. The pre-v5.69 "InpMaxRR must stay above 3.0"   |
+   //| floor is GONE: it was an artifact of an entry past the far      |
+   //| edge. Twin of COttoBlockManager::BlockEntryPrice(); any drift   |
+   //| and the Front-Run veto would judge a different price            |
+   //| from the order's.                                               |
    //+------------------------------------------------------------------+
    double                  CalcEntryPrice(const SSniperBlock &block, double atr)
      {
       if(InpEntryStyle == ENTRY_MIDPOINT)
          return block.midpoint;
-      // Deep front-edge, twin of COttoBlockManager::BlockEntryPrice():
-      // 2.0 block heights + 1.5 ATR out from the NEAR edge. slDist is
-      // untouched, so the stop keeps exactly one slDist of separation.
+      // True deep front-edge, twin of COttoBlockManager::BlockEntryPrice():
+      // 2.0 block heights + 1.5 ATR out from the NEAR edge, landing on the
+      // OPPOSITE side of the zone from the target so the order can rest as a
+      // limit. slDist is untouched, so the stop keeps exactly one slDist of
+      // separation from the entry.
       double gap = (2.0 * block.blockHeight) + (1.5 * atr);
-      return (GetDirectionForBlock(block) == DIR_LONG) ? (block.bottom + gap)
-                                                       : (block.top - gap);
+      return (GetDirectionForBlock(block) == DIR_LONG) ? (block.bottom - gap)
+                                                       : (block.top + gap);
      }
 
    //+------------------------------------------------------------------+
@@ -718,10 +729,12 @@ private:
    //| CheckVirtualTriggers() on the cross.                             |
    //+------------------------------------------------------------------+
    // FIX (v5.57) FRONT-RUNNING ANTICIPATION: with InpEntryStyle = ENTRY_FRONT_EDGE
-   // the entry sits 0.5*ATR beyond the FAR edge the breakout crosses (a
-   // buy-stop above resistance / a sell-stop below support), so the VIRTUAL
-   // arm is the ordinary path and a physical rest is the rare stale-price
-   // case. Either way the trigger is a MARKET deal when the level is crossed.
+   // the entry sits on the NEAR side of the zone, 2.0*blockHeight + 1.5*ATR out
+   // from the edge the arming close clears (v5.69: below the market for a LONG,
+   // above it for a SHORT). That is a legal BUY_LIMIT / SELL_LIMIT, so the
+   // PHYSICAL rest is the ordinary path and the VIRTUAL arm is the fallback for
+   // a tick where price already ran through the entry. Either way the trigger
+   // is a MARKET deal when the level is crossed.
    bool                    PlaceOrArmOrder(int blockIndex, SSniperBlock &block)
      {
       if(block.isVetoed || block.isTriggered || block.hasPlacedOrder)
@@ -821,15 +834,17 @@ private:
       // just as far out -- harsher than every pre-anticipation build -- so the
       // Front-Run veto would miss setups it used to catch. COttoBlockManager::
       // ProcessBlocks projects identically.
-      // REALIZED RR (deep front-edge entry): with near edge at 0, far edge at
-      // bh, slDist = bh + 0.5*a and entry = 2*bh + 1.5*a, the reward from the
-      // ENTRY to the far-edge-anchored target is
-      //     (rr - 1)*bh + (0.5*rr - 1.5)*a
-      // over a risk of (bh + 0.5*a). As bh shrinks that reward turns NEGATIVE
-      // for InpMaxRR < 3.0 -- the target would sit behind the entry -- so 3.0
-      // is a hard floor for this geometry. With the shipped defaults (bh 1.0,
-      // ATR 2.0, rr 4.0) the realized multiple is 2.0R, and it falls further
-      // as ATR grows against the zone height (bh 0.5 / a 4.0 -> 1.4R).
+      // REALIZED RR (true deep front-edge entry): with the near edge at 0, the
+      // far edge at bh, slDist = bh + 0.5*a and the LONG entry at
+      // -(2*bh + 1.5*a), the reward from the ENTRY to the far-edge-anchored
+      // target is
+      //     3.0*bh + 1.5*a + rr*slDist  =  (3.0 + rr) * slDist
+      // so the realized multiple is EXACTLY rr + 3.0 at every zone height and
+      // every ATR -- 7.0R on the shipped InpMaxRR 4.0, and independent of both
+      // bh and a. It therefore cannot fall behind the entry for any positive
+      // InpMaxRR, and the pre-v5.69 "InpMaxRR must stay above 3.0" floor is
+      // retired: it was an artifact of an entry anchored PAST the far edge,
+      // where the reward carried a (0.5*rr - 1.5) coefficient on the ATR term.
       // Intentional: the target reproduces the pre-anticipation projection and
       // keeps the veto strict. Do NOT "fix" it by anchoring the target on the
       // entry.
@@ -882,23 +897,25 @@ private:
       // zone the resting form is illegal, so we ARM an in-memory virtual order
       // and let CheckVirtualTriggers() fire it as a MARKET deal on the cross.
       //
-      // DEEP FRONT-EDGE ANTICIPATION NOTE. With InpEntryStyle =
+      // DEEP FRONT-EDGE NOTE (v5.69). With InpEntryStyle =
       // ENTRY_FRONT_EDGE the entry is measured out from the NEAR edge by
-      // 2.0*blockHeight + 1.5*ATR -- a Resistance LONG at b.bottom+gap
-      // (= b.top + blockHeight + 1.5*ATR), a Support SHORT at b.top-gap
-      // (= b.bottom - blockHeight - 1.5*ATR) -- so the trigger is STOP-style
-      // (breakout): the market must still RISE to a LONG entry and FALL to a
-      // SHORT entry, while the SL sits a full slDist back, 1.0*ATR beyond the
-      // FAR edge. At arm time price has only just closed clear of the NEAR
-      // edge, i.e. it is still far short of the entry, so the limit test below
-      // is FALSE: the setup arms VIRTUALLY and CheckVirtualTriggers() fires a
-      // MARKET deal on the cross. That inverted cross is the ordinary path,
-      // not a fallback; a physical rest is only ever used when a stale armed
-      // price happens to sit on the limit side of a moved market. This deeper
-      // offset makes the virtual route the norm by a wide margin -- which is
-      // why the break veto had to be re-anchored on this same price (v5.66):
-      // the retired far-edge threshold sat blockHeight + 1.0*ATR short of the
-      // fill and vetoed every block on approach.
+      // 2.0*blockHeight + 1.5*ATR and lands on the OPPOSITE side of the zone
+      // from the target: a Resistance LONG at b.bottom-gap (= b.top - bh -
+      // 1.5*ATR), a Support SHORT at b.top+gap (= b.bottom + bh + 1.5*ATR).
+      // At arm time the close has only just cleared the NEAR edge, so a LONG
+      // entry sits BELOW the market and a SHORT entry ABOVE it -- exactly the
+      // side a BUY_LIMIT / SELL_LIMIT must sit on. The limit test below is
+      // therefore TRUE in the ordinary case and the setup RESTS PHYSICALLY at
+      // the broker, filling on the pullback back through the near edge. The
+      // virtual route is the FALLBACK for the case where price has already
+      // run through the entry between the arming close and this call, and
+      // CheckVirtualTriggers() then fires it as a MARKET deal on the cross.
+      // The SL sits a full slDist behind the entry, and because the target is
+      // still anchored on the FAR edge the realized multiple is exactly
+      // InpMaxRR + 3.0 (see CalcEntryPrice). The break veto is deliberately
+      // NOT anchored on this price: it stays on the physical far edge so the
+      // pending cannot be cancelled on the very close that armed it (v5.69
+      // decoupling, derived in ProcessBlocks).
       double boundary = GetPriceBoundaryBuffer();
       bool   priceValid;
       if(isLong)
@@ -2664,13 +2681,13 @@ public:
    //| order's level is reached. This is the execution half of the in-  |
    //| memory engine whose ARM half is PlaceOrArmOrder().               |
    //|                                                                  |
-   //| The cross test mirrors Pine's own strategy fill logic and is     |
-   //| INVERTED for the front-running anticipation entry FIX (v5.57):   |
-   //| trigger now sits BEYOND the far edge, so a LONG fires once the   |
-   //| market has traded UP to/through its trigger and a SHORT once it  |
-   //| has traded DOWN to/through it - a gap past the level still       |
-   //| triggers. FIX (v5.57): under the far-edge entry the level sat on |
-   //| the limit side of price and the test ran the other way.)         |
+   //| The cross test mirrors Pine's own strategy fill logic and is the   |
+   //| LIMIT predicate for the true front-edge entry (v5.69): the trigger  |
+   //| sits on the NEAR side of the zone, so a LONG fires once the market  |
+   //| has come back DOWN to/through its trigger and a SHORT once it has   |
+   //| rallied UP to/through it - a gap through the level still triggers.  |
+   //| (v5.57..v5.68 ran this the other way, because the entry then sat    |
+   //| BEYOND the far edge as a STOP-style breakout.)                     |
    //+------------------------------------------------------------------+
    void              CheckVirtualTriggers(void)
      {
@@ -2713,12 +2730,17 @@ public:
          // note) -- kept because the virtual fire knows the exact side it sent.
          ENUM_TRADE_DIRECTION seedDir = isLong ? DIR_LONG : DIR_SHORT;
 
-         // THE CROSS TEST. A MARKET condition, not a resting price. Inverted
-         // FIX (v5.57) for the front-running anticipation entry: the trigger sits
-         // BEYOND the far edge, so a LONG fires once the market has traded UP
-         // to (or through) the level, a SHORT once it has traded DOWN to it -
-         // a gap past it still fires.
-         if(isLong ? (ask < vo.triggerPrice) : (bid > vo.triggerPrice))
+         // THE CROSS TEST. A MARKET condition, not a resting price. The trigger
+         // sits on the NEAR side of the zone (v5.69): a LONG entry is BELOW the
+         // arming close and a SHORT entry ABOVE it, so the trigger is a PULLBACK
+         // level -- the LONG fires when the ask returns DOWN to it, the SHORT
+         // when the bid rallies UP to it. Either way the fill is a market deal,
+         // and a gap through the level still fires. This is the resting limit's
+         // own predicate applied to a fill the broker could not hold:
+         // identical semantics, market execution. See PlaceOrArmOrder's router --
+         // this route is now the fallback, and it is the physical BUY_LIMIT /
+         // SELL_LIMIT that carries the ordinary case.
+         if(isLong ? (ask > vo.triggerPrice) : (bid < vo.triggerPrice))
             continue;
 
          // --- Pine gates: the identical ladder every other path applies ---

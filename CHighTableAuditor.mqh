@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.68"
+#property version   "5.69"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__

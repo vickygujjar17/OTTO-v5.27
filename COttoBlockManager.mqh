@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.68"
+#property version   "5.69"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -134,45 +134,55 @@ private:
    //+------------------------------------------------------------------+
    //| BlockEntryPrice — Pine entry price for a block, honouring        |
    //| InpEntryStyle.                                                   |
-   // DEEP FRONT-EDGE ANTICIPATION. The entry is measured OUT from the NEAR
+   // TRUE DEEP FRONT-EDGE (v5.69). The entry is measured OUT from the NEAR
    // edge -- the edge the arming close clears: b.bottom for a RESISTANCE
-   // breakout, b.top for a SUPPORT breakdown -- by two block heights plus one
-   // and a half ATRs (gap, below). The far edge is one blockHeight past the
-   // near edge, so the fill lands blockHeight + 1.5*ATR BEYOND the FAR edge
-   // the breakout crosses: a deep continuation entry, not a hair past it. At
-   // arm time price has only just cleared the NEAR edge, so it is still short
-   // of this price and the trigger stays a genuine STOP cross, never a
-   // resting limit.
+   // arm, b.top for a SUPPORT arm -- by two block heights plus one and a half
+   // ATRs (gap, below), and it lands on the OPPOSITE side of the zone from
+   // the target:
+   //   LONG  (RESISTANCE): near = b.bottom, entry = b.bottom - gap
+   //   SHORT (SUPPORT)   : near = b.top,    entry = b.top    + gap
+   // With the near edge pinned at 0.0 and the far edge at +blockHeight:
+   //   LONG : entry = -(2.0*bh + 1.5*a)    far edge = +bh
+   //   SHORT: entry = +(2.0*bh + 1.5*a)    far edge = -bh
+   // At arm time the close has only just cleared the NEAR edge, so the entry
+   // sits BELOW the market for a LONG and ABOVE it for a SHORT. That is a
+   // legal BUY_LIMIT / SELL_LIMIT (see GetOrderTypeForBlock), so the order
+   // RESTS AT THE BROKER: the fakeout-pullback fill, not a breakout chase.
+   // Resting is the normal route by construction, not a lucky coincidence;
+   // see the v5.69 note in PlaceOrArmOrder's router.
    //
    // slDist is UNCHANGED at blockHeight + 0.5*ATR, so the stop lands
-   //   LONG : b.bottom + gap - slDist = b.top    + 1.0*ATR
-   //   SHORT: b.top    - gap + slDist = b.bottom - 1.0*ATR
-   // -- exactly 1.0*ATR past the FAR edge and a full slDist back from the
-   // entry. The anticipation offset is carried by the ENTRY alone, never by a
-   // wider stop, so entry<->SL stays exactly slDist and every rung that reads
-   // 1R (pyramid ladder, breakeven, trail) is untouched by this geometry.
+   //   LONG : entry - slDist = -(3.0*bh + 2.0*a)   (below the near edge)
+   //   SHORT: entry + slDist = +(3.0*bh + 2.0*a)   (above the near edge)
+   // -- a full slDist behind the entry in both directions. The offset is
+   // carried by the ENTRY alone, never by a wider stop, so entry<->SL stays
+   // exactly slDist and every rung that reads 1R (pyramid ladder, breakeven,
+   // trail) is untouched by this geometry.
    //
-   // THE BREAK VETO MOVES WITH THE ENTRY (v5.66). Through v5.65 the break test
-   // fired ATRBufferBreak*ATR past the PHYSICAL far edge. That threshold now
-   // sits blockHeight + 1.0*ATR BEFORE this entry, so a breakout walking in
-   // through the zone would arm, then veto itself VETO_BROKEN -- and
-   // CancelOrdersForInvalidBlocks() would drop the pending order -- long
-   // before price could ever reach the fill. ProcessBlocks() therefore
-   // anchors the break on THIS price: the zone is invalidated once the close
-   // clears ATRBufferBreak*ATR beyond BlockEntryPrice(). The zone-to-direction
-   // mapping is unchanged (SUPPORT breaks DOWN, RESISTANCE breaks UP); only
-   // the level moved out, exactly as the stop did.
+   // THE BREAK VETO IS DECOUPLED FROM THE ENTRY (v5.69). v5.66 anchored the
+   // break on the entry, which was workable only because the entry sat on the
+   // far side of the zone. That anchor is now actively wrong: InpArmATR is
+   // 0.0, so a RESISTANCE arms the instant close1 < b.bottom, while entry is
+   // a further `gap` BELOW b.bottom. A break test of close1 > entry +
+   // ATRBufferBreak*atr therefore evaluates close1 > b.bottom - 2.0*bh -
+   // 1.0*a, which is TRUE on the arming bar itself -- the block would arm and
+   // veto itself VETO_BROKEN in one pass, and CancelOrdersForInvalidBlocks()
+   // would drop the pending. ProcessBlocks() hence anchors the break on the
+   // PHYSICAL far edge again: SUPPORT breaks DOWN through b.bottom,
+   // RESISTANCE breaks UP through b.top a further ATRBufferBreak*ATR. Near
+   // edge = arm, far edge = invalidate, opposite sides, never the same close.
    //
    // TARGET ANCHOR (FIX v5.57, deliberately unchanged). The target is still
-   // projected from the FAR edge the breakout crosses, never from this entry:
-   // a LONG target = b.top + tpRR*slDist, a SHORT target = b.bottom -
-   // tpRR*slDist. Anchoring it on the entry would stretch the target a further
-   // blockHeight + 1.5*ATR and veto setups that were never front-runs. The
-   // consequence, derived in full in the front-run block of ProcessBlocks(),
-   // is that the reward-to-risk taken off the ENTRY is now well below
-   // InpMaxRR -- and turns NEGATIVE for InpMaxRR below 3.0, because the entry
-   // is out by blockHeight + 1.5*ATR while the target is only InpMaxRR*slDist
-   // from the far edge. Keep InpMaxRR above 3.0; the shipped 4.0 is safe.
+   // projected from the FAR edge, never from this entry: a LONG target =
+   // b.top + tpRR*slDist, a SHORT target = b.bottom - tpRR*slDist. With the
+   // entry now on the NEAR side, the reward from the ENTRY is
+   //   3.0*bh + 1.5*a + tpRR*slDist = (3.0 + tpRR) * slDist
+   // so the realized multiple is EXACTLY InpMaxRR + 3.0 at every zone height
+   // and every ATR -- 7.0R on the shipped 4.0, and it can never fall behind
+   // the entry for any positive InpMaxRR. The pre-v5.69 "InpMaxRR must stay
+   // above 3.0" floor is therefore GONE: it was an artifact of an entry that
+   // sat past the far edge, and it no longer constrains the configuration.
+   // Derivation in full in the front-run block of ProcessBlocks().
    //
    // This is the exact twin of COttoOrderManager::CalcEntryPrice(); the two
    // must stay identical or the Front-Run veto would judge a different price
@@ -180,11 +190,12 @@ private:
    double                  BlockEntryPrice(const SSniperBlock &b, double atr) const
      {
       if(InpEntryStyle == ENTRY_MIDPOINT) return b.midpoint;
-      // Deep front-edge: 2.0 block heights + 1.5 ATR out from the NEAR edge,
-      // i.e. blockHeight + 1.5*ATR beyond the FAR edge. slDist is untouched,
-      // so the stop keeps exactly one slDist of separation from the entry.
+      // True deep front-edge: 2.0 block heights + 1.5 ATR out from the NEAR
+      // edge, landing on the OPPOSITE side of the zone from the target so the
+      // order can rest as a limit. slDist is untouched, so the stop keeps
+      // exactly one slDist of separation from the entry.
       double gap = (2.0 * b.blockHeight) + (1.5 * atr);
-      return (BlockDirection(b) == DIR_LONG) ? (b.bottom + gap) : (b.top - gap);
+      return (BlockDirection(b) == DIR_LONG) ? (b.bottom - gap) : (b.top + gap);
      }
 
    //+------------------------------------------------------------------+
@@ -581,36 +592,35 @@ private:
             // v5.34 Part 2 once re-anchored this projection to the Phase 2
             // outer-boundary entry; v5.52 dropped Phase 2 and FIX (v5.57) pins
             // the FAR-EDGE anchor. The target is measured from the edge the
-            // breakout crosses (b.top LONG / b.bottom SHORT), NOT from the
-            // deep entry BlockEntryPrice() returns: that entry now sits a
-            // full blockHeight + 1.5*ATR past this edge, so projecting the
-            // target from it would move the target just as far beyond what
-            // every pre-anticipation build projected -- vetoing setups that
-            // were never front-runs. This is the one price the Front-Run veto
-            // is allowed to judge; COttoOrderManager::PlaceOrArmOrder()
+            // zone breaks through (b.top LONG / b.bottom SHORT), NOT from the
+            // deep entry BlockEntryPrice() returns: since v5.69 that entry sits
+            // on the OPPOSITE (NEAR) side of the zone, so projecting the target
+            // from it would pull the target inside the zone and veto setups
+            // that were never front-runs. This is the one price the Front-Run
+            // veto is allowed to judge; COttoOrderManager::PlaceOrArmOrder()
             // projects it with identical arithmetic, and once the order rests
             // b.localTP supersedes this anyway.
             //
-            // REALIZED RR (deep front-edge entry). Long side, near edge at 0,
-            // far edge at bh, slDist = bh + 0.5*a, entry = 2*bh + 1.5*a, and
-            // the target anchored on the far edge:
+            // REALIZED RR (true deep front-edge entry, v5.69). Long side, near
+            // edge at 0, far edge at bh, slDist = bh + 0.5*a, and the entry on
+            // the NEAR side: entry = -(2*bh + 1.5*a). Target anchored on the
+            // far edge:
             //   TP     = bh + rr*(bh + 0.5*a)
-            //   reward = TP - entry = (rr - 1)*bh + (0.5*rr - 1.5)*a
-            //   risk   = slDist     =  bh        + 0.5*a
-            // The reward term is the reason InpMaxRR MUST stay above 3.0: as
-            // the zone height shrinks toward zero, reward -> (0.5*rr - 1.5)*a,
-            // which is NEGATIVE for rr < 3.0 -- the far-edge target would land
-            // BEHIND a deep entry and every such setup would be vetoed as a
-            // front-run that never existed. Above 3.0 the target is always
-            // beyond the entry, but the realized multiple is still well under
-            // InpMaxRR and falls further as ATR grows against the zone height:
-            //   bh 1.0 / a 2.0 / rr 4.0 -> 2.0R   (the shipped defaults)
-            //   bh 2.0 / a 1.0 / rr 4.0 -> 2.6R
-            //   bh 0.5 / a 4.0 / rr 4.0 -> 1.4R
-            // and as a -> 0 it approaches rr - 1, still strictly below rr.
-            // Intentional: the target reproduces the pre-anticipation
-            // projection and keeps the veto strict. Do NOT "fix" it by
-            // anchoring the target on the entry.
+            //   reward = TP - entry = 3*bh + 1.5*a + rr*(bh + 0.5*a)
+            //                       = (3 + rr) * slDist
+            //   risk   = slDist     =  bh + 0.5*a
+            // so the realized multiple is EXACTLY rr + 3.0 at every zone height
+            // and every ATR, independent of both:
+            //   bh 1.0 / a 2.0 / rr 4.0 -> 7.0R   (the shipped defaults)
+            //   bh 2.0 / a 1.0 / rr 4.0 -> 7.0R
+            //   bh 0.5 / a 4.0 / rr 4.0 -> 7.0R
+            // It therefore cannot go negative for any positive InpMaxRR, and
+            // the pre-v5.69 "InpMaxRR MUST stay above 3.0" floor is RETIRED --
+            // that floor was an artifact of an entry anchored PAST the far edge,
+            // whose reward carried a (0.5*rr - 1.5) coefficient on the ATR term.
+            // Intentional: the target reproduces the pre-anticipation projection
+            // and keeps the veto strict. Do NOT "fix" it by anchoring the target
+            // on the entry.
             double farEdge = isLong ? MathMax(b.top, b.bottom)
                                     : MathMin(b.top, b.bottom);
             double target  = isLong ? farEdge + tpRR * calcSLDist
@@ -679,10 +689,10 @@ private:
             //
             // This is the pre-v5.52 arming test, kept verbatim. It is deliberately
             // on the edge OPPOSITE the break test below: arming looks past the
-            // NEAR edge, while the break is measured from the ENTRY price (v5.66:
-            // the deep front-edge entry, blockHeight + 1.5*ATR past the far
-            // edge), so the two can never fire on the same close and a block
-            // cannot arm and be vetoed BROKEN in one pass.
+            // NEAR edge, while the break is measured from the PHYSICAL FAR edge
+            // (v5.69 decoupled it from the entry), so the two can never fire on
+            // the same close and a block cannot arm and be vetoed BROKEN in one
+            // pass.
             if((b.type == BLOCK_SUPPORT && close1 > b.top + InpArmATR * atrNow) ||
                (b.type == BLOCK_RESISTANCE && close1 < b.bottom - InpArmATR * atrNow))
                b.isArmed = true;
@@ -696,25 +706,29 @@ private:
          // UP), so arming above still looks past the NEAR edge while this
          // looks past the FAR side.
          //
-         // RE-ANCHORED (v5.66) on the ENTRY, not on the physical far edge.
-         // Through v5.65 this test fired ATRBufferBreak*ATR (0.5*ATR) past
-         // b.bottom / b.top. With the deep front-edge entry the fill sits
-         // blockHeight + 1.5*ATR past that edge, so the retired threshold
-         // lands blockHeight + 1.0*ATR BEFORE the entry: a breakout walking
-         // in through the zone would arm, then veto itself VETO_BROKEN -- and
-         // CancelOrdersForInvalidBlocks() would drop its pending -- before
-         // price could reach the fill. Every armed block died on approach.
-         // Anchoring on BlockEntryPrice() keeps the two mutually exclusive in
-         // the intended sense: arming clears the near edge, a break clears the
-         // OUTER boundary of this block's own trade, so the block is only
-         // invalidated once price has gone ATRBufferBreak*ATR past the price
-         // it was waiting to be filled at.
+         // ANCHORED ON THE PHYSICAL FAR EDGE (v5.69, restored after v5.66).
+         // v5.66 hung this test on BlockEntryPrice(), which worked only while
+         // the entry sat BEYOND the far edge -- the fill and the invalidation
+         // were the same event, so one anchor served both. The v5.69 entry is
+         // on the OPPOSITE side of the zone (a RESISTANCE LONG fills BELOW
+         // b.bottom, a SUPPORT SHORT ABOVE b.top), and hanging the break on it
+         // inverts the test's meaning: with InpArmATR = 0.0 a RESISTANCE arms
+         // the instant close1 < b.bottom, while entry = b.bottom - gap sits a
+         // further gap BELOW that, so close1 > entry + ATRBufferBreak*ATR is
+         // already TRUE on the arming bar. The block would arm and veto itself
+         // VETO_BROKEN in one pass and CancelOrdersForInvalidBlocks() would
+         // drop the pending. Every armed block would die instantly.
          //
-         // breakLevel honours InpEntryStyle, so under ENTRY_MIDPOINT the
-         // invalidation anchors on the midpoint -- the same price that style
-         // would have entered at. Deliberate: a block's invalidation always
-         // tracks the entry it was actually trying to take.
-         double breakLevel = BlockEntryPrice(b, atrNow);
+         // So the two tests are DECOUPLED and live on opposite sides of the
+         // zone, which is the only arrangement in which both can be true of
+         // one close:
+         //   NEAR edge -> ARM      (a RESISTANCE: close1 < b.bottom)
+         //   FAR  edge -> BREAK    (a RESISTANCE: close1 > b.top + buffer)
+         // The level is therefore the physical far edge -- b.top for a
+         // RESISTANCE, b.bottom for a SUPPORT -- and honours no entry style.
+         // That decoupling is the invariant to keep: the veto must never move
+         // with the entry again, or the pending dies before it can fill.
+         double breakLevel = (b.type == BLOCK_SUPPORT) ? b.bottom : b.top;
          bool isBroken =
             (b.type == BLOCK_SUPPORT && close1 < breakLevel - ATRBufferBreak * atrNow) ||
             (b.type == BLOCK_RESISTANCE && close1 > breakLevel + ATRBufferBreak * atrNow);
@@ -802,15 +816,19 @@ private:
             double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
             // Intra-bar twin of the ProcessBlocks() projection above — same
             // unconditional mapped direction AND the same FAR-EDGE anchor.
-            // FIX (v5.57) measures the target from the edge the breakout crosses
-            // -- never from the deep anticipation entry, which sits a full
-            // blockHeight + 1.5*ATR past it -- so both passes judge one price;
-            // see the detailed derivation in ProcessBlocks().
-            // REALIZED RR (deep front-edge entry): reward from the ENTRY is
-            // (rr - 1)*bh + (0.5*rr - 1.5)*a over (bh + 0.5*a), which turns
-            // NEGATIVE for InpMaxRR below 3.0 as the zone height shrinks. That
-            // is the floor this build depends on; the full arithmetic, and the
-            // shipped-defaults 2.0R, live in ProcessBlocks(). Intentional: the
+            // FIX (v5.57) measures the target from the edge the zone breaks
+            // through -- never from the deep front-edge entry, which now sits on
+            // the OPPOSITE side of the zone (v5.69) -- so both passes judge one
+            // price; see the detailed derivation in ProcessBlocks().
+            // REALIZED RR (true deep front-edge entry): with the near edge at 0,
+            // the far edge at bh, entry = -(2.0*bh + 1.5*a) for a LONG and
+            // slDist = bh + 0.5*a, the reward from the ENTRY to the far-edge
+            // target is 3.0*bh + 1.5*a + rr*slDist = (3.0 + rr)*slDist, so the
+            // realized multiple is exactly rr + 3.0 at EVERY zone height and
+            // ATR -- 7.0R on the shipped InpMaxRR 4.0. It therefore cannot fall
+            // behind the entry for any positive InpMaxRR, and the pre-v5.69
+            // "InpMaxRR must stay above 3.0" floor is retired: it was an
+            // artifact of an entry anchored past the far edge. Intentional: the
             // target reproduces the pre-anticipation projection and keeps the
             // veto strict. Do NOT "fix" it by anchoring the target on the
             // entry.

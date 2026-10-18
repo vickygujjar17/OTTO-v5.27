@@ -1,0 +1,251 @@
+569: fix — true deep front-edge geometry: entry to the OPPOSITE side of the zone, break veto decoupled
+
+RATIONALE
+
+  v5.66 shipped two changes that each looked coherent in isolation and were
+  incoherent together. This release corrects both signs and re-anchors the veto
+  that depended on them. It is a REAL trade-character change, not a comment
+  sweep: the entry moves from "chase the breakout past the far edge" to "rest a
+  limit on the near side and buy the pullback."
+
+  1. THE ENTRY SIGNS WERE INVERTED.
+
+     v5.66 computed gap = 2.0*bh + 1.5*ATR and then added it for a LONG:
+
+         LONG : b.bottom + gap        SHORT: b.top - gap
+
+     b.bottom is the NEAR edge of a RESISTANCE zone and the arming close has
+     already gone BELOW it, so b.bottom + gap sits far ABOVE the market. A
+     BUY_LIMIT must sit below the ask, so `priceValid = (entryPrice < Bid -
+     boundary)` was FALSE on every bar and the broker limit was illegal by
+     construction. Every setup was forced onto the virtual stop path, which is
+     why the v5.66 "the trigger is a genuine STOP cross" narrative read as
+     self-consistent: it was describing the only route the wrong sign allowed.
+
+     The blueprint signs are the coherent ones, and v5.69 ships them:
+
+         LONG : b.bottom - gap        SHORT: b.top + gap
+
+     Near edge pinned at 0.0, far edge at +bh:
+
+         LONG : entry = -(2.0*bh + 1.5*a)    far edge = +bh
+         SHORT: entry = +(2.0*bh + 1.5*a)    far edge = -bh
+
+     The entry now sits BELOW the market for a LONG and ABOVE it for a SHORT,
+     i.e. on the limit side, so BUY_LIMIT / SELL_LIMIT is legal and the order
+     RESTS AT THE BROKER. It fills when price pulls back through the near edge.
+     The router needed NO code change: `priceValid` was always correct, it was
+     the price handed to it that was wrong. Physical rest becomes the ordinary
+     route by construction; the virtual MARKET arm becomes the fallback for a
+     tick where price already ran through the entry between the arming close
+     and the call.
+
+  2. THE BREAK VETO HAD TO BE DECOUPLED FROM THE ENTRY.
+
+     v5.66 anchored the break test on BlockEntryPrice(). That was only workable
+     because the entry sat BEYOND the far edge: the fill and the invalidation
+     were the same event, so one anchor served both. With the entry moved to the
+     opposite side of the zone the anchor inverts the test's meaning.
+
+     InpArmATR is 0.0, so arming is exactly:
+         RESISTANCE: close1 < b.bottom        SUPPORT: close1 > b.top
+     while the new entry is a further `gap` past that same edge. An
+     entry-anchored threshold for a RESISTANCE LONG is therefore
+
+         close1 > (b.bottom - 2.0*bh - 1.5*a) + ATRBufferBreak*a
+               == close1 > b.bottom - 2.0*bh - 1.0*a
+
+     and since arming only requires close1 < b.bottom, the threshold sits
+     BELOW the arm trigger. The test is ALREADY TRUE on the arming bar: the
+     block arms and vetoes itself VETO_BROKEN in a single pass, and
+     CancelOrdersForInvalidBlocks() drops the pending. Every setup dies the
+     instant it is armed -- a 100% failure, not an edge case.
+
+     ProcessBlocks() now anchors on the PHYSICAL far edge again:
+
+         double breakLevel = (b.type == BLOCK_SUPPORT) ? b.bottom : b.top;
+
+     Keeping the existing `<` / `>` operators. The two tests now live on
+     opposite sides of the zone and can never fire on the same close:
+
+         NEAR edge -> ARM     (RESISTANCE: close1 < b.bottom)
+         FAR  edge -> BREAK   (RESISTANCE: close1 > b.top + 0.5*ATR)
+
+     The decoupling is the invariant to preserve. The veto must never move with
+     the entry again, which is stated at the anchor site, in the enum banner and
+     in the probe.
+
+  3. THE "InpMaxRR MUST STAY ABOVE 3.0" FLOOR IS RETIRED.
+
+     Under v5.66 the target was anchored on the far edge while the entry sat
+     bh + 1.5*ATR past it, so the reward carried a (0.5*rr - 1.5) coefficient on
+     the ATR term and went NEGATIVE for rr < 3.0. Four comment blocks asserted a
+     hard 3.0 floor and the probe pinned it as a configuration invariant.
+
+     With the entry on the near side that term disappears:
+
+         reward = TP - entry = 3*bh + 1.5*a + rr*(bh + 0.5*a)
+                             = (3 + rr) * slDist
+         risk   = slDist
+         realized RR = rr + 3.0      -- EXACTLY, independent of bh and atr
+
+     Verified numerically at 7.0000R for all three shipped geometries
+     (1.0/2.0, 2.0/1.0, 0.5/4.0) and 5.0R at rr = 2.0 on a 1e-9-high zone, which
+     the old geometry could not survive at all. Because rr > 0 implies
+     rr + 3 > 3, the far-edge target can never land behind the entry and the
+     floor no longer constrains anything.
+
+     The four blocks that asserted it were REWRITTEN rather than left standing:
+     a comment claiming a hard floor that the code no longer has is worse than
+     no comment. The shipped 4.0 is now documented as simply the shipped value
+     (7.0R), not as a safety floor.
+
+
+SOURCE
+
+  COttoBlockManager.mqh
+
+    BlockEntryPrice() -- signs flipped, comment block rewritten.
+      return (BlockDirection(b) == DIR_LONG) ? (b.bottom - gap) : (b.top + gap);
+    A single character pair, and the whole trade character with it. The
+    comment now derives the near/far geometry from the blueprint rather than
+    rationalising the stop cross.
+
+    ProcessBlocks() -- break veto decoupled.
+      double breakLevel = (b.type == BLOCK_SUPPORT) ? b.bottom : b.top;
+    Was BlockEntryPrice(b, atrNow). The predicate's operators are untouched;
+    only the level moved, and the comment now records why an entry anchor is
+    impossible under near-side entries.
+
+    Arming comment re-pointed at the physical far edge (was: "the deep
+    front-edge entry, blockHeight + 1.5*ATR past the far edge").
+
+    ProcessBlocks() Front-Run projection derivation rewritten:
+      reward = 3*bh + 1.5*a + rr*(bh + 0.5*a) = (3 + rr) * slDist
+    with the retired 3.0 floor explicitly marked RETIRED and the shipped 7.0R
+    replacing the old 2.0R / 2.6R / 1.4R table.
+
+    UpdateIntraBar() twin derivation rewritten to match.
+
+  COttoOrderManager.mqh
+
+    CalcEntryPrice() -- signs flipped, byte-for-byte twin of BlockEntryPrice()
+      (the probe asserts arithmetical identity, so a one-sided edit fails).
+      return (GetDirectionForBlock(block) == DIR_LONG) ? (block.bottom - gap)
+                                                       : (block.top + gap);
+
+    CheckVirtualTriggers() -- cross predicate re-flipped:
+      if(isLong ? (ask > vo.triggerPrice) : (bid < vo.triggerPrice)) continue;
+    A LONG now fires when the ask comes back DOWN to its (lower) entry; the
+    v5.66 predicate waited for price to rise through an entry that was above
+    the market. The comment derives it from the limit semantics.
+
+    PlaceOrArmOrder() router note rewritten: physical rest FIRST, virtual arm
+    as fallback -- the exact inverse of what v5.66 asserted in the same place.
+
+    PlaceOrArmOrder() SL/TP derivation rewritten around the near-side entry
+    (reward = (3 + rr) * slDist; realized multiple = rr + 3.0).
+
+    File banner (Virtual Order Engine) and PlaceOrArmOrder() header corrected:
+    v5.52 made the virtual arm the ordinary path because the entry was a
+    breakout a limit cannot rest. That premise is gone.
+
+  COttoJournal.mqh -- for BOTH LogSetupArmed and LogEntry:
+      SUPPORT    : "Sell at Near Edge + 2.0*H + 1.5*ATR | SL 1R above entry"
+      RESISTANCE : "Buy  at Near Edge - 2.0*H - 1.5*ATR | SL 1R below entry"
+    The v5.67 captions described a stop 1.0*ATR past the FAR edge, which is no
+    longer where the stop lives. These are printed strings, so neither the
+    compiler nor any runtime check could have caught the drift.
+    Armed header: target caption now says "far edge +/- InpMaxRR*1R" (was 1R,
+    which understated it by the whole InpMaxRR multiple).
+
+  OttoDefines.mqh -- ENTRY_FRONT_EDGE banner rewritten: TRUE DEEP FRONT-EDGE,
+    both sign lines, the resting-limit route, rr + 3.0, and the explicit note
+    that the break veto is NOT anchored on the entry.
+
+  _probe/test_v557_frontrun.py -- extended 114 -> 122 checks.
+    Rewritten: header docstring, section 3 gap signs (plus a new
+    belt-and-braces "far-side spellings gone" pair), section 4b break anchor
+    (now asserts the physical far edge AND that the retired entry anchor is
+    absent), section 5 cross predicate, section 7 geometry (realized() now
+    returns the negative near-side entry; realized_rr() returns rr + 3.0), and
+    section 10 journal captions with a derived `geometry()` helper.
+
+    New numeric assertions that would have caught v5.66 on day one:
+      * "an entry-anchored threshold sits BELOW the arming close, so it fires
+         on the arming bar itself (the bug v5.69 removed)" -- the self-cancel,
+         proved arithmetically instead of argued in prose;
+      * "the entry sits strictly below the near edge in every case, so the
+         BUY_LIMIT is legal and rests physically" -- the legality v5.66's signs
+         made impossible;
+      * "the realized multiple is independent of zone height and ATR".
+
+    Deliberately NOT touched: the two "retired physical far-edge threshold is
+    gone" assertions at what were lines 408-410. They test
+    `"b.bottom - ATRBufferBreak" not in BM_C` / `"b.top + ATRBufferBreak" not in
+    BM_C`, which contain no `BlockEntryPrice` literal, so they keep passing
+    unchanged through the re-anchor. The `BM_C.count("breakLevel") == 3` pin
+    also still holds: the new ternary names the variable once and the two
+    predicate arms once each -- verified by measurement, not by inspection.
+
+  _probe/test_v563_trail_health.py -- one anchor de-hardcoded.
+    "the auditor is stamped v5.68" pinned a literal that MUST rot on every
+    release. Replaced with a comparison against the tree-wide stamp the probe
+    already extracts (RELEASE), so it now says what it means: the auditor
+    carries the same release as every other shipped source. First bump that
+    would otherwise have gone red for no reason.
+
+  Version census: 20 human-facing rows bumped 5.68 -> 5.69 by
+  _tools/_bump_version.py (11 headers + otto.mq5 banner/Print + 4 input groups
+  + OttoDefines banner/description + README). Guard reports
+  "no v5.68 literal remains in the shipped sources or docs".
+
+GATES
+
+  * build_check.ps1 : 0 errors / 0 warnings, GATE PASSED, headers verified from
+    the staging tree (binary 258652 bytes). Run BEFORE the bump (258526) and
+    again AFTER it (258652) so the version rewrite is itself compile-verified.
+  * test_v557_frontrun.py : 122/122 (was 114/114). +8 checks.
+  * test_v563_trail_health.py : 164/164. _mutate_v563.py : 38/38 caught,
+    0 anchors skipped.
+  * test_v532_pyramid.py 87/87 | test_v533_adoptmanual.py 230/230 |
+    test_v526_vector.py 83/83 | test_v52x_pyramid.py 135/135 |
+    test_v530_price_guard.py 44/44.
+  * Full probe suite: 24 GREEN / 4 RED -- the SAME four reds and the SAME
+    counts as the v5.68 baseline recorded in _tools/_commit568.txt:
+        test_v528_hotfix      57 / 68
+        test_v531_smart_trim  15 / 38
+        test_v532_hightable  126 / 136
+        test_v543_session     27 / 29
+    No new red, no count drift. Every InpMaxRR / front-run / far-edge check
+    inside test_v531_smart_trim still PASSES; its reds are the removed
+    smart-trim silo.
+  * _bump_probe.ps1 : 20 rows, bump_exit=0, restored_identical=True,
+    guard_verdict=PASS (0 stale).
+  * _vercensus.py : all 20 rows resolve at 5.69.
+  * normalize_eol.py . --check : files=11, rewritten=0, strict CRLF preserved
+    (bareLF=0, bareCR=0 on every shipped source).
+  * verify_integrity.py : NOT RUNNABLE in this checkout -- the workspace is not
+    a git repository ("fatal: not a git repository"), so every file reports
+    "<not in HEAD - untracked>". Must be re-run in the real repo before relying
+    on it.
+
+KNOWN RED, OUT OF SCOPE (identical to the v5.68 baseline, none touched here)
+
+  * AuditTrimHealth / WalkTrimLegs / TrimHeavyLosers / CountTrimCandidates --
+    referenced by test_v531_smart_trim and test_v532_hightable, defined nowhere
+    in the tree (whole-tree grep = 0 hits). The smart-trim silo was never
+    shipped.
+  * NY-DST session helpers (IsUsEasternDST / NewYorkUtcOffsetSeconds /
+    UtcToNewYork / MostRecentNyRollover) -- test_v528_hotfix, 0 tree hits.
+  * The v5.543 cancel-write count: CancelOrdersForInvalidBlocks contains TWO
+    save/restore pairs, the probe expects four.
+
+ROLLBACK
+
+  Single-commit revert. The two sign pairs and the break anchor are three
+  one-line edits with no state coupling: reverting restores the v5.68 breakout
+  entry, the entry-anchored veto, and the virtual-first router note. Note that
+  v5.68's entry signs put the entry on the wrong side of the market, so a
+  revert also restores the 100% virtual-route behaviour -- worth knowing before
+  rolling back.

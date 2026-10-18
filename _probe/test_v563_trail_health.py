@@ -178,6 +178,9 @@ check("all %d shipped sources carry a version stamp" % len(ALL_FILES),
       len(stamps) == len(ALL_FILES), "found %d" % len(stamps))
 check("every shipped source carries the SAME release stamp",
       bool(stamps) and len(set(stamps)) == 1, "stamps=%s" % sorted(set(stamps)))
+# The tree-wide release, derived rather than pinned, so a bump cannot leave this
+# probe asserting a stale literal. Section D compares the auditor against it.
+RELEASE = stamps[0] if stamps else "?"
 
 
 # ----------------------------------------------------------------------
@@ -534,8 +537,12 @@ check("the auditor still includes NO trade module",
 # ----------------------------------------------------------------------
 print("\n-- D. v5.68 milestone floor + orphan sweep --")
 
-check("the auditor is stamped v5.68",
-      re.search(r'#property\s+version\s+"5\.68"', AUD_T) is not None)
+check("the auditor carries the tree-wide release stamp",
+      RELEASE != "?" and
+      re.search(r'#property\s+version\s+"%s"' % re.escape(RELEASE), AUD_T) is not None,
+      "auditor=%s tree=%s" % (
+          (re.search(r'#property\s+version\s+"([\d.]+)"', AUD_T) or [None, "?"])[1],
+          RELEASE))
 
 # --- The floor helper --------------------------------------------------
 FLOOR = func_body(AUD_T, r"double\s+ExpectedFloorRR\s*\(\s*const\s+double\s+peakRR\s*,"
