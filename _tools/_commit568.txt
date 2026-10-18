@@ -1,0 +1,54 @@
+568: release - bump to 5.68 and teach the census guard to read comment-borne history
+
+RATIONALE
+
+  v5.67's three EA fixes landed without a release bump, which broke the standing
+  rule that every source change bumps the release stamp. v5.68 is that bump, and
+  it is not a bare string swap: the census guard that protects the bump had a
+  blind spot that made a correct bump impossible to land.
+
+  1. THE BUMP. All twenty version rows move 5.67 -> 5.68: every #property
+     version line, the two otto.mq5 banners, the OttoDefines.mqh build stamp and
+     its input-group labels, and the README base line.
+
+  2. THE GUARD'S BLIND SPOT. census() protects the bump by refusing to call it
+     clean while any old-release literal survives. It exempted parenthesised
+     history -- "(v5.67)" -- but this tree's house style also writes history as
+     a line-leading or trailing release TAG: "// v5.67: ...", "//| v5.67 - ...",
+     "AuditOrphanLegs();   // v5.67 - ...". Those are identical in form to the
+     annotations used for v5.52 and v5.63, so they are genuinely historical and
+     must survive the bump. Under the old rule a correct bump reported sixteen
+     of them as missed rows and refused.
+
+  3. THE FIX, AND WHY IT IS NARROW. The exemption now also accepts a
+     'v'-prefixed release reference appearing after the // opener on the same
+     line. That is deliberately the narrowest form covering the house style,
+     because a guard that swallows everything is worse than no guard at all:
+       - a ROW that lives inside a comment (the "Pine Script Master Build
+         Port (vX.Y)" and "OTTO EA vX.Y" banners) is tested FIRST and is always
+         reported, so the guard cannot be talked out of a real miss;
+       - the input-group labels are still matched explicitly;
+       - a bare literal with no 'v' prefix inside a comment ("// as of 5.67 the
+         veto reads the ENTRY") is still reported, as is any row outside a
+         comment, since those lines carry no '//' at all.
+
+VERIFICATION
+
+  census control     15/15 PASS -- the four original verdicts are unchanged and
+                     eight new cases pin both the extension and its narrowness:
+                     four history shapes exempted, two banner rows plus one bare
+                     literal still flagged.
+  unified SL probe   113/113 PASS.
+  mutation harness   30/30 killed, 0 skipped -- the probes still bite.
+  full probe sweep   30 probes, only the four documented reds, at exact
+                     baseline (57/68, 15/38, 125/135, 27/29). No new red.
+  build gate         0 errors, 0 warnings (binary 261664 bytes).
+  version census     every module and the README at 5.68.
+  EOL                normalize_eol.py --check: rewritten=0.
+
+SCOPE
+
+  The source diff is version literals only: one line per module, seven in
+  OttoDefines.mqh, three in otto.mq5, one in README.md. The remaining two files
+  are the guard and its control. No EA logic is touched by this release, so the
+  v5.67 behavioural proofs above stay the authority on the EA's correctness.

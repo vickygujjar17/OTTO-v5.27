@@ -142,8 +142,40 @@ def census(old):
 
     A bare, un-parenthesised "5.66" on a non-FIX line is still reported: that
     is the shape of a missed version row.
+
+    v5.68: the v5.67 rule still over-fired, because this tree annotates history
+    in a SECOND legitimate form the parenthesis test cannot see -- the
+    line-leading release tag ("// v5.67: ...", "//| v5.67 - ...") and the
+    trailing one ("AuditOrphanLegs();   // v5.67 - ..."). Those are the house
+    style for every earlier release as well (v5.52, v5.63), so a strict
+    parenthesis test reports the CURRENT release's own annotations the moment
+    you bump away from it -- exactly the sixteen valid history lines v5.68 hit.
+    The exemption is therefore extended: a 'v'-prefixed release reference that
+    appears AFTER the comment opener on the same line is history, not a row.
+
+    That extension is deliberately narrow, because an exemption that swallows
+    everything is worse than none. Two shapes are checked FIRST and are reported
+    unconditionally, so the guard cannot be talked out of a real miss:
+      * a version ROW that lives inside a comment -- the file banners
+        ("Pine Script Master Build Port (vX.Y)", "OTTO EA vX.Y") -- which is a
+        genuine row and must be rewritten by the bump;
+      * the input-group labels, matched explicitly.
+    A row outside a comment (the '#property version' line, the README base
+    line) has no '//' and so can never satisfy the exemption either.
     """
     hist = re.compile(r"\((?:FIX\s*\(\s*)?v?%s(?![\d.])" % re.escape(old))
+    # v5.68: a release ROW that happens to live inside a comment (the file
+    # banners) is still a row, so it is reported before the exemption is
+    # consulted. These are the only two comment-borne row shapes the bump
+    # itself rewrites, so they are enumerated rather than pattern-guessed.
+    row_in_comment = re.compile(
+        r"(?:Master Build Port|Master Build) \(v%s\)|OTTO EA v%s(?![\d.])"
+        % (re.escape(old), re.escape(old)))
+    # v5.68: the house annotation style ("// v5.67: ...", "//| v5.67 - ...",
+    # "<code>;   // v5.67 - ..."). A 'v'-prefixed reference placed after the
+    # comment opener on the same line is history. Un-parenthesised bare
+    # literals ("// the 5.66 build") do NOT match: they carry no 'v' prefix.
+    comment_hist = re.compile(r"//.*?\bv%s(?![\d.])" % re.escape(old))
     hits = []
     for path in FILES + DOC_FILES:
         full = os.path.join(ROOT, path)
@@ -154,7 +186,10 @@ def census(old):
                                  .split("\n"), 1):
             if old not in line:
                 continue
-            if "FIX (" in line or hist.search(line):
+            if row_in_comment.search(line):
+                hits.append("%s:%d: %s" % (path, i, line.strip()))
+                continue
+            if "FIX (" in line or hist.search(line) or comment_hist.search(line):
                 continue
             hits.append("%s:%d: %s" % (path, i, line.strip()))
     return hits
