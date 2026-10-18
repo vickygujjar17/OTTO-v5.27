@@ -22,8 +22,10 @@ bump pass skips any line containing 'FIX (' outright, and every remaining
 pattern is anchored on a specific human-facing prefix rather than on the
 version number alone, so no comment can be rewritten by accident. The one
 non-prefixed form is the versioned INPUT GROUP label, which a comment can never
-satisfy. The post-bump staleness census applies the same 'FIX (' exemption, so
-a historical marker is never reported as stale.
+satisfy. The post-bump staleness census applies those SAME anchored patterns
+(plus the 'FIX (' exemption), so a historical marker is never reported as
+stale -- a bare substring test would flag every '// v5.3x:' note and make the
+guard red on the first bump AFTER the release that introduced them.
 
 Every em-dash inside an anchored banner is matched with a single '.' so the
 script is agnostic to how the dash is encoded.
@@ -118,13 +120,17 @@ def bump(path, patterns):
     return changed
 
 
-def census(old):
-    """Every surviving literal `old` in the shipped sources + docs.
+def census(old, patterns):
+    """Every surviving OPERATOR-VISIBLE literal `old` in the sources + docs.
 
-    Mirrors the bump() exemption above: a line carrying a historical
-    'FIX (vX)' annotation LEGITIMATELY names the release the fix landed in, so
-    it is not stale. Without this the guard fires on exactly the markers the
-    bump pass was written to preserve.
+    "Operator-visible" is defined by the SAME anchored patterns bump()
+    rewrites, not by a bare substring. This matters: a provenance comment such
+    as '// v5.63: the trail now arms ...' names the release a feature LANDED
+    in and is deliberately preserved (see the module docstring), so it must
+    never be reported as stale. A bare `old in line` test reports exactly those
+    comments, which means the guard stays green for the release that INTRODUCES
+    them and goes red on the first bump AFTER it -- a false alarm that blocks a
+    correct bump.
     """
     hits = []
     for path in FILES + DOC_FILES:
@@ -134,7 +140,10 @@ def census(old):
         for i, line in enumerate(io.open(full, encoding="utf-8",
                                          errors="replace", newline="").read()
                                  .split("\n"), 1):
-            if old in line and "FIX (" not in line:
+            # Historical 'FIX (vX)' annotations are preserved by bump() too.
+            if "FIX (" in line:
+                continue
+            if any(pat.search(line) for pat, _ in patterns):
                 hits.append("%s:%d: %s" % (path, i, line.strip()))
     return hits
 
@@ -170,8 +179,9 @@ def main():
     print("changed %d line(s)" % total)
 
     # Guard: a partial bump is worse than no bump, so refuse to exit clean if
-    # the OLD release is still stamped anywhere operator-visible.
-    stale = census(old)
+    # the OLD release is still stamped anywhere operator-visible. The census
+    # reuses the bump patterns, so it asks exactly the question bump() answers.
+    stale = census(old, build_patterns(old, new) + build_doc_patterns(old, new))
     if stale:
         print("\n*** STALE v%s REMAINS ***" % old)
         for h in stale:

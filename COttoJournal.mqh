@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.63"
+#property version   "5.66"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -177,14 +177,14 @@ public:
       W("  Setup ID          : " + tradeId);
       W("  Logic             : " + phase);
       W("  Execution Mode    : " + execMode);
-      W("  Trigger Price     : " + FmtPrice(entryPrice) + " (Front-Run: far edge +/- 0.5*ATR)");
+      W("  Trigger Price     : " + FmtPrice(entryPrice) + " (Front-Run: near edge +/- 2.0*H +/- 1.5*ATR)");
       W("  Initial SL        : " + FmtPrice(slPrice) + " | 1R = " + FmtPrice(blk.rrUnit));
       W("  Volume            : " + DoubleToString(lotSize,2));
       string actionDesc = "";
       if(btype == BLOCK_SUPPORT)
-         actionDesc = "SUPPORT (Front-Run Breakdown / Sell at Bottom Edge - 0.5*ATR | SL at Top Edge)";
+         actionDesc = "SUPPORT (Front-Run Breakdown / Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge + 1.0*ATR)";
       else
-         actionDesc = "RESISTANCE (Front-Run Breakout / Buy at Top Edge + 0.5*ATR | SL at Bottom Edge)";
+         actionDesc = "RESISTANCE (Front-Run Breakout / Buy at Near Edge + 2.0*H + 1.5*ATR | SL at Far Edge + 1.0*ATR)";
       W("  Trade             : " + actionDesc);
       W("  Block Top/Bottom  : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom) + " | Mid=" + FmtPrice(blk.midpoint) + " | Height=" + FmtPrice(blk.blockHeight));
       W("  Projected Target  : " + FmtPrice(blk.localTP) + " (Front-Run veto anchor, far edge +/- 1R)");
@@ -223,9 +223,9 @@ public:
       W("  S/R Block:");
       string actionDesc = "";
       if(blk.type == BLOCK_SUPPORT)
-         actionDesc = "SUPPORT (Front-Run Breakdown / Sell at Bottom Edge - 0.5*ATR | SL at Top Edge)";
+         actionDesc = "SUPPORT (Front-Run Breakdown / Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge + 1.0*ATR)";
       else
-         actionDesc = "RESISTANCE (Front-Run Breakout / Buy at Top Edge + 0.5*ATR | SL at Bottom Edge)";
+         actionDesc = "RESISTANCE (Front-Run Breakout / Buy at Near Edge + 2.0*H + 1.5*ATR | SL at Far Edge + 1.0*ATR)";
       W("    - Logic     : " + actionDesc);
       W("    - Zone      : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom) + " | Mid=" + FmtPrice(blk.midpoint) + " | Height=" + FmtPrice(blk.blockHeight));
       if(blk.wick1Time > 0 && blk.wick2Time > 0)

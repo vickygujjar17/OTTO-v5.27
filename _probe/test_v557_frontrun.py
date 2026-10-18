@@ -1,12 +1,14 @@
 """
-v5.57 static verification probe - FRONT-RUNNING ANTICIPATION ENTRY.
+Front-run / deep front-edge anticipation entry - static verification probe.
 
-v5.57 moves the entry, the stop and the take-profit onto an EXTREME
-FRONT-RUNNING ANTICIPATION model (entry = the zone edge plus one full stop
-distance, i.e. 0.5*ATR BEYOND the edge the breakout crosses) and moves the
+Originally written for v5.57, which moved the entry, the stop and the
+take-profit onto an EXTREME FRONT-RUNNING ANTICIPATION model and moved the
 level the virtual engine waits on from a resting price to a MARKET cross.
-Three properties carry that change and NOT ONE of them is visible to the
-MQL5 compiler, because each is a runtime relationship between two files:
+v5.66 DEEPENS that entry (gap = 2.0*blockHeight + 1.5*ATR out from the NEAR
+edge, i.e. blockHeight + 1.5*ATR beyond the FAR edge) and re-anchors the BREAK
+veto onto the same price. The properties below carry that change and NOT ONE of
+them is visible to the MQL5 compiler, because each is a runtime relationship
+between two files:
 
   1. ATR SHIFT SYNC. COttoBlockManager prices its Front-Run veto projection
      from GetATRAtShift(1) -- the last CLOSED bar. COttoOrderManager must
@@ -28,31 +30,42 @@ MQL5 compiler, because each is a runtime relationship between two files:
      it is invisible at compile time -- the block still arms either way.
 
   3. THE FAR-EDGE TARGET ANCHOR. slDist = blockHeight + 0.5*ATR, and the
-     anticipation entry maps a FURTHER 0.5*ATR past the far edge. The target
-     is deliberately measured from the FAR EDGE (block.top LONG /
+     anticipation entry maps blockHeight + 1.5*ATR past the far edge. The
+     target is deliberately measured from the FAR EDGE (block.top LONG /
      block.bottom SHORT), not from the entry, so the projection reproduces
      what every pre-anticipation build projected and the veto keeps its
      strictness. Anchoring it on the entry instead would silently stretch
-     the target 0.5*ATR and veto setups that were never front-runs. The
-     consequence, pinned in section 7, is that the target is no longer a
+     the target the same distance and veto setups that were never front-runs.
+     The consequence, pinned in section 7, is that the target is no longer a
      full InpMaxRR from the ENTRY: realized entry-anchored RR is
-     InpMaxRR - 0.5*ATR/slDist (e.g. 4.0 -> 3.5 on a 1.0-high zone at
-     ATR 2.0). That is intended, not a defect, and the invariant is asserted
-     so a future re-anchor has to be a deliberate act.
+     InpMaxRR - 3 + 2*blockHeight/slDist (e.g. 4.0 -> 2.0 on a 1.0-high zone
+     at ATR 2.0), and turns NEGATIVE for InpMaxRR below 3.0, which is why that
+     is a hard configuration floor. Intended, not a defect, and asserted so a
+     future re-anchor has to be a deliberate act.
+
+  4. THE BREAK VETO ANCHOR (v5.66). Through v5.65 the break test fired
+     ATRBufferBreak*ATR past the PHYSICAL far edge -- a level that now sits
+     blockHeight + 1.0*ATR BEFORE the fill. A breakout walking in through the
+     zone armed and then immediately vetoed itself VETO_BROKEN, and
+     CancelOrdersForInvalidBlocks() dropped the pending before price could
+     reach it, so every armed block died on approach. Section 4b pins the
+     re-anchor onto BlockEntryPrice() and the retirement of the old literals;
+     section 7 proves numerically that the retired threshold falls short of
+     the entry in every shipped geometry.
 
 WHAT THIS PROBE PINS. The ATR shift sync and its fallback in all three
 OrderManager price paths, the public visibility of GetATRAtShift(), the two
 entry twins' textual identity (COttoBlockManager::BlockEntryPrice() vs
 COttoOrderManager::CalcEntryPrice(), which MUST judge one price), the
 two-argument call sites and the retirement of the single-argument form, the
-far-edge projection in BOTH BlockManager passes, the inverted cross test
-plus the absence of the retired v5.56 predicate, the geometry identity
-behind the realization above, and the release stamps.
+far-edge projection in BOTH BlockManager passes, the break veto's re-anchor,
+the inverted cross test plus the absence of the retired v5.56 predicate, the
+geometry identities behind the realization above, and the release stamps.
 
 WHAT IT CANNOT PROVE. That the ATR cache slot is actually POPULATED on the
-tick that matters, and that the cross fires on the intended bar, are
-Strategy-Tester properties. This probe is pure static analysis of the
-shipped sources -- no MT5 required.
+tick that matters, that the cross fires on the intended bar, and that a block
+survives the walk from arming to fill, are Strategy-Tester properties. This
+probe is pure static analysis of the shipped sources -- no MT5 required.
 
 Companion to test_v530_price_guard.py, which pins the SNAP the entry price
 depends on but pins nothing about where that price comes from.
@@ -294,9 +307,14 @@ check("the two entry twins are arithmetically identical",
 check("both twins honour ENTRY_MIDPOINT before the front-edge maths",
       "if(InpEntryStyle == ENTRY_MIDPOINT) return midpoint;" in BEP_BODY and
       "if(InpEntryStyle == ENTRY_MIDPOINT) return midpoint;" in CALC_BODY)
-check("the front-edge entry sits one full slDist from the near edge",
-      "return (Dir(x) == DIR_LONG) ? (bottom + slDist) : (top - slDist);" in BEP_BODY,
+check("the front-edge entry sits 2.0 heights + 1.5 ATR from the near edge",
+      "double gap = (2.0 * blockHeight) + (1.5 * atr);" in BEP_BODY and
+      "return (Dir(x) == DIR_LONG) ? (bottom + gap) : (top - gap);" in BEP_BODY,
       BEP_BODY)
+check("the OrderManager twin uses the identical gap expression",
+      "double gap = (2.0 * blockHeight) + (1.5 * atr);" in CALC_BODY and
+      "return (Dir(x) == DIR_LONG) ? (bottom + gap) : (top - gap);" in CALC_BODY,
+      CALC_BODY)
 
 # ----------------------------------------------------------------------
 # 4. The far-edge target anchor, in BOTH BlockManager passes
@@ -325,8 +343,8 @@ check("both BlockManager passes carry the far-edge anchor",
 check("both passes defer to block.localTP",
       len(re.findall(r"target = b\.localTP;", BM_C)) == 2)
 check("neither pass recalls a single-arg entry helper",
-      "BlockEntryPrice(" not in BM_PROC and
-      "BlockEntryPrice(" not in BM_INTRA)
+      "BlockEntryPrice(b)" not in BM_PROC and
+      "BlockEntryPrice(b)" not in BM_INTRA)
 
 # The anchor is only FAR if the high edge is named first: on a valid block
 # top > bottom, so MathMax(top,bottom) SHORT would be near-edge anchored.
@@ -354,8 +372,56 @@ check("OrderManager writes the exact TP back to the block",
 
 
 # ----------------------------------------------------------------------
-# 5. The INVERTED cross test
+# 4b. v5.66: the BREAK veto re-anchors onto that same entry price
 # ----------------------------------------------------------------------
+# The deep front-edge entry drags the fill blockHeight + 1.5*ATR past the far
+# edge. The pre-v5.66 break test fired ATRBufferBreak*ATR past the PHYSICAL far
+# edge, which now sits blockHeight + 1.0*ATR BEFORE the fill: a breakout
+# walking in through the zone armed, then immediately vetoed itself
+# VETO_BROKEN, and CancelOrdersForInvalidBlocks() dropped the pending order
+# before price could ever reach the entry. Every armed block died on approach.
+#
+# Nothing here is compile-visible: both spellings are valid MQL5, both veto the
+# block, and the block still arms either way. Only the LEVEL differs, so only a
+# static pin over the two literals catches a regression.
+print("\n-- 4b. Break veto re-anchored on the entry --")
+
+BREAK_LEVEL = "double breakLevel = BlockEntryPrice(b, atrNow);"
+BREAK_LONG = ("b.type == BLOCK_RESISTANCE && close1 > breakLevel"
+              " + ATRBufferBreak * atrNow")
+BREAK_SHORT = ("b.type == BLOCK_SUPPORT && close1 < breakLevel"
+               " - ATRBufferBreak * atrNow")
+BREAK_BLOB = norm(BM_PROC or "")
+
+check("ProcessBlocks declares breakLevel from BlockEntryPrice(b, atrNow)",
+      BREAK_LEVEL in BREAK_BLOB)
+check("the break fires ATRBufferBreak*ATR past that level, both directions",
+      BREAK_LONG in BREAK_BLOB and BREAK_SHORT in BREAK_BLOB)
+check("the retired physical far-edge threshold is gone from the sources",
+      "b.bottom - ATRBufferBreak" not in BM_C and
+      "b.top + ATRBufferBreak" not in BM_C)
+# Exactly ONE declaration, and it must be the re-anchored one: a second
+# (unre-anchored) break test in the intra-bar twin would still kill the block
+# on approach even with ProcessBlocks fixed.
+check("exactly one breakLevel is declared, and only in ProcessBlocks",
+      BM_C.count("breakLevel") == 3 and
+      "breakLevel" not in (BM_INTRA or ""),
+      "count=%d intra=%s" % (BM_C.count("breakLevel"),
+                             "breakLevel" in (BM_INTRA or "")))
+# Ordering inside ProcessBlocks is the whole defence: the block must already be
+# armed when the break is evaluated, or the veto could fire on a block that
+# never placed anything (and the arming close is the one that still looks past
+# the NEAR edge).
+_arm_at = (BM_PROC or "").find("b.isArmed = true")
+_break_at = (BM_PROC or "").find("double breakLevel")
+check("the arming test is evaluated BEFORE the break veto",
+      _arm_at >= 0 and _break_at >= 0 and _arm_at < _break_at,
+      "armed@%d break@%d" % (_arm_at, _break_at))
+check("breakLevel honours InpEntryStyle through the twin, and says so",
+      "breakLevel honours InpEntryStyle" in BM_RAW)
+check("ATRBufferBreak is the documented 0.5 ATR buffer",
+      re.search(r"ATRBufferBreak\s*=\s*0\.5;", DEFS_T) is not None)
+
 print("\n-- 5. Inverted cross test --")
 
 LIVE_CROSS = "isLong ? (ask < vo.triggerPrice) : (bid > vo.triggerPrice)"
@@ -415,39 +481,119 @@ print("\n-- 7. Geometry identity --")
 
 
 def realized(bh, atr, rr):
-    """Transcribe the shipped geometry with the near edge at 0.0.
+    """Transcribe the shipped deep front-edge geometry, near edge at 0.0.
 
     LONG is the whole story: DIR_SHORT is the mirror image, so one side
-    proves both. nearEdge=0, farEdge=bh, entry = nearEdge + slDist,
-    stop = nearEdge, tp = farEdge + InpMaxRR*slDist.
+    proves both. nearEdge=0, farEdge=bh, gap = 2.0*bh + 1.5*atr measured from
+    the NEAR edge, so entry = bh + bh + 1.5*atr -- i.e. bh + 1.5*atr past the
+    far edge. slDist is untouched at bh + 0.5*atr, and the target stays
+    anchored on the FAR edge: tp = farEdge + rr*slDist.
     """
     sl = bh + 0.5 * atr
-    return (sl, 0.0, bh + rr * sl, sl)   # entry, stop, tp, slDist
+    entry = 2.0 * bh + 1.5 * atr
+    return (entry, entry - sl, bh + rr * sl, sl)   # entry, stop, tp, slDist
 
 
-CASES = [(1.0, 2.0, 4.0), (2.0, 1.0, 4.0), (1.0, 1.0, 2.0), (0.5, 4.0, 4.0)]
-risk_ok = anchor_ok = bound_ok = True
+def realized_rr(bh, atr, rr):
+    """The closed form of the reward-to-risk the ENTRY actually realizes.
+
+    reward = tp - entry = (rr - 1)*bh + 0.5*(rr - 3)*atr, risk = slDist.
+    Dividing by slDist = bh + 0.5*atr and writing r = bh/slDist gives
+        x = rr - 3 + 2*r,   with 0 < r < 1
+    so x lies strictly in (rr - 3, rr) and can only reach zero from above when
+    rr <= 3 and the zone is thin (r -> 0). That is the whole 3.0 floor.
+    """
+    entry, stop, tp, sl = realized(bh, atr, rr)
+    return (tp - entry) / abs(entry - stop)
+
+
+def break_level(bh, atr, buffer):
+    """The v5.66 break barrier, near edge at 0.0 (RESISTANCE / LONG side).
+
+    breakLevel IS the entry, and the break fires `buffer*atr` above it.
+    """
+    return 2.0 * bh + 1.5 * atr + buffer * atr
+
+
+# The first three are inside the shipped configuration space (rr = 4.0); the
+# fourth is `InpMaxRR = 2.0`, deliberately INCLUDED as the negative control
+# that proves the 3.0 floor is real rather than asserted.
+CASES = [(1.0, 2.0, 4.0), (2.0, 1.0, 4.0), (0.5, 4.0, 4.0), (1.0, 1.0, 2.0)]
+SHIPPED = CASES[:3]
+risk_ok = anchor_ok = beyond_ok = bound_ok = True
 for bh, atr, rr in CASES:
     entry, stop, tp, sl = realized(bh, atr, rr)
     if abs(abs(entry - stop) - sl) > 1e-12:
         risk_ok = False                      # risk must never drift
-    if abs((tp - entry) - (rr - 0.5 * atr / sl) * sl) > 1e-12:
-        anchor_ok = False                    # the far-edge identity
-    x = (tp - entry) / abs(entry - stop)
-    if not (rr - 1.0 < x <= rr):
+    # reward = (rr - 1)*bh + 0.5*(rr - 3)*atr -- the far-edge identity.
+    if abs((tp - entry) - ((rr - 1.0) * bh + 0.5 * (rr - 3.0) * atr)) > 1e-12:
+        anchor_ok = False
+    # The entry clears the FAR edge by bh + 1.5*atr, the stop trails it by
+    # exactly 1.0*atr (entry - stop = sl, so stop - farEdge = atr).
+    if abs(entry - (2.0 * bh + 1.5 * atr)) > 1e-12 or abs((stop - bh) - atr) > 1e-12:
+        beyond_ok = False
+    # x = rr - 3 + 2*bh/slDist, which must sit strictly inside (rr - 3, rr).
+    if abs(realized_rr(bh, atr, rr)
+           - (rr - 3.0 + 2.0 * bh / (bh + 0.5 * atr))) > 1e-12:
+        bound_ok = False
+    if not (rr - 3.0 < realized_rr(bh, atr, rr) < rr):
         bound_ok = False
 
 check("the stop always sits exactly one slDist from the entry", risk_ok)
-check("reward from the ENTRY == (InpMaxRR - 0.5*ATR/slDist) * slDist",
-      anchor_ok)
-check("realized RR is bounded by (InpMaxRR - 1, InpMaxRR]", bound_ok)
+check("reward from the ENTRY == (rr-1)*bh + 0.5*(rr-3)*ATR", anchor_ok)
+check("the entry clears the far edge by bh + 1.5*ATR, stop by 1.0*ATR",
+      beyond_ok)
+check("realized RR == InpMaxRR - 3 + 2*bh/slDist, strictly inside "
+      "(InpMaxRR - 3, InpMaxRR)", bound_ok)
 
 entry, stop, tp, sl = realized(1.0, 2.0, 4.0)
 HEAD = (tp - entry) / abs(entry - stop)
-check("the documented 1.0-high / ATR 2.0 / RR 4.0 zone realizes 3.5R",
-      abs(HEAD - 3.5) < 1e-12, "%.4fR" % HEAD)
+check("the documented 1.0-high / ATR 2.0 / RR 4.0 zone realizes 2.0R",
+      abs(HEAD - 2.0) < 1e-12, "%.4fR" % HEAD)
+check("the documented 2.0-high / ATR 1.0 / RR 4.0 zone realizes 2.6R",
+      abs(realized_rr(2.0, 1.0, 4.0) - 2.6) < 1e-12)
+check("the documented 0.5-high / ATR 4.0 / RR 4.0 zone realizes 1.4R",
+      abs(realized_rr(0.5, 4.0, 4.0) - 1.4) < 1e-12)
 check("the target is NOT a full InpMaxRR from the anticipation entry",
       HEAD < 4.0)
+
+# The reward can only stay POSITIVE because InpMaxRR exceeds 3.0. As the zone
+# thins (bh/slDist -> 0) x -> rr - 3, so any InpMaxRR BELOW 3.0 eventually
+# puts the far-edge target BEHIND the deep entry and vetoes every such setup as
+# a front-run that never existed. Nothing in the .mqh rejects such a value --
+# it fails silently at runtime -- so the floor is pinned here instead, both as
+# arithmetic and against the shipped default.
+FLOOR = 3.0
+check("every shipped case keeps the far-edge target ahead of the entry",
+      all(realized_rr(bh, atr, rr) > 0 for bh, atr, rr in SHIPPED))
+check("a thin zone under InpMaxRR = 2.0 puts the target BEHIND the entry",
+      realized_rr(1e-9, 1.0, 2.0) < 0)
+check("InpMaxRR = 3.0 is the floor: thin zones stay positive, just barely",
+      realized_rr(1e-9, 1.0, FLOOR) > 0 and
+      realized_rr(1e-9, 1.0, FLOOR) < 1e-6)
+MMAXX = re.search(r"InpMaxRR\s*=\s*([0-9.]+)", DEFS_T)
+check("the shipped InpMaxRR stays above the 3.0 geometry floor",
+      MMAXX is not None and float(MMAXX.group(1)) > FLOOR,
+      "InpMaxRR=%s" % (MMAXX.group(1) if MMAXX else "?"))
+
+# The break barrier must sit BEYOND the entry, never before it: the gap between
+# the retired far-edge threshold and this entry IS the bug v5.66 fixed.
+_bufraw = re.search(r"ATRBufferBreak\s*=\s*([0-9.]+);", DEFS_T)
+_buf = float(_bufraw.group(1)) if _bufraw else 0.5
+check("the break barrier clears the entry by exactly ATRBufferBreak*ATR",
+      all(abs(break_level(bh, atr, _buf) - (realized(bh, atr, 4.0)[0] + _buf * atr))
+          <= 1e-12 for bh, atr, _ in CASES))
+check("the break barrier sits past the physical far edge, not before it",
+      all(break_level(bh, atr, _buf) > bh for bh, atr, _ in CASES),
+      "buf=%.2f" % _buf)
+# And the RETIRED threshold (buffer past the far edge) must fall BEFORE the
+# entry in every case -- proving the old test killed live setups on approach
+# rather than merely being tighter.
+RETIRED = [(bh, atr) for bh, atr, _ in CASES
+           if bh + _buf * atr < realized(bh, atr, 4.0)[0]]
+check("the retired far-edge threshold falls short of the entry in every case",
+      len(RETIRED) == len(CASES),
+      "shorts=%s" % RETIRED)
 
 
 # ----------------------------------------------------------------------
@@ -473,7 +619,8 @@ check("the front-run veto is switchable and defaults on",
 check("the BlockManager gates both veto passes on InpUseFrontRunVeto",
       _gates == 2)
 check("the retired single-arg helper left no call site anywhere",
-      "BlockEntryPrice(" not in BM_PROC and "BlockEntryPrice(" not in BM_INTRA)
+      "BlockEntryPrice(b)" not in BM_C and
+      "CalcEntryPrice(block)" not in OM_C)
 
 
 # ----------------------------------------------------------------------
@@ -522,9 +669,14 @@ check("the startup banner names the current release",
 # see: nothing reads the wick fields, so a regression here is silent.
 print("\n-- 10. Journal & wick geometry sync --")
 
-check("the journal names the front-run geometry, not the retired wording",
-      "Front-Run Breakdown / Sell at Bottom Edge - 0.5*ATR | SL at Top Edge" in JRN_RAW and
-      "Front-Run Breakout / Buy at Top Edge + 0.5*ATR | SL at Bottom Edge" in JRN_RAW)
+check("the journal names the deep front-edge geometry, not the retired wording",
+      JRN_RAW.count("SUPPORT (Front-Run Breakdown / Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge + 1.0*ATR)") == 2 and
+      JRN_RAW.count("RESISTANCE (Front-Run Breakout / Buy at Near Edge + 2.0*H + 1.5*ATR | SL at Far Edge + 1.0*ATR)") == 2,
+      "S=%d R=%d" % (JRN_RAW.count("Sell at Near Edge - 2.0*H - 1.5*ATR"),
+                     JRN_RAW.count("Buy at Near Edge + 2.0*H + 1.5*ATR")))
+check("the armed header prints the deep gap, not the retired 0.5*ATR offset",
+      JRN_RAW.count("(Front-Run: near edge +/- 2.0*H +/- 1.5*ATR)") == 1 and
+      "near edge +/- 0.5*ATR" not in JRN_RAW)
 check("the retired 'Aggressive' block wording is gone",
       "Aggressive" not in JRN_RAW)
 

@@ -1,0 +1,196 @@
+566: fix — re-anchor break veto to deep entry to prevent pre-emptive fill cancellation
+
+RATIONALE
+
+  v5.57 moved the front-run entry 0.5*ATR past the far edge and gave the block
+  a BREAK test that fired ATRBufferBreak*ATR (0.5*ATR) past that same far edge.
+  The two thresholds were one ATR apart, so the ordering was harmless: the
+  break level sat BEYOND the entry, and a breakout could only invalidate the
+  block after price had already traded through the fill.
+
+  v5.66 deepens the entry to gap = 2.0*blockHeight + 1.5*ATR out from the NEAR
+  edge, i.e. blockHeight + 1.5*ATR beyond the far edge, and does NOT widen the
+  stop (slDist stays blockHeight + 0.5*ATR). That silently inverted the
+  relationship above. The retired break threshold now sits
+  blockHeight + 1.0*ATR BEFORE the entry, so a breakout walking in through the
+  zone ARMS the block and then immediately invalidates it VETO_BROKEN on the
+  same or the next close; CancelOrdersForInvalidBlocks() drops the pending
+  order, and the deep entry is never reached. Every armed block died on
+  approach, which reads in the journal as a strategy that simply stopped
+  taking breakouts.
+
+  This commit re-anchors the BREAK veto onto the same price the entry uses,
+  BlockEntryPrice(), so the two are again ordered the right way round: the
+  block is invalidated only once the close has gone ATRBufferBreak*ATR beyond
+  the price it was waiting to fill at. The zone-to-direction mapping is
+  untouched (SUPPORT breaks DOWN, RESISTANCE breaks UP); only the LEVEL moved
+  out, exactly as the stop did.
+
+SOURCE
+
+  OttoDefines.mqh -- ENTRY_FRONT_EDGE narrative rewritten for the deep entry
+    The enum's doc block still described the v5.57 0.5*ATR offset. It now
+    states gap = 2.0*blockHeight + 1.5*ATR from the NEAR edge for both
+    directions, that the fill lands blockHeight + 1.5*ATR past the far edge,
+    that slDist is unchanged so entry<->SL stays exactly slDist, and that the
+    BREAK veto is anchored on this same entry price. The pinned
+    EXTREME FRONT-RUNNING ANTICIPATION phrase is retained verbatim -- four
+    probes and the operator's own grep key on it.
+
+  COttoBlockManager.mqh -- BlockEntryPrice(): slDist -> gap
+    double gap = (2.0 * b.blockHeight) + (1.5 * atr);
+    return (BlockDirection(b) == DIR_LONG) ? (b.bottom + gap) : (b.top - gap);
+    Measured OUT from the NEAR edge (b.bottom for a RESISTANCE breakout,
+    b.top for a SUPPORT breakdown) -- the edge the arming close clears -- not
+    from the far edge. At arm time price has only just cleared that near edge,
+    so it is still short of this price and the trigger stays a genuine STOP
+    cross rather than a resting limit. ENTRY_MIDPOINT is untouched and still
+    returns first.
+
+  COttoBlockManager.mqh -- the BREAK test re-anchors (the fix)
+    double breakLevel = BlockEntryPrice(b, atrNow);
+    bool isBroken =
+       (b.type == BLOCK_SUPPORT && close1 < breakLevel - ATRBufferBreak * atrNow) ||
+       (b.type == BLOCK_RESISTANCE && close1 > breakLevel + ATRBufferBreak * atrNow);
+    The two retired literals (`close1 < b.bottom - ...`, `close1 > b.top + ...`)
+    are gone. breakLevel deliberately honours InpEntryStyle through the twin:
+    under ENTRY_MIDPOINT the invalidation anchors on the midpoint, the price
+    that style would have entered at, because a block's invalidation should
+    always track the entry it was actually trying to take. Said so in the
+    comment rather than special-casing the style here.
+
+  COttoOrderManager.mqh -- CalcEntryPrice(): the identical twin
+    Same gap expression and same near-edge return, differing only in the two
+    identifiers canon() tolerates (&block / GetDirectionForBlock). The entry
+    price the ORDER is placed at and the price the VETO is anchored on are one
+    arithmetic expression in two files; a divergence is silent at compile time
+    and would judge the market against a level the order never had.
+
+  COttoOrderManager.mqh / COttoBlockManager.mqh -- RR derivation restated
+    Both far-edge-anchor narratives now carry the deep-entry algebra:
+    reward = TP - entry = (rr - 1)*bh + 0.5*(rr - 3)*ATR over a risk of
+    slDist, i.e. realized RR = InpMaxRR - 3 + 2*bh/slDist, strictly inside
+    (InpMaxRR - 3, InpMaxRR). The 3.0 floor is stated as a floor rather than an
+    inclusive bound: at exactly 3.0 a vanishing zone leaves the target exactly
+    AT the entry, which is not "ahead of" it. Worked examples in the comment
+    are the shipped defaults (2.0R), bh 2.0 / ATR 1.0 (2.6R) and
+    bh 0.5 / ATR 4.0 (1.4R); values verified against the formula, not eyeballed.
+
+  COttoJournal.mqh -- five printed rows, both blocks
+    Trigger Price   : (Front-Run: near edge +/- 2.0*H +/- 1.5*ATR)
+    SUPPORT    (Front-Run Breakdown / Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge + 1.0*ATR)
+    RESISTANCE (Front-Run Breakout / Buy at Near Edge + 2.0*H + 1.5*ATR | SL at Far Edge + 1.0*ATR)
+    Each actionDesc literal appears TWICE (LogSetupArmed and LogEntry) and the
+    two must stay byte-identical or the armed and filled records describe
+    different geometry -- the v5.58 failure mode. An operator reading only the
+    log can now reconstruct the derivation instead of being told 0.5*ATR.
+
+COUPLING
+
+  * The BREAK veto now depends on BlockEntryPrice(), i.e. on InpEntryStyle.
+    Changing the entry style moves the invalidation level with it. That is the
+    intent, and it is the one behavioural coupling an operator can trip over:
+    under ENTRY_MIDPOINT a block is invalidated near the midpoint, not near
+    either edge.
+  * InpMaxRR must stay ABOVE 3.0 for the far-edge target to remain ahead of
+    the deep entry. Nothing in the .mqh rejects a lower value -- it fails
+    silently, as every thin-zone setup being vetoed VETO_FRONTRUN. The shipped
+    default is 4.0; the floor is pinned in the probe rather than enforced in
+    code, because enforcing it would silently rewrite a user's input.
+  * breakLevel is declared once, in ProcessBlocks only. UpdateIntraBar carries
+    the projection but NOT a second break test, so there is no half-applied
+    fix that could still kill a block on approach.
+  * The arming test still looks past the NEAR edge while the break is measured
+    from the entry, so the two remain mutually exclusive and no block can arm
+    and be vetoed BROKEN in one pass. Pinned by source offset.
+
+PROBES
+
+  _probe/test_v557_frontrun.py -- UPDATED, 112/112 (was 93 checks)
+    * docstring rewritten for the deep geometry; the retired 0.5*ATR model is
+      now described only as history
+    * the two entry-form pins moved from `near + slDist` to `gap`, asserted
+      separately for each twin so a desync names the file
+    * NEW section 4b, the break-veto re-anchor: the breakLevel declaration, the
+      two `breakLevel +/- ATRBufferBreak*atrNow` comparisons, absence of BOTH
+      retired far-edge literals, exactly three breakLevel occurrences and none
+      in UpdateIntraBar, arming-before-break source ordering,
+      breakLevel-honours-InpEntryStyle, and ATRBufferBreak == 0.5
+    * section 7 rewritten around realized_rr(): the closed form
+      rr - 3 + 2*bh/slDist, the bracket (InpMaxRR - 3, InpMaxRR), the
+      2.0R / 2.6R / 1.4R worked examples, the 3.0 floor (including a thin-zone
+      control that MUST go negative), InpMaxRR > 3.0 read from the source, and
+      the numerical proof that the retired far-edge threshold falls short of
+      the entry in every case
+    * journal pins moved to the new literals with count == 2 per actionDesc
+    * the single-arg retirement pins now match `BlockEntryPrice(b)` /
+      `CalcEntryPrice(block)`, not `BlockEntryPrice(` -- the break test
+      legitimately calls the two-arg twin from ProcessBlocks, so the old pin
+      would have failed for the right reason but the wrong claim
+
+  Mutation-tested rather than trusted, on a scratch mirror of the shipped tree:
+    * revert the break anchor to the retired far-edge literals -> 3 [FAIL]
+    * revert the entry to `near + slDist` in both twins       -> 2 [FAIL]
+    * desync only the BlockManager gap (1.4 instead of 1.5)   -> 2 [FAIL],
+      including "the two entry twins are arithmetically identical"
+    All three classes caught; no mutation survived silently.
+
+TOOLING
+
+  _tools/_bump_version.py -- the staleness census no longer cries wolf
+    census() tested a BARE substring (`old in line`) while bump() skipped
+    `FIX (` lines and every pattern was anchored on a human-facing prefix. So
+    the guard stayed green for the release that INTRODUCED a `// v5.63:` note
+    and went red on the first bump AFTER it -- which is this one. The tool
+    reported 16 "stale" rows that its own docstring promises to preserve, and
+    exited 1 on a correct 20-row bump.
+
+    The census now runs the SAME anchored patterns bump() rewrites (plus the
+    existing `FIX (` exemption), so it asks exactly the question bump answers.
+    Verified both directions: the 16 historical rows resolve to 0 stale, while
+    the live tree still reports all 20 operator-visible rows for the release
+    actually in force. Guard strength unchanged; only the false positives are
+    gone. This is a gate bug fixed, not a gate relaxed.
+
+  _tools/_bump_probe.ps1 -- derives its target instead of hardcoding 5.61
+    It ran `_bump_version.py 5.61` against a tree shipping 5.66, i.e. it would
+    have rewritten 20 rows BACKWARDS on every run. It now reads the release
+    from OttoDefines.mqh and bumps current -> next minor, so it cannot go stale
+    again. restored_identical=True.
+
+  _tools/_fix566box.py -- deliberately NOT committed and deleted. It repairs a
+    one-line box-comment defect in the same header _patch566.py authors;
+    re-running it after the fix would find nothing to match. _patch566.py IS
+    committed: the _pivot*/_annotate* one-shots set that precedent, and it
+    records the exact 17 replacements with their asserted counts.
+
+GATES
+
+  * build_check.ps1 : 0 errors / 0 warnings, GATE PASSED, headers verified from
+    the staging tree; all 11 OTTO modules resolved [STAGED], zero [TERMINAL] /
+    [MISSING] (binary 254530 bytes).
+  * test_v557_frontrun.py 112/112 (was 93/93) | 3 mutations caught, 0 survived.
+  * _bump_probe.ps1 : 20 rows, bump_exit=0, restored_identical=True.
+  * _vercensus.py : all 20 rows resolve at 5.66, exit 0.
+  * normalize_eol.py . --check : files=11, rewritten=0, strict CRLF preserved
+    (bareLF=0, bareCR=0 on every shipped source).
+  * Full probe suite: 25 GREEN / 4 RED, the four reds at their documented
+    counts and identical to the v5.63 baseline: test_v528_hotfix 57/68,
+    test_v531_smart_trim 15/38, test_v532_hightable 125/135, test_v543_session
+    27/29. No new red, no green-count drop.
+
+KNOWN RED, OUT OF SCOPE
+
+  * AuditTrimHealth repair (the 10 [FAIL] in the trim silo).
+  * The floating-loss trim silo's disagreement with AuditTrimHealth.
+  * NY-DST session helpers (test_v543_session).
+  * The v5.543 cancel-write count.
+
+ROLLBACK
+
+  Single-commit revert. The geometry is carried by three literals that must move
+  together -- the gap in both twins, the breakLevel declaration, and the five
+  journal strings -- plus the probe pins that describe them. Reverting restores
+  the v5.57 0.5*ATR anticipation entry AND the far-edge break anchor, which are
+  consistent with each other; the failure mode this commit fixes only appears
+  when the deep entry is paired with the shallow break test.
