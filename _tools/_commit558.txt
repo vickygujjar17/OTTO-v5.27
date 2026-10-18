@@ -1,0 +1,60 @@
+558: test — add v5.57 anticipation logic static probes and document realized RR
+
+Nothing here changes shipped behaviour: three comments, one new static probe and
+two probe repairs. The release stamp stays v5.57 -- there is no shipping-code
+change to re-tag, so no _bump_version.py pass and no re-stamp of the 20
+human-facing version rows.
+
+REALIZED RR DOCUMENTED (3 sites, comments only)
+
+  COttoBlockManager::ProcessBlocks(), its intra-bar twin UpdateIntraBar(), and
+  COttoOrderManager::PlaceOrArmOrder() each carry a new paragraph recording the
+  consequence of the far-edge anchor: because the entry sits 0.5*ATR beyond the
+  edge the target is anchored to, the reward-to-risk measured from the ENTRY is
+  InpMaxRR - (0.5*ATR / slDist), not InpMaxRR. Worked case: a 1.0-high zone at
+  ATR 2.0 with InpMaxRR 4.0 -> 3.5R. The note closes with "Do NOT fix it by
+  anchoring the target on the entry", so a future maintainer meets the intent
+  before the code. No line, offset or geometry changed.
+
+NEW PROBE test_v557_frontrun.py (84 checks)
+
+  Static pin for the front-running anticipation entry: the shift-1 ATR sync and
+  its GetATR() fallback across all three order-building paths, GetATRAtShift()
+  public reachability, the two entry twins' canonicalised arithmetic identity,
+  the retirement of the single-argument entry helper, the far-edge target
+  anchor in both manager passes, the inverted cross test and the absence of the
+  retired v5.56 predicate, the SL/TP wiring, the realized-RR geometry, the
+  config defaults and the release stamps.
+
+  Validated by mutation: 10 mutants against a TEMP sandbox, 9/9 real
+  regressions caught (cross un-inversion, cross deletion, shift 1->0, fallback
+  deletion, TP re-anchored on the entry, far-edge -> near-edge, single-arg call
+  restored, twin arithmetic divergence, twin demotion), and a legitimate
+  version bump still passes.
+
+PROBE REPAIRS (test-only, 2 lines)
+
+  test_v530_price_guard.py and test_v531_smart_trim.py both omitted
+  CHighTableAuditor.mqh from ALL_FILES, so each stamp-checked 10 of 11 sources
+  while its own check name claimed "all 10 files". The file is added and the
+  count now derives from len(ALL_FILES), so it cannot go stale again. v531's
+  15/38 is unchanged: the file carries the stamp, so no check flips.
+
+VERIFICATION
+
+  * Build gate: build_check.ps1 -- 0 errors / 0 warnings, GATE PASSED, all 11
+    OTTO modules verified [STAGED] from the temp build tree.
+  * test_v557_frontrun.py: 84 / 84.
+  * Probe census: 22 GREEN / 5 RED across 27 probes (was 21/5 across 26). The
+    five reds are pre-existing and sanctioned, byte-identical to the v5.57
+    baseline (test_v528_hotfix 57/68, test_v52x_pyramid 127/130,
+    test_v531_smart_trim 15/38, test_v532_hightable 125/135,
+    test_v543_session 27/29).
+  * Encoding: scan_encoding.ps1 -> 11 files, bom=none, validUTF8=True,
+    bareLF=0. normalize_eol.py . --check -> rewrote 0.
+  * Version: unchanged at v5.57 by design; no bump census to run.
+
+NOT PROVEN HERE: behaviour -- no Strategy Tester run; the RR realization is
+asserted statically as geometry, not observed on a filled trade.
+
+ROLLBACK: git checkout 2b58270 -- COttoBlockManager.mqh COttoOrderManager.mqh

@@ -1,0 +1,147 @@
+552: PURE CONTINUATION engine -- the two-phase block lifecycle is retired
+
+The EA has always traded a zone twice: first the FADE (a bounce off Support /
+Resistance) and, only once that zone was reclaimed, the FLIP. v5.52 deletes the
+fade and keeps the flip, so every zone trades the continuation -- a BREAKOUT
+above Resistance or a BREAKDOWN below Support -- exactly once.
+
+WHY: PINE SAYS SO
+
+Pine's can_place gate is 'flat OR (long & resistance) OR (short & support)'. That
+is the continuation mapping, unconditionally stated: Resistance -> LONG, Support
+-> SHORT. The two-phase lifecycle v5.34 layered on top made a zone's FIRST fill
+the opposite (the bounce fade) and only a reclaimed zone the flip, which made the
+first entry the deviation and the second the original intent. v5.52 restores the
+original semantics and removes the phase machinery that existed to serve the fade.
+
+THE THREE DIRECTION TWINS (the whole pivot, in one mapping)
+
+The zone -> direction decision is triplicated by design and must stay identical:
+
+  COttoOrderManager::GetDirectionForBlock()   <- the authority
+  COttoBlockManager::BlockDirection()         <- mirrors it for the veto funnel
+  otto.mq5 MappedZoneDirection()              <- mirrors it for the HiveMind vote
+
+All three lose the 'if(touches >= 1)' branch and become, unconditionally:
+
+  return (type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;
+
+GetOrderTypeForBlock() and CalcSLDistance() need no change: the former already
+follows the mapped direction, the latter is direction-free. CalcEntryPrice() and
+BlockEntryPrice() also keep their arithmetic, but the MAPPING is now the
+continuation one, so the front edge ('price APPROACHES FROM') is the NEAR edge of
+the zone -- resistance.bottom for a Resistance LONG, support.top for a Support
+SHORT. The entry is therefore STOP-style: price crosses the level on its way
+through the zone.
+
+RETIRED (the reversal machinery existed only to serve the fade)
+
+  * COttoBlockManager::TryConvertToReversal() and its SIX call sites -- a
+    convertible veto can no longer promote a block into a phase that no longer
+    exists, so each of Stale / Front-Run / Near-Miss / Momentum / FVG is now
+    simply a veto.
+  * COttoBlockManager::SyncReversalCluster() and its TWO call sites -- with no
+    promotion there is no cluster to sync, and no twin left fading a level.
+  * COttoJournal::LogConversion() -- no writer remained.
+  * The two conversion branches in PendingOrderCleanup() (physical + virtual).
+    With TryConvertToReversal() gone, conversionReason is permanently VETO_NONE,
+    so the branch was dead; the cancellation path replaces it in place.
+  * The InpShiftReversalEntry outer-boundary entry shift in BOTH twins
+    (PlaceOrArmOrder and UpdateIntraBar's projected entry).
+  * Every touches-driven branch in hasExited, arming, break/flip and the two
+    Front-Run projections.
+
+
+NEUTRALISED, NOT DELETED (deliberate: .set compatibility)
+
+The five InpRev* flags and InpShiftReversalEntry are KEPT as DECLARED inputs,
+defaulted false and documented as retired no-ops, so a saved .set from a
+two-phase build still loads instead of aborting on an unknown input. They are
+read nowhere. SSniperBlock::conversionReason is likewise kept (VETO_NONE forever)
+so the struct layout does not churn.
+
+KEPT ON PURPOSE
+
+  * block.touches and both 'touches += 1' increments. They are load-bearing for
+    the v5.28 duplicate-tranche shield: a block that has already filled must not
+    fill a second tranche. Retiring the field would re-open that bug. It is now a
+    fill counter, not a phase cursor.
+  * The Pine break detector VERBATIM, minus only its dead Phase 2 arm. It is an
+    S/R-BREACH / polarity-flip detector (the FAR edge), NOT an entry validator,
+    and it is deliberately the opposite edge from arming (the NEAR edge). The two
+    are mutually exclusive by construction, so a block can never arm and be
+    vetoed BROKEN in the same pass. This distinction is written into the code.
+  * CanPlaceForDirection() -- it already reads the direction chokepoint, so with
+    the continuation mapping it becomes the correct Pine gate with no change.
+
+THE ENTRY STYLE HAD TO MOVE
+
+InpEntryStyle defaults to ENTRY_MIDPOINT, under which the front-edge arithmetic
+never runs and the continuation geometry would be dead code. The default flips to
+ENTRY_FRONT_EDGE and CalcEntryPrice()/BlockEntryPrice() carry the new mapping in
+lockstep. Midpoint remains selectable.
+
+ROUTING IS UNCHANGED, ITS INTERPRETATION IS NOT
+
+The hybrid router's legality test is untouched: a BUY_LIMIT must rest BELOW the
+ask and a SELL_LIMIT ABOVE the bid. With a continuation entry those conditions
+now mean 'price has not yet crossed the level', which is the ordinary case for a
+breakout: the setup arms VIRTUALLY and CheckVirtualTriggers() fires a MARKET deal
+on the cross. A physical rest is the pullback case. Either way the execution is
+the breakout taking the level, which is the intended semantics. Recorded in a
+CONTINUATION NOTE at the router tail and in its header rather than silently.
+
+PRE-EXISTING, DELIBERATELY NOT TOUCHED
+
+HiveMind()'s two DeleteBlockType() arguments inside
+ResolveBidirectionalConflict() look INVERTED against their own comment and their
+own 'kept Support' / 'kept Resistance' log lines. That inversion predates this
+pivot (it is a property of how a zone maps, which is not what changed), so it is
+recorded in the code and left verbatim for its own change.
+
+
+VERIFICATION
+
+  * build_check.ps1 (BARE invocation) : 0 errors / 0 warnings, GATE PASSED,
+    headers verified from the staging tree. The .ex5 byte count is not a
+    fingerprint -- it varies run to run on identical builds.
+  * The pivot script is REPRODUCIBLE: applying _tools/_pivot552.py to HEAD's
+    pristine sources yields byte-identical files (SHA256 per file), so the diff
+    is auditable rather than a one-way edit. Every one of the 46 regions it
+    rewrites is anchored on exact text and must match EXACTLY ONCE (the script
+    aborts otherwise), so it cannot half-apply.
+  * Line endings / encoding: all five modified files are pure CRLF, no BOM, no
+    lone CR, trailing newline preserved. verify_integrity.py is run against HEAD
+    AFTER the commit.
+  * Probes: the four probes that pin the two-phase machinery now fail ONLY on
+    their phase assertions, and every failure is expected and enumerated:
+      test_v540_hybrid   38/41  (two-phase lifecycle advance; R/C arm phase x2)
+      test_v541_sarfix   13/14  (phase local derived from touches)
+      test_v548_seed_dir 19/21  (resolver reads touches; Phase 2 flips)
+      test_v548_hourly   46/48  (touches discriminator; Reversal label)
+    The ninth failure this pivot initially introduced -- the hourly report losing
+    its visible UNKNOWN sentinel for an unresolvable block -- was FOUND by
+    test_v548_hourly and FIXED before commit: 45/48 -> 46/48, with the remaining
+    two being the intended retirements. These probes are not in the release gate,
+    whose authority is build_check.ps1.
+
+NOT PROVEN HERE: behaviour. The gate proves compilation and the script proves the
+diff; neither can prove that the continuation engine takes the trades it is meant
+to. Confirmation is a Strategy Tester run on the pivot branch versus the
+two-phase baseline.
+
+ONE BUG CAUGHT IN REVIEW, AND WHY IT MATTERS
+
+An early draft of the arming collapse armed on the FAR edge (a Support close
+BELOW the zone) -- the natural-looking 'enclose the zone' choice, and the one the
+GAINED direction (Support -> SHORT) makes tempting. That is a STRICT SUPERSET of
+the break test, which fires on the same edge once the close clears
+ATRBufferBreak * ATR: every armed block would have been vetoed VETO_BROKEN on the
+very next pass. It is exactly the failure mode this pivot was warned about, and
+it compiles cleanly, so no gate would have caught it.
+
+Arming therefore keeps the pre-v5.52 geometry, verbatim: a Support zone arms on a
+close ABOVE it and a Resistance zone on a close BELOW it. Arming and break are
+opposite edges by construction and can never both be true on one close. This is
+the single most important invariant in the pivot and it is now stated in the code
+at both sites.

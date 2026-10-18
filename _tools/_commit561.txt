@@ -1,0 +1,139 @@
+561: feat — update pyramiding allocation to 1/1/0.5/0.25 and unified trail ladder
+
+The pyramid shipped a HALVING ladder of vestigial size (T2 0.25%, T3 0.125%,
+T4 0.0625%) whose scale-in legs were protected by a floor that grew LOOSER the
+further the basket ran. This change flattens the head of the ladder, quarters the
+tail, and re-derives every scale-in floor from the unified-SL milestone the
+basket is ALREADY wearing.
+
+VERSION 5.60 -> 5.61
+
+  Applied with _tools/_bump_version.py 5.61, which rewrote all 20 human-facing
+  rows in one pass (11 '#property version' stamps, otto.mq5's Pine port banner
+  and startup Print, OttoDefines' module header box and '#property description'
+  with the four versioned input-group labels [9]-[12], and README's
+  '**Current base: vX.Y**'). The pass exited 0 with 'no v5.60 literal remains in
+  the shipped sources or docs', so no partial bump can leave the tree stamping
+  two releases at once. _tools/_vercensus.py resolves all 20 at 5.61.
+
+RISK LADDER 1.0 / 1.0 / 0.5 / 0.25 (OttoDefines.mqh)
+
+  T1 stays at 1.0% (RiskPercent, group [6]) and is UNTOUCHED. The three scale-in
+  inputs move:
+
+    InpRiskT2Pct   0.25   -> 1.0
+    InpRiskT3Pct   0.125  -> 0.5
+    InpRiskT4Pct   0.0625 -> 0.25
+
+  The four rungs therefore sum to 2.75% of equity with all four legs live,
+  replacing the 0.6875% the old text claimed.
+
+  SUMMED VS PER-LEG: RATIONALE. The comment that stood above these inputs said
+  the four rungs "total 1.4375% ... comfortably inside the SafetyMaxRiskPct =
+  1.5% budget". That sentence was doubly wrong and is now corrected in place.
+  It was arithmetically wrong (the shipped defaults summed to 0.6875 once T1 read
+  1.0, not the 1.4375 the text claimed -- the probe's own pin had drifted from
+  the text), and it described a budget that nothing in the tree enforced:
+  SafetyMaxRiskPct is read in exactly one place and has never been a
+  basket-sum cap.
+
+  What the runtime actually enforces is a PER-LEG threshold.
+  CHighTableAuditor::AuditRiskExposure() tracks peakRiskPct -- the worst SINGLE
+  leg, measured from its own entry to the SHARED basket SL -- and never the sum.
+  leg is T1/T2 at 1.0%, and both of those legs read as risk-free (lossDist <= 0)
+  once the unified SL ratchets past their entries, so the peak sits at 1.0%
+  against the 1.5% budget. The auditor is therefore UNCHANGED by this release,
+  and its pin (test_v546_risk_isolation.py) still passes 28/28.
+
+  The 2.75% sum is deliberate, not an oversight: each rung is only reachable
+  once the rungs beneath it already wear a milestone floor (T2 at friction
+  breakeven, T3 at +1.0R, T4 at +2.0R), so the risk genuinely at stake is always
+  a fraction of the nominal sum. The new comment states the sum explicitly and
+  tells the reader NOT to read it against SafetyMaxRiskPct.
+
+UNIFIED-SL SCALE-IN FLOORS (COttoTradeManager.mqh)
+
+  The ladder's T3 and T4 blocks used to protect their brand-new legs with
+  CalcBasketFriction() breakeven -- entry +/- friction. At the rung where they
+  fire, that floor was already far LOOSER than the stop the rest of the basket
+  was wearing, so a fresh leg entered carrying more risk than every ticket
+  beneath it. Both blocks now derive their floor from the SAME unified-SL
+  milestone the ladder above applies to the basket:
+
+    T3 (+2.0R) -> primaryEntry +/- 1.0 * rrUnit
+    T4 (+3.0R) -> primaryEntry +/- 2.0 * rrUnit
+
+  matching InpLockProfit2TargetRR (lock at +1.0R) and InpLockProfitTargetRR
+  (lock at +2.0R) respectively. No new input was needed: those two locks already
+  ARE these milestones, so OttoDefines needed no T-ladder change for them.
+
+  CLAMPED, and this is load-bearing. Handing the bare milestone to the fill
+  would be a silent no-op. The v5.32-hoisted half-risk rung pins the basket at
+  entry -/+ 0.5R from the +1.0R breakeven onward, so a bare +1.0R override is
+  LOOSER than the floor already live and ApplyUnifiedSL()'s one-way ratchet would
+  refuse it -- leaving the new leg with whatever the fill handed it. Both blocks
+  therefore take the tighter of the milestone and GetSessionSL():
+
+    LONG : MathMax(milestoneRaw, sessionNow)
+    SHORT: MathMin(milestoneRaw, sessionNow)
+
+  with the clamp applied only when a session stop is live (> 0). The new leg is
+  consequently born wearing exactly the stop the basket already has, and the ATR
+  trail ratchets it forward on the next tick as before. Local names safeBE and
+  safeBE4 are renamed t3Floor and t4Floor to match what they now hold, and the
+  two LogGroupStop() strings say 'Executed (Unified SL +1.0R)' / '(+2.0R)'
+  instead of '(Trail Pending)'.
+
+  T2 is deliberately unchanged: at +1.0R the friction breakeven IS the milestone
+  (that is where InpBreakEvenRR puts the basket), so groupBE is already the
+  unified floor and still travels with the fill. InpBreakEvenRR and both lock
+  handlers are untouched.
+
+PROBES: ONE RE-SCOPED CHECK, TWO DEAD HARNESSES REVIVED
+
+  test_v52x_pyramid.py was at 127/130 before this change -- three stale pins, not
+  regressions (a 0.25 T1 default, a 0.6875 total, and a doc pin for a string
+  that had stopped existing). All three are retuned, the rung and override pins
+  follow the renames, and section 7 is RE-SCOPED rather than merely repaired:
+  the old 'ladder total sits inside the SafetyMaxRiskPct budget' compared the SUM
+  against a per-leg threshold and would have failed at the new ladder
+  (2.75 < 1.5 is false). It now asserts what the runtime actually enforces --
+  max(RISKS) < budget, i.e. the worst single leg -- and pins the 2.75% summed
+  exposure SEPARATELY so a future retune cannot drift the total unnoticed. Four
+  new checks pin the +1.0R/+2.0R milestone floors, their four-way clamp, and the
+  removal of the old breakeven floors. Probe: 134/134.
+
+  _probe/_mutate_ms_milestones.py and _probe/_mutate_v531.py both pointed at
+  'C:\Users\vivek\Downloads\OTTO-v5.00 v5.27', a path that does not exist, so
+  each one aborted on startup and had been providing NO mutation coverage at
+  all. Both now derive their tree from __file__ (the form
+  _mutate_v532_pyramid.py already used). The milestone harness then gained three
+  mutations for the new floors -- T3 and T4 fills stripped of their protective
+  stop, and the T3 clamp removed -- each of which is CAUGHT: 14/14 mutations
+  caught, 0 anchors skipped. _mutate_v531.py now resolves its tree correctly and
+  aborts on its pre-existing baseline (15/38), which is the guard behaving as
+  designed rather than a half-fixed harness.
+
+  Three harnesses carry rot this change did NOT introduce and did not try to
+  hide: _mutate_v532_pyramid.py is 39/40 with one MISSED and three anchors that
+  name literal '5.32' strings, and four probes fail at pristine HEAD for reasons
+  unrelated to the pyramid (test_v528_hotfix 57/68, test_v531_smart_trim 15/38,
+  test_v532_hightable 125/135, test_v543_session 27/29). Each was measured
+  against a detached HEAD worktree and produces IDENTICAL counts there. They
+  touch no symbol this release moves.
+
+GATES
+
+  test_v52x_pyramid.py 134/134; test_v546_risk_isolation.py 28/28 unchanged;
+  test_v532_pyramid.py 87/87; _mutate_ms_milestones.py 14/14 caught / 0 skipped;
+  _vercensus.py all 20 rows at 5.61; _tools/build_check.ps1 0 errors,
+  0 warnings, headers verified from the staging tree.
+
+FILES
+
+  OttoDefines.mqh                  ladder comment rewritten; T2/T3/T4 retuned
+  COttoTradeManager.mqh            T3/T4 floors -> clamped unified-SL milestones
+  _probe/test_v52x_pyramid.py      pins retuned; section 7 re-scoped; +4 checks
+  _probe/_mutate_ms_milestones.py  dead tree path fixed; +3 floor mutations
+  _probe/_mutate_v531.py           dead tree path fixed
+  README.md, otto.mq5, and the 8 further .mqh modules  version stamps only

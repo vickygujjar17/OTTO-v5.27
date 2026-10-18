@@ -1,0 +1,148 @@
+567: fix - three EA defects in the unified-SL repair and the High Table risk budget
+
+RATIONALE
+
+  Three defects shared one signature: each was a safety bound that read as
+  correct in the source and could not fire in the field. None is provable by the
+  MQL5 compiler gate, so each is pinned by a static probe and, in turn, the
+  probe is proven to bite by a mutation harness.
+
+  1. UNIFIED-SL REPAIR DEBT WAS LOST. When a venue refused a stop modification
+     part-way through the basket loop, the staged repair level was dropped, so
+     the refused leg kept its old, looser stop for the life of the trade. The
+     legs that DID accept the write then wore the unified floor while the
+     refused leg did not -- the basket carried more loss-side risk than the
+     floor accounted for, and nothing reported it.
+
+  2. THE PER-LEG RISK ALLOWANCE WAS ANCHORED TO TRANCHE 1. RiskPercent * 1.5 was
+     applied to EVERY leg, but the ladder sizes T2/T3/T4 from InpRiskT2Pct /
+     T3Pct / T4Pct. A T2 leg sized exactly at its own legal 2.0% budget read as
+     a breach (2.0 > 1.5), while a T4 leg running 5.6x its own 0.25% budget sat
+     comfortably inside 1.5% and was never reported. The check fired on correct
+     sizing and stayed silent on real over-sizing.
+
+  3. THE AGGREGATE ALLOWANCE WAS UNREACHABLE. It summed all four nominal rungs
+     (2.75% x 1.5 = 4.125%) while the basket's real exposure is capped far
+     below that by the unified stop: before +1.0R only tranche 1 exists, and
+     from +1.0R every leg's stop is at or past breakeven so its loss-side risk
+     is zero. The greatest sum the ladder can produce is ~1.0%, so the check
+     could not fire for any input -- dead code guarding the exact partial-
+     stop-out shape it existed to catch.
+
+SOURCE
+
+  COttoOrderManager.mqh - unified-SL repair debt is now repaid or abandoned
+
+    ApplyUnifiedSL() stages the level it actually tried to write when any ticket
+    refuses, instead of discarding it. StageUnifiedRepair() only accepts a
+    TIGHTER level, so a repair can never walk a stop backwards; the debt is
+    carried in m_unifiedRepairPending / m_unifiedRepairSL and settled by
+    RepairUnifiedSL(), which re-reads the BROKER's stop (never the order layer's
+    belief) and skips a ticket already at or beyond the floor, so a completed
+    repair costs no broker traffic. A retry budget
+    (OTTO_UNIFIED_REPAIR_MAX_ATTEMPTS) behind a stagger
+    (OTTO_UNIFIED_REPAIR_STAGGER_SEC) turns a permanently refused level into one
+    loud ABANDONED line rather than a per-tick storm. Every exit -- applied,
+    abandoned, non-positive level, basket cleared -- releases the debt, so it
+    cannot leak into the next basket.
+
+  CHighTableAuditor.mqh - per-leg budget from the leg's OWN rung
+
+    CommentTrancheTag() parses the trailing "_T<n>" form; RungRiskPct() maps it
+    to the live input, falling back to RiskPercent for an untagged leg, an
+    adopted manual leg, or a malformed / out-of-range tag. The tag is scanned
+    from the END of the comment (StringFind(comment, "_T", len - 2)) because
+    the 31-character comment clamp eats the FRONT of the string, not the tail.
+    The per-leg test is then a RATIO (risk / its own allowance) rather than a
+    raw maximum, with a 999.0 sentinel so a rung configured at 0 cannot hide an
+    oversize.
+
+  CHighTableAuditor.mqh - aggregate allowance derived from the legs at risk
+
+    The allowance is now the summed rung budget of the legs that are OPEN AND
+    ON THE LOSS SIDE, times the same 1.5 tolerance. Legs through breakeven drop
+    out of the measured sum and the allowance together, so the ratio stays
+    meaningful at every stage of the ladder instead of dissolving at +1.0R. The
+    full nominal stack is still reported in the alert text as CONTEXT, never as
+    a threshold. An empty budget can never raise the breach.
+
+  CHighTableAuditor.mqh - CountOrphanLegs() / AuditOrphanLegs()
+
+    The two fixes above repair a refused stop; neither can see a leg that has NO
+    stop. AuditRiskExposure cannot: it needs a stop distance to compute a risk
+    percentage, so it `continue`s past sl <= 0, which also kept such a leg out
+    of the aggregate allowance. The sweep is therefore the only body that looks
+    for the shape itself, and it does so on the OnTimer cadence that survives a
+    dead OnTick. Scoping is AuditRiskExposure's v5.46 rule exactly (this EA's
+    magic, widened by exactly ONE ticket for an adopted magic-0 primary), so a
+    foreign EA's or the operator's own leg is never reported. A
+    HT_ORPHAN_GRACE_SECONDS grace period keyed on the venue's own POSITION_TIME
+    keeps a leg mid-submission from crying wolf. CRITICAL, and the latch
+    re-arms, so the second incident is not silent.
+
+  OttoDefines.mqh - tuning constants at FILE scope
+
+    OTTO_UNIFIED_REPAIR_STAGGER_SEC and OTTO_UNIFIED_REPAIR_MAX_ATTEMPTS are
+    file-scope consts, NOT class members: MQL5 rejects an in-class
+    `static const int` with an initialiser ("illegal assignment use"), which is
+    a compile error and not a warning the gate could absorb.
+
+PROBE
+
+  _probe/test_v567_unified_sl.py - 113 checks, ALL PASS.
+
+  Four groups: the repair state machine (staged from the level actually
+  attempted, monotone staging, broker-not-belief reads, retry credit, the
+  abandon path, and each exit clearing the debt), the rung attribution
+  (tag-from-end parsing, unparseable -> tranche 1, out-of-range -> tranche 1,
+  RungRiskPct as a pure read of the live inputs), the per-leg ratio, and a
+  stage-by-stage model of the aggregate allowance showing no false breach at any
+  rung and a real breach for a stranded leg. The repair and abandon exits are
+  sliced apart before assertion: a whole-body scan for `ClearUnifiedRepair();
+  return repaired;` was satisfied by the abandon exit's own clear and could not
+  distinguish a leak on the success path.
+
+  _probe/_mutate_v567.py - 30 mutations, 30 killed, 0 survived, 0 skipped.
+
+  Each mutation is a plausible maintainer "simplification" (dropping the repair,
+  staging phantom debt, walking the stop backwards, restoring the
+  RiskPercent-anchored allowance, restoring the unreachable aggregate, dropping
+  or un-scoping the orphan sweep), never arbitrary corruption. A missing anchor
+  is reported SKIPPED and FAILS the run, because a stale anchor table is itself
+  a silent gap. The probe must be green before any mutation, the table is
+  CRLF-tolerant, and the originals are restored in a finally block.
+
+  The harness paid for itself twice while being written: it found five real
+  coverage gaps and two stale anchors in the probe it was validating.
+
+GATE
+
+  build_check.ps1 -NoDeploy : 0 errors, 0 warnings, binary 261306 bytes.
+  normalize_eol.py . --check : files=11, rewritten=0.
+  _vercensus.py             : every module stamps 5.67 (README base line too).
+
+  Full _probe\test_*.py sweep: 30 probes. FOUR are red and are the documented
+  pre-existing baseline, unchanged in count and identity:
+
+    test_v528_hotfix     57/68      test_v531_smart_trim   15/38
+    test_v532_hightable  125/135    test_v543_session      27/29
+
+  See KNOWN RED below. No new red, no green-count drop.
+
+KNOWN RED, OUT OF SCOPE (pre-existing, identical to the v5.62/v5.63 baseline)
+
+  * AuditTrimHealth / the floating-loss trim silo (10 [FAIL] in
+    test_v532_hightable, 23 in test_v531_smart_trim).
+  * NY-DST session helpers (test_v528_hotfix).
+  * The v5.43 cancel-write count (test_v543_session).
+  * _mutate_v531.py / _mutate_v532.py, both gated behind those probes.
+
+ROLLBACK
+
+  pre-commit : git checkout -- OttoDefines.mqh COttoOrderManager.mqh
+                             CHighTableAuditor.mqh otto.mq5 README.md
+                             _probe/test_v567_unified_sl.py
+                             _probe/_mutate_v567.py
+                             _probe/test_v563_trail_health.py
+                             _tools/_commit567.txt
+  post-commit: git reset --soft HEAD~1

@@ -1,0 +1,664 @@
+//+------------------------------------------------------------------+
+//|                                              COttoTradeManager.mqh |
+//|       MODULE 6 - Dynamic Trade Management (exact Pine v4.70) + Pyr |
+//|            OTTO EA - Cut / Cost-BE / ATR Trail / Pyramiding       |
+//+------------------------------------------------------------------+
+#property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
+#property version   "5.67"
+
+#ifndef __OTTO_TRADE_MANAGER__
+#define __OTTO_TRADE_MANAGER__
+
+#include "OttoDefines.mqh"
+#include "COttoRiskManager.mqh"
+#include "COttoOrderManager.mqh"
+#include "COttoBlockManager.mqh"
+#include "COttoJournal.mqh"
+
+class COttoTradeManager
+  {
+private:
+   string               m_symbol;
+   COttoRiskManager    *m_riskManager;
+   COttoOrderManager   *m_orderManager;
+   COttoBlockManager   *m_blockManager;
+   int                  m_tradesManaged;
+   int                  m_halfRiskTriggers;
+   int                  m_breakevenTriggers;
+   int                  m_trailActivations;
+   int                  m_stopsHit;
+
+   //+------------------------------------------------------------------+
+   //| v5.32 — is the legacy "cut risk in half" rung LIVE?              |
+   //|                                                                   |
+   //| THE BUG THIS FIXES                                                |
+   //| The half-risk rung is a LOSS-SIDE floor: LONG = entry - 0.5R,      |
+   //| SHORT = entry + 0.5R. It was evaluated BEFORE the +1.0R cost-      |
+   //| covering breakeven and could only ever move the stop toward       |
+   //| market, so the two competed for the same value on the same tick.   |
+   //|                                                                   |
+   //| Under the shipped defaults InpCutRiskRR == InpBreakEvenRR == 1.0,  |
+   //| so both rungs fire on the SAME tick and breakeven always wins:     |
+   //| its stop sits at entry +/- friction, a fraction of a pip on the    |
+   //| PROFIT side, while half-risk sits 0.5R on the LOSS side. The       |
+   //| half-risk comparison is therefore provably false the instant it    |
+   //| is reached, its guard never assigns, and the rung is DEAD.        |
+   //|                                                                   |
+   //| The old code nonetheless incremented m_halfRiskTriggers inside     |
+   //| that guard's body only when it assigned -- but the shape of the    |
+   //| guard meant the "reached the trigger" half of the condition was    |
+   //| what the journal acted on, so every +1R winner was reported as     |
+   //| "SL -> HALF-RISK / risk now -0.5R" while the live stop sat at      |
+   //| breakeven. That is a live-money reporting lie: it tells the        |
+   //| operator to risk -0.5R on a trade that cannot lose.               |
+   //|                                                                   |
+   //| THE FIX (two independent halves):                                 |
+   //|  1. A rung whose target can never survive the higher rungs is      |
+   //|     INERT, and an inert rung must not count. m_cutRiskRungLive is  |
+   //|     resolved ONCE at Initialize() from inputs that cannot change   |
+   //|     mid-session, so the gate is a pure read in the hot path.       |
+   //|  2. The rung is HOISTED to the END of its direction's ladder, so   |
+   //|     the halfRiskSL local is computed only after every profit-side   |
+   //|     floor has been applied. Its comparison then tests the FINAL    |
+   //|     stop rather than an intermediate one, which makes the trigger  |
+   //|     counter mean exactly what the journal claims: "this floor was  |
+   //|     actually applied to the live stop".                            |
+   //|                                                                   |
+   //| Behaviour is otherwise identical: every rung still resolves with   |
+   //| max() for LONG / min() for SHORT, and max/min are order-           |
+   //| independent, so hoisting cannot change which floor wins. The       |
+   //| rung's TARGET (a literal fraction of 1R) is deliberately left as   |
+   //| the only such literal in the ladder -- see the v5.31 milestone     |
+   //| probe, which pins this rung's arithmetic to exactly one site per   |
+   //| direction.                                                         |
+   //+------------------------------------------------------------------+
+   bool                 m_cutRiskRungLive;
+
+   // v5.32 -- one-shot trace bookkeeping for the Tranche 2 crossing.
+   // Holds the 5%-wide RR bucket most recently reported so the crossing
+   // is logged once per approach instead of once per tick. -1 = unarmed.
+   int                  m_t2TraceBucket;
+
+   double            GetCurrentATR(void)
+     { return m_blockManager.GetATR(); }
+
+   // Sum per-position commission from the opening deal. POSITION_COMMISSION
+   // is deprecated in modern MT5 builds (compiler warning 89), so the value
+   // is read from deal history instead — the same convention used by
+   // COttoOrderManager::LogClosedTrade().
+   double            GetPositionCommission(ulong ticket)
+     {
+      double comm = 0.0;
+      if(ticket == 0) return 0.0;
+      for(int i = HistorySelect(0, TimeCurrent()) - 1; i >= 0; i--)
+        {
+         ulong dt = HistoryDealGetTicket(i);
+         if(dt == 0) continue;
+         if(HistoryDealGetInteger(dt, DEAL_POSITION_ID) != (long)ticket) continue;
+         comm += HistoryDealGetDouble(dt, DEAL_COMMISSION);
+        }
+      return comm;
+     }
+
+   // Sum negative broker friction (commission+swap) across ALL basket tickets
+   double            CalcBasketFriction(bool isLong)
+     {
+      double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+      double tickValue = m_riskManager.GetTickValuePerLot();
+      double tickSize  = m_riskManager.GetTickSize();
+      if(point <= 0 || tickValue <= 0 || tickSize <= 0) return 0.0;
+      double frictionMoney = 0.0;
+      
+      for(int i = 0; i < m_orderManager.GetBasketCount(); i++)
+        {
+         SPyramidTranche t;
+         if(!m_orderManager.GetBasketTicket(i, t)) continue;
+         if(PositionSelectByTicket(t.ticket))
+           {
+            double comm = GetPositionCommission(t.ticket);
+            double swp  = PositionGetDouble(POSITION_SWAP);
+            if(comm < 0.0) frictionMoney += MathAbs(comm);
+            else if(comm == 0.0) frictionMoney += 7.0 * t.size;
+            if(swp  < 0.0) frictionMoney += MathAbs(swp);
+           }
+        }
+      double frictionPoints = (frictionMoney / (tickValue * 1.0)) * tickSize;
+      double spread = SymbolInfoDouble(m_symbol, SYMBOL_ASK) - SymbolInfoDouble(m_symbol, SYMBOL_BID);
+      return frictionPoints + (spread * 0.5);
+     }
+
+public:
+   COttoTradeManager(void)
+     {
+      m_symbol=""; m_riskManager=NULL; m_orderManager=NULL; m_blockManager=NULL;
+      m_tradesManaged=0; m_halfRiskTriggers=0; m_breakevenTriggers=0; m_trailActivations=0; m_stopsHit=0;
+      // v5.32: pessimistic default. Initialize() resolves the real value from
+      // the inputs; until then every half-risk rung is treated as inert, which
+      // is the safe direction -- a rung that cannot assign must not count.
+      m_cutRiskRungLive=false;
+      m_t2TraceBucket=-1;
+     }
+   ~COttoTradeManager(void) { }
+
+   bool            Initialize(string symbol, COttoRiskManager *rm, COttoOrderManager *om, COttoBlockManager *bm)
+     {
+      m_symbol=symbol; m_riskManager=rm; m_orderManager=om; m_blockManager=bm;
+
+      //+----------------------------------------------------------------+
+      //| v5.32 -- RESOLVE THE HALF-RISK RUNG'S LIVENESS, ONCE.          |
+      //|                                                                |
+      //| The rung is a LOSS-SIDE floor at entry -/+ 0.5R and every      |
+      //| profit-side rung OUTRANKS it: the +1.0R cost-covering          |
+      //| breakeven already sits a fraction of a pip on the PROFIT side, |
+      //| so once it has been applied the half-risk floor can never      |
+      //| assign again. The rung is therefore only reachable at all      |
+      //| while the stop is still worse than -0.5R, i.e. before          |
+      //| breakeven -- which requires InpCutRiskRR to trigger strictly   |
+      //| EARLIER than InpBreakEvenRR.                                   |
+      //|                                                                |
+      //| At the shipped defaults (both 1.0) the rung is inert, and an   |
+      //| inert rung must neither move the stop NOR increment the        |
+      //| counter the journal reports from. Previously it did the        |
+      //| latter, which is how every +1R winner came to be journalled as |
+      //| "risk now -0.5R" while the live stop was already at breakeven. |
+      //|                                                                |
+      //| Inputs are read-only at runtime, so this needs no per-tick     |
+      //| re-evaluation: the hot path just reads the resolved bool.      |
+      //+----------------------------------------------------------------+
+      bool cutBeforeBE = (InpCutRiskRR > 0.0 && InpCutRiskRR < InpBreakEvenRR);
+      m_cutRiskRungLive = cutBeforeBE;
+      if(!cutBeforeBE)
+        {
+         // Loud by design: an operator who sees this line knows the half-risk
+         // rung is inert and that the journal will NEVER report HALF-RISK --
+         // by construction, not because a trigger was missed.
+         if(EnableLogging)
+            Print("[TradeManager] INERT RUNG: half-risk rung disabled because ",
+                  "InpCutRiskRR (", DoubleToString(InpCutRiskRR,2), ") is not below ",
+                  "InpBreakEvenRR (", DoubleToString(InpBreakEvenRR,2), "). ",
+                  "The -0.5R floor can never survive the cost-covering breakeven, ",
+                  "so it is never applied and never reported. Journal HALF-RISK ",
+                  "lines are suppressed.");
+        }
+      else if(EnableLogging)
+         Print("[TradeManager] LIVE RUNG: half-risk rung armed at ",
+               DoubleToString(InpCutRiskRR,2), "R (< breakeven ",
+               DoubleToString(InpBreakEvenRR,2), "R) -> -0.5R floor is reachable");
+      return true;
+     }
+
+   void            Update(void)
+     {
+      if(!m_orderManager.HasActiveTrade()) return;
+      SActiveTrade trade;
+      if(!m_orderManager.GetActiveTradeRef(trade)) return;
+      if(!PositionSelectByTicket(trade.ticket)) return;
+      double rrUnit = m_orderManager.GetBasketRRUnit();
+      if(rrUnit <= 0.0) rrUnit = trade.rrUnit;
+      if(rrUnit <= 0.0) rrUnit = trade.initialSLDistance;
+      double primaryEntry = m_orderManager.GetPrimaryEntry();
+      if(primaryEntry <= 0.0) primaryEntry = trade.entryPrice;
+      ENUM_TRADE_DIRECTION dir = m_orderManager.GetBasketDir();
+      if(dir == DIR_NONE) dir = trade.direction;
+
+      double atr = GetCurrentATR();
+      if(atr <= 0) return;
+      double high0 = iHigh(m_symbol, PERIOD_CURRENT, 0);
+      double low0  = iLow(m_symbol, PERIOD_CURRENT, 0);
+      // LIVE prices every tick (fixes the +1.0R pyramid trigger): LONG=BID, SHORT=ASK
+      double liveBid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+      double liveAsk = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+      double currentRR = 0.0;
+      double desiredSL = trade.currentTrailSL;
+      // Snapshot the stale struct value BEFORE any re-seeding. The single-ticket
+      // push below compares against this, so introducing the session SL can never
+      // by itself manufacture a difference and trigger a spurious broker write.
+      double prevTrailSL = desiredSL;
+      // FIX (v5.20): set when a scaling tranche is added on THIS tick. The
+      // ATR-trail block and the single-ticket broker push are both bypassed for
+      // that one tick so the broker can confirm the protective breakeven stop on
+      // the new ticket before the dynamic trail takes over.
+      // v5.29: generalised from t3OpenedThisTick. The Tranche 2 fill, the
+      // breakeven ratchet and the trail activation all land on the SAME +1.0R
+      // tick -- the trail sat at +2.0R for v5.62 only, and v5.63 put it back on
+      // the +1.0R rung -- so the guard has to cover every rung. Scoping it to
+      // Tranche 3 alone would have let a tight ATR trail be written over a
+      // brand-new T2 ticket whose protective stop the broker had not yet
+      // confirmed -- the v5.14/v5.20 INVALID_STOPS / instant-stopped-out failure
+      // mode, moved one rung earlier.
+      // FIX (v5.62): the unconditional ladder was the reason this guard is
+      // still required; v5.63 restores the trail to the +1.0R rung, so the
+      // coincident write on the T2 tick is if anything more certain again.
+      bool trancheOpenedThisTick = false;
+      // FIX (v5.15): after a T2/T3 ApplyUnifiedSL moved the BASKET stop, the
+      // primary struct field (trade.currentTrailSL) lags behind the real
+      // ratcheted value. Re-seed from the authoritative session SL so the
+      // guards below and the T3 trail block work off the true basket stop.
+      // FIX (v5.16): only do this for a MULTI-tranche basket (> 1). On a
+      // single-tranche basket the per-ticket path at the bottom of Update()
+      // owns the stop, and seeding here only caused extra broker writes.
+      if(m_orderManager.GetBasketCount() > 1 && m_orderManager.GetSessionSL() > 0)
+         desiredSL = m_orderManager.GetSessionSL();
+
+      if(dir == DIR_LONG)
+        {
+         currentRR = (rrUnit > 0) ? (liveBid - primaryEntry) / rrUnit : 0;
+         // v5.32: the legacy half-risk rung USED to sit here, ahead of every
+         // profit-side floor. It has been HOISTED to the end of this branch --
+         // see the "HALF-RISK (HOISTED)" block below. Nothing else moved.
+         // v5.27: BREAKEVEN AT 1:1 (InpBreakEvenRR lowered 2.0 -> 1.0).
+         // Cost-covering, not nominal: beOffset carries commission + swap +
+         // half-spread, so the stop sits fractionally ABOVE true entry and a
+         // trip there returns the account to flat rather than to a loss.
+         if(currentRR >= InpBreakEvenRR && desiredSL < primaryEntry)
+           {
+            double beOffset = CalcBasketFriction(true);
+            double beSL = primaryEntry + beOffset;
+            if(desiredSL < beSL) { desiredSL = beSL; m_breakevenTriggers++; }
+           }
+         // v5.27: STEP PROFIT LOCK (InpLockProfitRR -> InpLockProfitTargetRR).
+         // At +3.0R the hard floor ratchets to +2.0R, banking 2R of open profit.
+         // Guarded strictly forward: the '<' test means the lock can never pull
+         // a stop backwards, which is also why ApplyUnifiedSL()'s ratchet will
+         // accept it unconditionally. Disabled when either input is 0.
+         if(InpLockProfitRR > 0.0 && InpLockProfitTargetRR > 0.0 && currentRR >= InpLockProfitRR)
+           {
+            double lockedSL = primaryEntry + (InpLockProfitTargetRR * rrUnit);
+            if(lockedSL > desiredSL) desiredSL = lockedSL;
+           }
+         // v5.27: DYNAMIC ATR TRAIL runs UNCONDITIONALLY past InpLock3RRR and is
+         // evaluated AFTER the step lock, so the tighter of the two wins on this
+         // same tick. When the ATR trail is near market it supersedes the +2.0R
+         // floor; in a wide-ATR chop the +2.0R floor holds.
+         // v5.29: STEP PROFIT LOCK rung 2 (InpLockProfit2RR -> InpLockProfit2TargetRR).
+         // Evaluated AFTER rung 3 above so the HIGHER milestone always wins: at or
+         // past +3.0R the stop already sits at +2.0R, which is forward of the
+         // +1.0R this rung would set, so its guard is simply false and the rung
+         // is a no-op. Keeping the rungs in descending order makes the ladder
+         // independent of which single trigger happens to be crossed first.
+         if(InpLockProfit2RR > 0.0 && InpLockProfit2TargetRR > 0.0 && currentRR >= InpLockProfit2RR)
+           {
+            double lockedSL2 = primaryEntry + (InpLockProfit2TargetRR * rrUnit);
+            if(lockedSL2 > desiredSL) desiredSL = lockedSL2;
+           }
+         // v5.29: trail gate repointed from InpLock3RRR (3.0) to InpTrailStartRR,
+         // so the ATR trail arms without waiting for the step at which the pyramid
+         // reaches full size. FIX (v5.63): InpTrailStartRR is 1.0, so the trail
+         // arms from +1.0R -- the SAME rung as the first milestone floor below.
+         // Evaluated AFTER both lock rungs, so the tighter of the
+         // three wins on this same tick. NOTE: this gate governs the ATR FORMULA
+         // only. The floors computed above are applied to the basket by the
+         // unconditional milestone-ladder block below, NOT by this gate.
+         if(currentRR >= InpTrailStartRR)
+           {
+            double dynamicTrail = high0 - (InpTrailATRMultiplier * atr);
+            if(dynamicTrail > desiredSL) desiredSL = dynamicTrail;
+           }
+         // --- HALF-RISK (HOISTED, v5.32) ---
+         // Evaluated LAST in this branch: after breakeven, both step locks and
+         // the ATR trail. The guard below therefore tests the FINAL stop rather
+         // than an intermediate one, which is what makes m_halfRiskTriggers
+         // honest -- it increments only when the -0.5R floor was genuinely
+         // APPLIED to the live stop.
+         //
+         // m_cutRiskRungLive is resolved once in Initialize(). With
+         // InpCutRiskRR >= InpBreakEvenRR the rung can never survive the
+         // breakeven floor above it, so it is inert and must not report. That
+         // gate is what removes the phantom "risk now -0.5R" journal line from
+         // every +1R winner.
+         //
+         // max() resolution is order-independent, so hoisting this rung cannot
+         // change which floor wins -- only what the counter means.
+         double halfRiskSL = primaryEntry - (0.5 * rrUnit);
+         if(m_cutRiskRungLive && currentRR >= InpCutRiskRR && desiredSL < halfRiskSL)
+           { desiredSL = halfRiskSL; m_halfRiskTriggers++; }
+        }
+      else // SHORT
+        {
+         currentRR = (rrUnit > 0) ? (primaryEntry - liveAsk) / rrUnit : 0;
+         // v5.32: half-risk rung HOISTED to the end of this branch (mirror of
+         // the LONG branch) so its counter means "the -0.5R floor was applied".
+         // v5.27: BREAKEVEN AT 1:1 — mirror of the LONG branch above.
+         if(currentRR >= InpBreakEvenRR && desiredSL > primaryEntry)
+           {
+            double beOffset = CalcBasketFriction(false);
+            double beSL = primaryEntry - beOffset;
+            if(desiredSL > beSL) { desiredSL = beSL; m_breakevenTriggers++; }
+           }
+         // v5.27: STEP PROFIT LOCK — mirror of the LONG branch, '<' mirrored to
+         // '>' so the ratchet again only ever moves the stop toward market.
+         if(InpLockProfitRR > 0.0 && InpLockProfitTargetRR > 0.0 && currentRR >= InpLockProfitRR)
+           {
+            double lockedSL = primaryEntry - (InpLockProfitTargetRR * rrUnit);
+            if(lockedSL < desiredSL) desiredSL = lockedSL;
+           }
+         // v5.29: STEP PROFIT LOCK rung 2 -- mirror of the LONG branch. Placed
+         // after rung 3 for the same reason: the higher milestone must win.
+         if(InpLockProfit2RR > 0.0 && InpLockProfit2TargetRR > 0.0 && currentRR >= InpLockProfit2RR)
+           {
+            double lockedSL2 = primaryEntry - (InpLockProfit2TargetRR * rrUnit);
+            if(lockedSL2 < desiredSL) desiredSL = lockedSL2;
+           }
+         // v5.27: DYNAMIC ATR TRAIL — mirror of the LONG branch.
+         // v5.29: trail gate repointed InpLock3RRR -> InpTrailStartRR (mirror).
+         // FIX (v5.62): this gate governs the ATR FORMULA only (see the LONG
+         // branch above). The milestone floors are applied by the unconditional
+         // block below.
+         if(currentRR >= InpTrailStartRR)
+           {
+            double dynamicTrail = low0 + (InpTrailATRMultiplier * atr);
+            if(dynamicTrail < desiredSL) desiredSL = dynamicTrail;
+           }
+         // --- HALF-RISK (HOISTED, v5.32) --- mirror of the LONG branch.
+         // Evaluated after breakeven, both step locks and the ATR trail, so the
+         // guard tests the FINAL stop and the counter only fires on a real
+         // application. The '<' is mirrored to '>' so the ratchet still only
+         // ever moves the stop toward market.
+         double halfRiskSL = primaryEntry + (0.5 * rrUnit);
+         if(m_cutRiskRungLive && currentRR >= InpCutRiskRR && desiredSL > halfRiskSL)
+           { desiredSL = halfRiskSL; m_halfRiskTriggers++; }
+        }
+
+      // --- PYRAMID (unified group stop) ---
+      // v5.27: Tranche 2 at +2.0R, driven by its OWN input (InpPyramidT2RR).
+      // Previously this read InpBreakEvenRR, which worked only because both
+      // happened to equal 2.0; lowering breakeven to 1.0 for the 1:1 rule would
+      // have silently dragged the T2 scale-in down to 1.0R. The trigger is now
+      // independent: add the InpRiskT2Pct tranche, then move the unified basket
+      // stop to exact Cost-Covering Breakeven (entry +/- beOffset, where
+      // beOffset already accounts for broker commission + swap friction).
+      // v5.29: this rung now fires at +1.0R (InpPyramidT2RR = 1.0), which is the
+      // tick on which three things coincide -- the T2 fill, the +1.0R breakeven
+      //+------------------------------------------------------------------+
+      //| v5.32 -- TRANCHE 2 CROSSING TRACE                                |
+      //|                                                                  |
+      //| This rung had never been observed firing in the field, and every |
+      //| refusal inside AddPyramidTranche() returned a bare 'false', so   |
+      //| "T2 never triggers" was indistinguishable from "T2 triggered    |
+      //| and was silently refused". This block makes the crossing         |
+      //| observable once per approach: the first tick whose RR enters the |
+      //| 5%-wide band below the trigger prints EVERY quantity the         |
+      //| decision depends on -- the live RR, the R unit it was measured   |
+      //| against, the basket size, the ladder cursor, and the lot the     |
+      //| rung would risk.                                                 |
+      //|                                                                  |
+      //| It deliberately runs BEFORE the gate below, so the trace also    |
+      //| fires when that gate's second half, IsPyramidPending(2), is      |
+      //| false -- which is the other candidate root cause: a m_nextTranche|
+      //| that has already advanced past 2.                                |
+      //|                                                                  |
+      //| Read-only apart from the bucket latch, which stops a basket      |
+      //| hovering just under the trigger from logging once per tick. The  |
+      //| latch re-arms whenever the ladder leaves rung 2, so the next     |
+      //| basket traces again.                                             |
+      //+------------------------------------------------------------------+
+      if(EnableLogging && InpPyramidT2RR > 0.0)
+        {
+         // Re-arm for the next basket: the ladder leaves rung 2 either by
+         // advancing (T2 fired) or by the whole basket being cleared, and in
+         // both cases a fresh basket should get its own crossing report.
+         // Deliberately NOT also keyed on InpPyramidEnable: a disabled pyramid
+         // leaves the cursor parked on 2, and re-arming every tick would turn
+         // this trace into a per-tick spammer. Parked on 2 is the correct
+         // behaviour for the disabled case too -- one report per approach.
+         if(m_orderManager.GetNextTranche() != 2)
+            m_t2TraceBucket = -1;
+
+         double t2Band = InpPyramidT2RR * 0.05;   // 5% of the trigger
+         if(currentRR >= (InpPyramidT2RR - t2Band))
+           {
+            int bucket = (int)MathFloor(currentRR / MathMax(t2Band, 0.0001));
+            if(bucket != m_t2TraceBucket)
+              {
+               m_t2TraceBucket = bucket;
+               double basketR = m_orderManager.GetBasketRRUnit();
+               double traceR  = (basketR > 0.0) ? basketR : rrUnit;
+               double traceLot = (traceR > 0.0)
+                                 ? m_riskManager.RiskPctLotSize(InpRiskT2Pct, traceR) : 0.0;
+               Print("[Pyramid] T2 crossing: currentRR=", DoubleToString(currentRR,3),
+                     " trigger=", DoubleToString(InpPyramidT2RR,2), "R",
+                     " | basketRRUnit=", DoubleToString(basketR, _Digits),
+                     " ladderRRUnit=", DoubleToString(rrUnit, _Digits),
+                     " | basketCount=", m_orderManager.GetBasketCount(),
+                     " | nextTranche=", m_orderManager.GetNextTranche(),
+                     " pending2=", (m_orderManager.IsPyramidPending(2) ? "true" : "false"),
+                     " | riskT2%=", DoubleToString(InpRiskT2Pct,3),
+                     " lot=", DoubleToString(traceLot,2),
+                     " | dir=", (dir == DIR_LONG ? "LONG" : "SHORT"),
+                     " enable=", (InpPyramidEnable ? "true" : "false"));
+              }
+           }
+        }
+      // ratchet and the +1.0R ATR-trail activation -- so the guard below is set
+      // unconditionally on a successful add.
+      if(currentRR >= InpPyramidT2RR && m_orderManager.IsPyramidPending(2))
+        {
+         double beOffset = CalcBasketFriction(dir==DIR_LONG);
+         double groupBE = primaryEntry + (dir==DIR_LONG ? beOffset : -beOffset);
+         // v5.29: hand groupBE to AddPyramidTranche as slOverride so the market
+         // fill carries its protective stop in the SAME request. T2 previously
+         // relied solely on the ApplyUnifiedSL() on the next line, so a skipped
+         // or rejected call left the new ticket naked in hedge mode. T3 has
+         // always been opened with the override; T2 now matches.
+         if(m_orderManager.AddPyramidTranche(2, groupBE))
+             {
+              m_orderManager.ApplyUnifiedSL(groupBE);
+              m_orderManager.LogGroupStop("Tranche 2 (+1.0R) - Cost-Covering Breakeven", groupBE);
+              // v5.29: bypass the trail/push blocks below for THIS tick only.
+              // The broker needs a moment to register the protective breakeven
+              // stop attached to the brand-new ticket; pushing the tight ATR
+              // trail in the same tick can be rejected as INVALID_STOPS or,
+              // worse, land on the fill and stop the whole basket out on entry.
+              // The normal ATR trail takes over on the next tick.
+              trancheOpenedThisTick = true;
+             }
+        }
+      // Tranche 3 at +2.0R (InpPyramidT3RR): add the InpRiskT3Pct tranche.
+      // FIX (v5.14): do NOT hand the tight dynamic 'desiredSL' to T3 upon entry.
+      // Two reasons: (1) 'desiredSL' is the ATR trail anchored to high0-1.5*ATR,
+      // which at +2.0R already sits close to market and can be rejected with
+      // INVALID_STOPS or instantly stop the whole basket on a spread spike;
+      // (2) the new ticket would otherwise be opened with sl=0.
+      // FIX (v5.61): T3's protective floor is now the UNIFIED-SL MILESTONE at
+      // +2.0R -- the same +1.0R lock the milestone ladder above already applies
+      // to the basket (InpLockProfit2RR / InpLockProfit2TargetRR) -- instead of
+      // the cost-covering breakeven it used to carry. The old floor stopped the
+      // new leg merely at entry +/- friction, which at +2.0R was far LOOSER than
+      // the stop the rest of the basket was already wearing, so T3 entered with
+      // more risk on it than every ticket beneath it.
+      //
+      // CLAMPED AGAINST THE LIVE SESSION STOP. Handing the raw +1.0R floor to
+      // ApplyUnifiedSL() would be a silent NO-OP: the v5.32-hoisted half-risk
+      // rung pins the basket at entry -/+ 0.5R from the +1.0R breakeven onward,
+      // so +1.0R is looser than the floor already live and the one-way ratchet
+      // in ApplyUnifiedSL() would reject it. Taking the tighter of the two means
+      // the new leg is born wearing exactly the stop the basket already has, and
+      // the normal milestone-ladder block below ratchets it forward on the next
+      // tick (that block is the unconditional ApplyUnifiedSL(), no longer
+      // gated on currentRR >= InpTrailStartRR).
+      if(currentRR >= InpPyramidT3RR && m_orderManager.IsPyramidPending(3))
+        {
+         double t3FloorRaw = primaryEntry + (dir==DIR_LONG ? 1.0 : -1.0) * rrUnit;
+         double sessionNow = m_orderManager.GetSessionSL();
+         double t3Floor = t3FloorRaw;
+         if(sessionNow > 0.0)
+            t3Floor = (dir==DIR_LONG) ? MathMax(t3FloorRaw, sessionNow)
+                                      : MathMin(t3FloorRaw, sessionNow);
+         if(m_orderManager.AddPyramidTranche(3, t3Floor))
+             {
+              m_orderManager.ApplyUnifiedSL(t3Floor);
+              m_orderManager.LogGroupStop("Tranche 3 (+2.0R) - Executed (Unified SL +1.0R)", t3Floor);
+              trancheOpenedThisTick = true;
+             }
+        }
+      // Tranche 4 at +3.0R (InpPyramidT4RR): add the final InpRiskT4Pct tranche.
+      // This is the last rung, so a successful add advances m_nextTranche to 0
+      // and IsPyramidPending() is false for every rung from here on. Mirrors the
+      // T3 pattern exactly: a protective floor travels WITH the fill request
+      // (never the tight dynamic 'desiredSL', for the INVALID_STOPS reasons
+      // spelled out above), and the trail/push blocks are skipped for this tick
+      // so the broker can confirm the new ticket's protective stop before
+      // anything tightens it further.
+      //
+      // FIX (v5.61): the floor is now the UNIFIED-SL MILESTONE at +3.0R -- the
+      // +2.0R lock the milestone ladder above already applies to the basket
+      // (InpLockProfitRR / InpLockProfitTargetRR) -- rather than the
+      // cost-covering breakeven. As with T3 it is CLAMPED against the live
+      // session stop, so a leg added while the ATR trail is already tighter than
+      // +2.0R inherits that tighter stop instead of loosening the basket back to
+      // the milestone (which the one-way ratchet would refuse anyway).
+      if(currentRR >= InpPyramidT4RR && m_orderManager.IsPyramidPending(4))
+        {
+         double t4FloorRaw = primaryEntry + (dir==DIR_LONG ? 2.0 : -2.0) * rrUnit;
+         double sessionNow4 = m_orderManager.GetSessionSL();
+         double t4Floor = t4FloorRaw;
+         if(sessionNow4 > 0.0)
+            t4Floor = (dir==DIR_LONG) ? MathMax(t4FloorRaw, sessionNow4)
+                                      : MathMin(t4FloorRaw, sessionNow4);
+         if(m_orderManager.AddPyramidTranche(4, t4Floor))
+             {
+              m_orderManager.ApplyUnifiedSL(t4Floor);
+              m_orderManager.LogGroupStop("Tranche 4 (+3.0R) - Executed (Unified SL +2.0R)", t4Floor);
+              trancheOpenedThisTick = true;
+             }
+        }
+      // --- MILESTONE LADDER: apply the unified basket stop UNCONDITIONALLY ---
+      // FIX (v5.62): this block was previously nested inside the ATR trail gate
+      // (if(currentRR >= InpTrailStartRR && ...)), which made InpTrailStartRR the
+      // de facto activation R:R of the WHOLE milestone ladder. Every floor the
+      // branches above may have raised into desiredSL -- the +1.0R cost-covering
+      // breakeven, the +2.0R lock rung, the +3.0R lock rung -- was only ever
+      // written to the basket once that single gate opened, so raising
+      // InpTrailStartRR to 1.0 would have darkened the +1.0R floor instead of
+      // just delaying the trail.
+      //
+      // The gate and the ladder are separate concerns and are now split: each
+      // milestone above is guarded by its OWN Inp*RR trigger, so this block only
+      // has to decide WHEN a stop may be pushed, not WHICH one. Applying it
+      // unconditionally is safe by construction: desiredSL is seeded from
+      // trade.currentTrailSL (the live stop) and from GetSessionSL() for a
+      // multi-tranche basket, and ApplyUnifiedSL() refuses anything that does not
+      // strictly tighten. Below every milestone, desiredSL equals the stop already
+      // live, so the one-way ratchet returns early and no broker write happens.
+      //
+      // The trancheOpenedThisTick guard is RETAINED: it stops a stop write racing
+      // the broker's confirmation of a ticket filled on this very tick
+      // (the v5.14/v5.20 INVALID_STOPS / instant-stopped-out failure mode).
+      if(!trancheOpenedThisTick)
+        {
+         m_orderManager.ApplyUnifiedSL(desiredSL);
+         // FIX (v5.15): mirror the AUTHORITATIVE ratcheted value back into the
+         // active-trade struct. Read back from GetSessionSL() rather than
+         // writing desiredSL: the ratchet may have rejected desiredSL and
+         // retained a tighter stop, and writing desiredSL here would
+         // re-introduce the very desync this fix removes.
+         m_orderManager.SetActiveTradeSL(m_orderManager.GetSessionSL());
+         // v5.67: settle any stop the venue refused on an earlier partial.
+         // Runs AFTER the ratchet above, so a level accepted this tick has
+         // already cleared the debt and this is a no-op; it only does work
+         // when the ratchet had nothing new to say, which is precisely the
+         // partial-application case the one-way guard cannot recover from.
+         // Inside the guard on purpose: re-offering stops to brand-new tickets
+         // on the tick they filled is the v5.14/v5.20 INVALID_STOPS race.
+         m_orderManager.RepairUnifiedSL();
+        }
+
+      // --- Dynamic ATR Trail ------------------------------------------------
+      // FIX (v5.62): the ATR formula itself was already computed inside the
+      // branches above, behind its own (currentRR >= InpTrailStartRR) gate, so it
+      // is part of desiredSL and is carried by the unconditional block above.
+      // InpTrailStartRR therefore still governs exactly two things: that formula
+      // and the m_trailActivations tally below. Nothing to apply here -- kept as a
+      // named boundary so the trail/ladder split is legible. v5.63: the trail
+      // gate now sits at 1.0R, the same rung as the ladder's first floor, so the
+      // two contributors to desiredSL overlap from +1.0R onward and the tighter
+      // one wins each tick.
+
+      // --- Push the primary stop to the broker ---
+      // When a multi-tranche basket is active, ApplyUnifiedSL() above already
+      // manages every basket ticket, so the single-ticket ModifySL() below is
+      // skipped to avoid a conflicting double-modification of the primary.
+      // FIX (v5.20): also skipped on the tick a scaling tranche opened, for the
+      // same reason as the milestone-ladder block above -- no stop write races the
+      // broker's confirmation of the new ticket's protective stop. v5.29: this now
+      // covers T2 as well as T3/T4, which matters because the T2 fill coincides
+      // with the +1.0R breakeven-rung activation (and, since v5.63, the ATR trail
+      // activation too -- it arms on that same +1.0R rung).
+      double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+      if(m_orderManager.GetBasketCount() <= 1 && !trancheOpenedThisTick)
+        {
+         // FIX (v5.16): compare against prevTrailSL (the value BEFORE the
+         // session-SL re-seed) so the push reflects genuine local movement
+         // rather than the seeding itself.
+         if(MathAbs(desiredSL - prevTrailSL) > point)
+           {
+            if(m_orderManager.ModifySL(trade.ticket, desiredSL))
+              {
+               m_orderManager.SetActiveTradeSL(desiredSL);
+               // FIX (v5.62): this tally is one of only two remaining reads of
+               // InpTrailStartRR in Update() (the other is the ATR formula in each
+               // branch). It is incremented on a successful single-ticket write
+               // ONLY once the trail is actually armed -- the write above may have
+               // been caused by the milestone ladder instead, and counting that as
+               // a trail activation would overstate the trail's contribution.
+               if(currentRR >= InpTrailStartRR) m_trailActivations++;
+               // v5.63: with InpTrailStartRR at 1.0 the trail is armed from the
+               // same +1.0R rung as the first milestone floor, so a write that
+               // the ladder alone caused is ONLY distinguishable by this gate.
+               // The guard is unchanged; what changed is that the window in
+               // which the ladder can act unaccompanied is now empty.
+              }
+           }
+        }
+      else if(currentRR >= InpTrailStartRR && !trancheOpenedThisTick)
+         m_trailActivations++;
+      m_tradesManaged++;
+     }
+
+   void            SyncTradeState(void)
+     {
+      if(!m_orderManager.HasActiveTrade()) return;
+      SActiveTrade trade;
+      if(!m_orderManager.GetActiveTradeRef(trade)) return;
+      if(trade.rrUnit <= 0.0) trade.rrUnit = trade.initialSLDistance;
+      double price = (trade.direction == DIR_LONG) ? SymbolInfoDouble(m_symbol, SYMBOL_BID) : SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+      double rr = (trade.rrUnit > 0) ? ((trade.direction == DIR_LONG ? price - trade.entryPrice : trade.entryPrice - price) / trade.rrUnit) : 0.0;
+      ENUM_TRAIL_STEP step = STEP_NONE;
+      // v5.27: STEP_TRAILING keys off InpLockProfitRR (the step-profit-lock
+      // milestone). v5.29: the second branch was repointed from InpLock3RRR to
+      // InpTrailStartRR, so the reported trail step now agrees with the input
+      // that actually arms the trail in Update(). As before, both remain
+      // inputs. FIX (v5.63): InpTrailStartRR is 1.0, so the second branch now
+      // fires from the SAME +1.0R rung as the InpBreakEvenRR branch below it.
+      // Because STEP_TRAILING is tested first, the +1.0R rung reports
+      // STEP_TRAILING and the STEP_BREAKEVEN branch is shadowed while the two
+      // inputs are equal. That is deliberate: at +1.0R the ATR trail genuinely
+      // IS armed, so STEP_TRAILING is the truthful label, and the milestone
+      // floor at that rung is still applied by the ladder block in Update()
+      // regardless of what the state machine reports. STEP_BREAKEVEN becomes
+      // reachable again the moment InpTrailStartRR is raised above
+      // InpBreakEvenRR.
+      // Order matters: highest milestone first.
+      if(InpLockProfitRR > 0.0 && rr >= InpLockProfitRR)      step = STEP_TRAILING;
+      else if(rr >= InpTrailStartRR)                          step = STEP_TRAILING;
+      else if(rr >= InpBreakEvenRR)                           step = STEP_BREAKEVEN;
+      // v5.32: gated on the rung's resolved liveness so this state machine
+      // cannot advertise a stop the ladder structurally never applies. With
+      // InpCutRiskRR >= InpBreakEvenRR the branch above is always taken first
+      // anyway, so this is a statement of intent rather than a behaviour
+      // change -- but it keeps the reported step and the journalled events
+      // (m_halfRiskTriggers) derived from the SAME gate.
+      else if(m_cutRiskRungLive && rr >= InpCutRiskRR)        step = STEP_HALF_RISK;
+      m_orderManager.SetActiveTradeStep(step);
+      m_orderManager.SetActiveTradeHighWatermark(price);
+     }
+
+   int               GetTradesManaged(void) const     { return m_tradesManaged; }
+   int               GetHalfRiskTriggers(void) const  { return m_halfRiskTriggers; }
+   int               GetBreakevenTriggers(void) const { return m_breakevenTriggers; }
+   int               GetTrailActivations(void) const  { return m_trailActivations; }
+   int               GetStopsHit(void) const          { return m_stopsHit; }
+  };
+
+//+------------------------------------------------------------------+
+#endif  // __OTTO_TRADE_MANAGER__

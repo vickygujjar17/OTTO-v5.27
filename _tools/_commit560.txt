@@ -1,0 +1,85 @@
+560: chore — release bump 5.58 -> 5.60 and de-dup the SAR stop distance
+
+Every source change bumps the release stamp, so the two-minor bump is applied
+here as its own pass, and the single pending source edit rides with it: the SAR
+reversal fallback in COttoOrderManager.mqh re-spelled the stop-distance
+arithmetic inline instead of sharing CalcSLDistance().
+
+VERSION 5.58 -> 5.60
+
+  HEAD stamped 5.58; the working tree carries the 20 human-facing rows at 5.60.
+  _tools/_bump_version.py 5.60 reports the documented idempotent no-op ("5.60 is
+  already the current release"), so the rewrite is complete and no partial bump
+  can leave the tree stamping two releases at once. Census (_tools/_vercensus.py,
+  exit 0) resolves all 20: the 11 '#property version' stamps (otto.mq5 plus
+  the 10 .mqh modules), otto.mq5's 'Pine Script Master Build Port (vX.Y)' banner
+  and its startup Print, OttoDefines.mqh's module header box and its
+  '#property description' with the four versioned input-group labels ([9]
+  Currency Vector, [10] High Table Auditor, [11] Manual Trade Adoption, [12]
+  Retired Veto Reversal), and README's '**Current base: vX.Y**'. All 20 read
+  5.60 and no 5.58 stamp survives.
+
+  The jump skips 5.59: 5.58 is the release committed at 41f8d5d and 5.60 is the
+  next release this tree ships, so no 5.59 ever exists. git grep '5\.59' over
+  the tracked tree returns nothing.
+
+SAR STOP DE-DUPLICATED (COttoOrderManager.mqh, OpenReversalPosition)
+
+  The SAR reversal fallback computed its stop as 'targetBlock.blockHeight +
+  0.5 * atr' -- the SAME quantity CalcSLDistance(block, atr) already returns
+  ('return block.blockHeight + (0.5 * atr);', line 691). Every other entry path
+  (PlaceOrArmOrder at line 785, CheckVirtualTriggers at line 2856) already calls
+  the helper; only this fallback re-spelled the arithmetic. The two spellings
+  agreed numerically, but a future edit to the helper would have diverged this
+  stop ALONE -- and with it the whole reversal basket's 1R basis, its pyramid
+  ladder, its breakeven and its trail. The fallback now calls CalcSLDistance()
+  with the identical shift-1 ATR it already fetched. The change is confined to
+  the fallback arm (guarded by 'if(targetBlock.localSL <= 0)'), so a block whose
+  localSL is already set is untouched.
+
+  SCOPE, stated exactly: this removes ONE inline spelling, on the STOP-DISTANCE
+  path in the order manager. It is deliberately NOT a tree-wide sweep, because
+  the other surviving spellings are load-bearing redundancy, not accidents:
+
+    - COttoOrderManager.mqh:681 (CalcEntryPrice) and COttoBlockManager.mqh:168
+      (BlockEntryPrice) are a PAIRED entry geometry. Each file's comment names
+      the other as its twin and says the two 'must stay identical or the
+      Front-Run veto would judge a different price from the order's' (block
+      manager, lines 162-164). Folding either onto CalcSLDistance() would be an
+      entry-geometry change under the banner of a de-dup.
+    - COttoBlockManager.mqh:555 and :756 compute 'calcSLDist' inside the two
+      front-run-veto passes (live ProcessBlocks and the intra-bar twin). Those
+      are mirrored on purpose too -- the comments call them 'the identical
+      arithmetic in COttoOrderManager::PlaceOrArmOrder' and 'Intra-bar twin of
+      the ProcessBlocks() projection above' -- and they feed a separate tpRR
+      projection, not the order's stop.
+
+  The SAR fallback is the one place where the mirroring was accidental rather
+  than declared: it sits in the same file as CalcSLDistance() and its two
+  siblings there (PlaceOrArmOrder at line 785, CheckVirtualTriggers at line
+  2856) already call the helper, so the inline spelling was a lone outlier
+  against its own file's convention. The remaining 'blockHeight + 0.5*ATR' hits
+  are prose in comment boxes.
+
+HISTORICAL MARKERS AND THE BUMP GUARD
+
+  The 5.58 release introduced five '// v5.58 — ...' annotations. Because the
+  bump went 5.58 -> 5.60 and no pass ever bumped through 5.58 again, they were
+  never restated, and the census scans for the bare literal and only exempts
+  lines carrying 'FIX ('; left alone they would have reported STALE on the next
+  bump and exited 1. All five are restated to the sanctioned historical marker
+  'FIX (v5.58)' (precedent: 'FIX (v5.26)' in OttoDefines; the 557 -> 558 bump
+  restated 16 survivors the same way, see _tools/_commit559.txt). The NEW de-dup
+  note is the opposite case: it is an uncommitted '+' line that lands in 5.60,
+  so it carries 'FIX (v5.60)', not 5.58 -- labelling it 5.58 would claim a
+  release it was never in. Widths grow at most 4 columns ('// vX — ' -> 'FIX
+  (vX) '), within the file's own accepted budget (existing FIX (v5.x) marker
+  lines run to 86 columns). Both restatements and the relabel are applied by
+  _tools/_annotate560.py.
+
+  The guard is not argued, it is MEASURED: _tools/_bump_probe.ps1 runs the real
+  next bump (5.60 -> 5.61), captures the verdict, then restores the tree
+  byte-for-byte (SHA-256 verified identical). Before the relabel the probe
+  reported '*** STALE v5.60 REMAINS *** COttoOrderManager.mqh:1487' and exited
+  1; after it, 'no v5.60 literal remains in the shipped sources or docs',
+  exit 0. That is what pinned the marker form.

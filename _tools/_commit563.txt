@@ -1,0 +1,267 @@
+563: feat — change trail start to 1.0R and add High Table trailing health audit
+
+RATIONALE
+
+  v5.62 split the milestone ladder from the ATR trail gate so the trail could be
+  retuned without darkening the ladder's first floor, and then set
+  InpTrailStartRR to 2.0. That left an intentional one-R gap: between +1.0R and
+  +2.0R the stop was carried by the milestone floors alone, with no ATR
+  component. v5.63 closes that gap. The trail now arms on the SAME +1.0R rung as
+  the ladder's first floor, so from +1.0R onward the basket wears BOTH the
+  milestone floors and the ATR component and the tighter of the two wins on each
+  tick.
+
+  That change has a consequence the audit layer could not previously see: the
+  two contributors to the basket stop now overlap for the whole life of a trade.
+  A trail that silently arms and then never writes a stop is indistinguishable
+  from a healthy one on any single tick, and with the trail armed from +1.0R
+  there is no longer any tick at which the ladder is provably the only writer.
+  v5.63 therefore adds an independent witness for exactly that condition, plus
+  an aggregate-risk leg that the existing per-leg audit is structurally blind
+  to.
+
+SOURCE
+
+  OttoDefines.mqh -- InpTrailStartRR 2.0 -> 1.0
+    The v5.29 and v5.62 narrative above the input is rewritten: the input still
+    gates the DYNAMIC ATR TRAIL ONLY (formula + tally), but its value is now
+    1.0, so the +1.0R -> +2.0R ATR gap v5.62 described is CLOSED. The
+    replacement text records the accepted trade explicitly (a wide-ATR chop
+    above +1.0R can pull the stop in as soon as the trail is armed) and
+    documents the one state-machine consequence below.
+
+  COttoTradeManager.mqh -- stale comments truth-up (7 sites, no logic change)
+    :222-224 the tranche guard note (the trail activation once again lands on
+    the same +1.0R tick as the T2 fill and the breakeven ratchet)
+    :285-287 the LONG trail arm (arms from +1.0R, the same rung as the first
+    milestone floor)
+    :477 the T3 floor note (the ladder block is unconditional)
+    :531 the ladder-split note (raising the input to 1.0 would have darkened
+    the floor)
+    :563-566 the named trail/ladder boundary (the two contributors now overlap)
+    :590-597 the m_trailActivations tally (the window in which the ladder can
+    act unaccompanied is now empty)
+    :619-630 the SyncTradeState classifier -- see COUPLING below
+
+COUPLING ACCEPTED: the +1.0R rung now reports STEP_TRAILING
+
+  With InpTrailStartRR == InpBreakEvenRR == 1.0 the two classification branches
+  in SyncTradeState() coincide. STEP_TRAILING is tested first, so the +1.0R rung
+  reports STEP_TRAILING and the STEP_BREAKEVEN branch is shadowed while the two
+  inputs are equal. This is deliberate and is now documented at the branch:
+
+    * at +1.0R the ATR trail genuinely IS armed, so STEP_TRAILING is the
+      truthful label;
+    * the +1.0R milestone floor is still applied to the basket by the ladder
+      block in Update() regardless of what the classifier reports, so no risk
+      behaviour changes with the label;
+    * InpCutRiskRR (also 1.0) is unaffected -- it sits BELOW both branches in
+      the chain, behind its own m_cutRiskRungLive gate;
+    * STEP_BREAKEVEN becomes reachable again the moment InpTrailStartRR is
+      raised above InpBreakEvenRR.
+
+  The probe pins the ORDERING, not just the values, because the ordering is what
+  makes the label correct: swapping the two branches (a plausible tidy-up)
+  immediately fails test_v563_trail_health.py.
+
+SOURCE (continued)
+
+  CHighTableAuditor.mqh -- AuditTrailingHealth() (new body, 1 site in RunAudit)
+    Runs after AuditRiskExposure() in RunAudit(). It is the independent witness
+    that an ARMED trail is actually tightening the basket.
+
+    THE ANTI-CIRCULARITY RULE, which is the whole point of the design. The
+    tempting test is "the stop reads +0.4R, so the trail must be lagging". That
+    test is circular: the only reason a stop reads below the arm threshold is
+    that it has not moved -- the very hypothesis under test. Worse, a fully
+    frozen stop reads NEGATIVE R and would sail through it. So the excursion is
+    taken from the LIVE PRICE every cycle (BID for a long, ASK for a short) and
+    kept as a running maximum, m_trailPeakRR, across cycles. The arm test then
+    compares the PEAK, never the stop:
+
+      * peak < InpTrailStartRR      -> gate still closed, no stop movement owed
+      * peak >= InpTrailStartRR     -> the trail is armed; the LIVE stop (read
+                                       from the book, pushed value as fallback)
+                                       must have left the losing side of entry
+
+    A stop still on the losing side after the peak cleared the arm threshold, or
+    no stop at all, raises a latched HT_SEV_WARN alert naming the ticket, the
+    observed peak, the entry, the 1R and the stop's own R.
+
+    Unjudgeable states stand the check DOWN rather than guessing: no geometry
+    pushed, no tracked trade, DIR_NONE, or a non-positive price all re-arm the
+    latch and return. Scope is deliberately narrow -- the body does not assert
+    the stop equals the trail value, does not know the ATR and does not measure
+    lag. Anything stricter would duplicate the trade manager's arithmetic here
+    and drift from it silently.
+
+  CHighTableAuditor.mqh -- SetTrackedGeometry() + NoteExcursion() (new ingress)
+    The terminal can answer everything about a leg EXCEPT its 1R unit:
+    m_basketRRUnit is the order layer's own private divisor, derived at basket
+    init and persisted across restarts. Re-deriving it inside the auditor would
+    create a second, silently drift-prone source of truth for the denominator of
+    every RR decision -- exactly what the decoupling contract at the top of the
+    file forbids -- so otto.mq5 pushes it alongside the entry, direction and
+    working stop.
+
+    A carrier-less push (no ticket, or a non-positive 1R) is recorded as NO
+    geometry rather than as geometry of zero: a zero divisor would turn the
+    stale-trail test into a permanent false CRITICAL. The ingress also resets
+    m_trailPeakRR when the tracked ticket CHANGES, because a high-water mark
+    carried over from the previous trade would be measured against a different
+    entry and 1R. Resetting can never manufacture an alert (a zero peak is below
+    every arm threshold) and costs at most one audit cycle of observation.
+
+  CHighTableAuditor.mqh -- aggregate basket-risk leg in AuditRiskExposure()
+    Strictly ADDITIVE. The per-leg peak (peakRiskPct) is blind to how many legs
+    are stacked behind the shared stop: four correctly-sized legs can each sit
+    comfortably inside the 1.5% per-leg allowance and still sum past what the
+    pyramid was designed to carry. The same loop and the same loss-side guard
+    now also accumulate sumRiskPct, tested against the stacked design budget
+
+      RiskPercent + InpRiskT2Pct + InpRiskT3Pct + InpRiskT4Pct   (x 1.50 tolerance)
+
+    so a correctly-sized pyramid at full size sits exactly at the allowance and
+    never alerts. It has its OWN latch (m_alertSent_AggRiskBreach) and its own
+    two-cycle confirmation (m_aggRiskSeen), for the same reason the trail check
+    does: a tranche landing just before its stop is pushed reads high for one
+    cycle, and that is the shape of a fill rather than an incident.
+
+    Every v5.46 guarantee that test_v546_risk_isolation.py pins is preserved
+    byte-for-byte: MathAbs remains gone, the signed lossDist and its
+    `<= 0.0 continue` guard are untouched, maxAllowedRiskPct = RiskPercent *
+    1.50 is unchanged, the peak is still the WORST leg keyed to the local
+    ticket, moneyAtRisk = distPts * tickValue * vol is unchanged, and the
+    per-leg latch still dispatches WARN and re-arms on a clean cycle.
+
+  otto.mq5 -- HighTablePushFacts() pushes the geometry (1 site)
+    SetTrackedGeometry(active.ticket, active.direction, active.entryPrice,
+    g_orderManager.GetBasketRRUnit(), active.currentTrailSL) is emitted on the
+    SAME GetActiveTradeRef(active) branch that already extracts the ticket and
+    the adopted flag -- the facts are one record. With no active trade the order
+    layer has no 1R to offer, and the auditor records that as "no geometry".
+
+  CHighTableAuditor.mqh -- declarations, ctor init and docs
+    Two latches (m_alertSent_StaleTrail, m_alertSent_AggRiskBreach), six
+    geometry members (m_haveGeometry, m_trackedEntry, m_trackedRRUnit,
+    m_trackedDir, m_trackedSL, m_trailPeakRR, m_trailPeakTicket) and one
+    confirmation flag (m_aggRiskSeen), each declared beside its peers inside the
+    include guard and each initialised in the constructor. The PART 2 header's
+    "four observation bodies" becomes "six".
+
+
+PROBES
+
+  _probe/test_v563_trail_health.py (NEW, 115 checks) -- static probe over the
+  shipped sources. Pins: the input value and the state-machine ORDER; the three
+  live ATR gates unchanged in count; the anti-circularity rule (the excursion
+  statement must divide a PRICE difference and must not mention any stop, and
+  the peak must be fed the price-derived R); the arm test comparing the PEAK;
+  the book-stop preference with the pushed fallback; both alert messages and
+  their evidence lines; every unjudgeable stand-down path; the geometry ingress
+  including the ticket-change peak reset and the zero-1R refusal; both new
+  latches declared inside the guard, initialised in the ctor and re-armed on
+  every healthy path; no state between the class body and the #endif; the
+  aggregate leg's budget, tolerance, own latch and two-cycle confirmation; and
+  thirteen checks re-asserting every v5.46 shape the older probe pins.
+
+  _probe/_mutate_v563.py (NEW, 27 mutations) -- every assertion above is
+  exercised against a deliberate regression. 27/27 caught, 0 anchors skipped.
+  The load-bearing mutant is "the excursion is derived from the STOP instead of
+  the price": it is the natural simplification and it silently disables the
+  whole check, which is exactly why it is in the table. Two mutants were NOT
+  caught on the first run and the probe was strengthened rather than the table
+  weakened: (a) leaking the stop into the excursion's R is now caught by
+  asserting the rr statement is stop-free and that NoteExcursion is fed `rr`;
+  (b) a latch moved outside the guard is now caught by splitting on the LAST
+  #endif (a `.split("#endif")[-1]` was looking at a COMMENT that merely mentions
+  the guard, so it always passed) plus the v5.32 rules that nothing may sit
+  between the class body and the guard and that every declared latch is
+  initialised in the ctor.
+
+  _probe/test_v52x_pyramid.py (UPDATED) -- the two expectations that encoded the
+  v5.62 value are inverted: "InpTrailStartRR defaults to +2.0R" becomes +1.0R,
+  and the ladder-rung check now reads BE_RR == T2_RR == TRAIL_RR == 1.0 (the
+  trail arms on the same rung as the breakeven floor). The section header and
+  the module docstring are re-dated to v5.63. The three-live-gates count, the
+  SyncTradeState read and the v5.62 structural pins are UNCHANGED -- the release
+  moved the value, not the wiring.
+
+  _probe/_mutate_ms_milestones.py -- verified, not edited. Its v5.62
+  re-anchoring comment refers to the APPLICATION gate
+  (`if(!trancheOpenedThisTick)`), not to the input value, so raising the trail
+  from +2.0R to +1.0R leaves it live. 14/14 caught, 0 anchors skipped.
+
+
+NOT PROVEN HERE
+
+  Behaviour. As with v5.62, the probes are static source assertions; no Strategy
+  Tester run accompanies this commit. Two claims in particular rest on reading
+  the code rather than on an observed trace:
+
+    * that closing the +1.0R -> +2.0R ATR gap cannot loosen a live stop -- it
+      rests on ApplyUnifiedSL() being a strict one-way ratchet, so an ATR value
+      looser than the +1.0R floor is refused and the trail can only ever tighten
+      from that rung;
+    * that the STEP_BREAKEVEN branch becoming unreachable at the default values
+      changes no risk behaviour -- it rests on the ladder block in Update()
+      applying the floors independently of the classifier.
+
+  _probe/test_v532_hightable.py remains RED (125/135, all 10 [FAIL] in the trim
+  silo). The v5.63 additions to the auditor are invisible to that probe's latch
+  inventory (it counts >= 6 and requires every dispatched latch to be re-armed)
+  and to its RunAudit check (it asserts a subset of four body names). The red
+  count is UNCHANGED from the v5.62 tree, so nothing here regresses it.
+
+VERSION 5.62 -> 5.63 (_tools/_bump_version.py 5.63)
+
+  20 human-facing rows rewritten (11 #property version stamps, the otto.mq5 Pine
+  port banner and startup Print, the OttoDefines banner and description, the four
+  versioned input-group labels, README "Current base"). Three further stale
+  v5.62 references in COttoTradeManager.mqh were false claims after this change
+  (the trail no longer waits for +2.0R) and were rewritten as part of the
+  comment truth-up above; the tool's staleness census then exits 0. The
+  historical `FIX (v5.62)` markers that remain are exempt by design and are
+  intentionally preserved, with :229 truth-up'd because its old text asserted
+  that the trail arms at +1.0R "no longer".
+
+GATES
+
+  * build_check.ps1 : 0 errors / 0 warnings, GATE PASSED, headers verified from
+    the staging tree (253582-byte binary).
+  * test_v563_trail_health.py 115/115 | _mutate_v563.py 27/27 caught |
+    test_v52x_pyramid.py 135/135 | test_v527_exit_comment.py 60/60 |
+    test_v546_risk_isolation.py PASS | _mutate_ms_milestones.py 14/14 caught |
+    _mutate_v532_pyramid.py 44/44 caught | _mutate_v533_adoptmanual.py PASS.
+  * Census 24 GREEN / 4 RED across the test_* probes (28 GREEN / 6 RED counting
+    the _mutate_* harnesses). The four reds are pre-existing and identical to
+    the v5.62 baseline: test_v528_hotfix 57/68, test_v531_smart_trim 15/38,
+    test_v532_hightable 125/135 (all 10 [FAIL] in the unchanged trim silo),
+    test_v543_session 27/29. _mutate_v531.py and _mutate_v532.py abort on that
+    pre-existing red baseline at HEAD as well -- verified by stashing this
+    release and re-running them. No new red, no green-count drop.
+  * Encoding: normalize_eol.py . --check rewritten 0, strict CRLF preserved on
+    all 11 shipped sources.
+
+KNOWN RED, OUT OF SCOPE
+
+  * AuditTrimHealth repair (the 10 [FAIL] in the trim silo).
+  * The floating-loss trim silo's disagreement with AuditTrimHealth.
+  * NY-DST session helpers (test_v543_session).
+  * The v5.543 cancel-write count.
+  * _mutate_v531.py / _mutate_v532.py, both gated behind those probes.
+
+ROLLBACK
+
+  pre-commit : git checkout -- OttoDefines.mqh COttoTradeManager.mqh
+                             CHighTableAuditor.mqh otto.mq5 README.md
+                             COttoBlockManager.mqh COttoCorrelationFilter.mqh
+                             COttoJournal.mqh COttoMarketStructure.mqh
+                             COttoNewsFilter.mqh COttoOrderManager.mqh
+                             COttoRiskManager.mqh
+                             _probe/test_v52x_pyramid.py
+                             _probe/test_v563_trail_health.py
+                             _probe/_mutate_v563.py
+                             _tools/_commit563.txt
+  post-commit: git reset --soft HEAD~1
+
