@@ -183,8 +183,12 @@ MUTATIONS = [
      "         if(false)   // MUTANT: every leg on the symbol counts"),
 
     ("the sweep drops its grace period and cries wolf on every entry", AUD,
-     "         if(opened > 0 && TimeCurrent() - opened < HT_ORPHAN_GRACE_SECONDS) continue;",
-     "         ;   // MUTANT: no grace period"),
+     "         if(opened > 0 && TimeCurrent() - opened < HT_ORPHAN_GRACE_SECONDS) continue;\n"
+     "\n"
+     "         n++;",
+     "         ;   // MUTANT: no grace period\n"
+     "\n"
+     "         n++;"),
 
     ("the orphan latch is never re-armed, so the second incident is silent", AUD,
      "         ClearLatch(m_alertSent_OrphanLeg);\n"
@@ -192,9 +196,9 @@ MUTATIONS = [
      "         return;   // MUTANT: latch stays raised"),
 
     ("an unprotected leg is downgraded from CRITICAL to WARN", AUD,
-     "                        \" restart mid-repair.\",\n"
+     "                        \" refused log lines) or a restart mid-repair.\",\n"
      "                        HT_SEV_CRITICAL);",
-     "                        \" restart mid-repair.\",\n"
+     "                        \" refused log lines) or a restart mid-repair.\",\n"
      "                        HT_SEV_WARN);"),
 ]
 

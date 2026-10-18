@@ -199,7 +199,9 @@ MUTATIONS = [
 
     ("D3 TrackedBasketStillOpen reverts to a magic filter, so it can never "
      "see the adopted leg", ORD,
+     "         if(m_basket[i].ticket <= 0) continue;\n"
      "         if(!PositionSelectByTicket(m_basket[i].ticket)) continue;",
+     "         if(m_basket[i].ticket <= 0) continue;\n"
      "         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;\n"
      "         if(!PositionSelectByTicket(m_basket[i].ticket)) continue;"),
 

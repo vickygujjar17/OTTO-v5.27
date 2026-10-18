@@ -1,0 +1,52 @@
+merge: reconcile the v5.67/v5.68 lineages into one v5.68 release
+
+Two independent histories both claimed v5.67/v5.68. Neither was a superset,
+and neither could be discarded without losing a real fix, so this merge keeps
+the best of both and resolves the one genuine semantic collision by hand.
+
+TAKEN FROM THE REMOTE LINEAGE (feature/complete-continuation-pattern):
+  * the v5.67 journal correction -- the SUPPORT row printed "SL at Far Edge
+    + 1.0*ATR" for a stop that sits 1.0*ATR BELOW that edge. This was a real
+    bug in the local line; the probe now DERIVES the sign from CalcSLDistance()
+    (sl_offset_from_far_edge) instead of pinning a string, so the caption can
+    never drift from the geometry in silence again.
+  * the v5.68 High Table Auditor upgrade: ExpectedFloorRR() plus the
+    lagging-floor audit (HT_FLOOR_TOLERANCE_R, m_lagFloorSeen, WARN, resolved
+    highest-rung-first so a stop two rungs behind cannot hide), and the
+    restructured AuditTrailingHealth() whose "stopRR >= 0.0 -> healthy" pass is
+    gone -- a stop frozen at +0.01R no longer reads well forever.
+  * the retargeted _bump_probe.ps1, which derives current -> next from the
+    live stamp. The local copy still hardcoded 5.60 -> 5.61 and would have
+    DOWNGRADED the tree.
+
+TAKEN FROM THE LOCAL LINEAGE:
+  * the v5.68 census guard fix, which is the reason this release exists
+    (row_in_comment pre-check + narrow comment-history exemption).
+  * the v5.67 unified-stop repair: RepairUnifiedSL()/StageUnifiedRepair()
+    behind the one-way ratchet, so a leg the venue refused is retried out of
+    band instead of keeping its looser stop for the life of the basket.
+  * the v5.67 rung attribution in AuditRiskExposure: per-leg budget comes from
+    the leg's own rung (CommentTrancheTag/RungRiskPct) by RATIO, and the
+    aggregate allowance is built from the budgets of the legs actually at risk
+    rather than the full four-rung nominal stack, which the unified stop makes
+    unreachable. The remote still compared every leg against RiskPercent*1.5.
+
+THE COLLISION, RESOLVED BY HAND: both lineages independently discovered that
+no audit could see a leg running with NO stop. The remote implemented it inline
+in AuditStateConsistency (const helpers, magic-only, WARN, two-cycle confirm);
+the local one gave it its own body called from RunAudit (adopted-leg widening,
+grace period, CRITICAL). Shipping both would double-alert one fault, so the
+merged tree keeps ONE sweep -- the local contract, because it matches the
+scope AuditRiskExposure already uses and a 120s grace subsumes the two-cycle
+confirm -- while keeping the remote's FirstOrphanLegTicket() accessor for the
+alert text. m_orphanSeen is gone; a probe now asserts it cannot come back.
+
+VERIFICATION (all on the merged tree):
+  probes      26 green, 4 red at their exact documented baseline
+              (57/68, 15/38, 125/135, 27/29)
+  mutants     39/39, 30/30, 54/54, plus the five older suites -- 0 uncaught,
+              0 skipped. The four stale anchors this merge created were
+              re-anchored, not accepted as skips.
+  build       0 errors, 0 warnings (263150 bytes)
+  vercensus   every module at 5.68
+  EOL         rewritten=0

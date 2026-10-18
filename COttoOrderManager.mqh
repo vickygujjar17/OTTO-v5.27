@@ -147,6 +147,10 @@ private:
    bool                    m_unifiedRepairPending;
    int                     m_unifiedRepairAttempts;
    datetime                m_unifiedRepairNextTry;
+
+   //+------------------------------------------------------------------+
+   //| FIX 1: three-second OrderSend throttle                           |
+   //+------------------------------------------------------------------+
    bool                    CheckOrderTimeLock(void)
      {
       if(TimeCurrent() - m_lastOrderTime < 3)

@@ -670,10 +670,44 @@ check("the startup banner names the current release",
 print("\n-- 10. Journal & wick geometry sync --")
 
 check("the journal names the deep front-edge geometry, not the retired wording",
-      JRN_RAW.count("SUPPORT (Front-Run Breakdown / Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge + 1.0*ATR)") == 2 and
+      JRN_RAW.count("SUPPORT (Front-Run Breakdown / Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge - 1.0*ATR)") == 2 and
       JRN_RAW.count("RESISTANCE (Front-Run Breakout / Buy at Near Edge + 2.0*H + 1.5*ATR | SL at Far Edge + 1.0*ATR)") == 2,
       "S=%d R=%d" % (JRN_RAW.count("Sell at Near Edge - 2.0*H - 1.5*ATR"),
                      JRN_RAW.count("Buy at Near Edge + 2.0*H + 1.5*ATR")))
+# The printed SL offset is a DERIVED fact, not a caption. Nothing in the .mqh
+# ties the journal string to CalcSLDistance(), so the two can drift apart in
+# silence -- and did: v5.57..v5.66 printed "SL at Far Edge + 1.0*ATR" for a
+# SUPPORT block whose stop actually sits 1.0*ATR BELOW that far edge.
+def sl_offset_from_far_edge(bh, atr, is_long):
+    """Signed distance from the far edge to the stop, far edge pinned at 0.0.
+
+    LONG  (RESISTANCE): far edge is block.top    -> 0.0, near edge is -bh.
+                       entry = near + gap = -bh + 2.0*bh + 1.5*atr
+                       stop  = entry - slDist        ->  +1.0*atr
+    SHORT (SUPPORT)   : far edge is block.bottom -> 0.0, near edge is +bh.
+                       entry = near - gap = +bh - 2.0*bh - 1.5*atr
+                       stop  = entry + slDist        ->  -1.0*atr
+    slDist = bh + 0.5*atr cancels the blockHeight terms exactly, so the offset
+    is always one full ATR; only its SIGN follows the direction.
+    """
+    gap = 2.0 * bh + 1.5 * atr
+    sl = bh + 0.5 * atr
+    near = -bh if is_long else bh
+    entry = (near + gap) if is_long else (near - gap)
+    return (entry - sl) if is_long else (entry + sl)
+
+
+check("the stop lands exactly +/- 1.0*ATR from the far edge, sign by direction",
+      all(abs(sl_offset_from_far_edge(bh, atr, True) - atr) <= 1e-12 and
+          abs(sl_offset_from_far_edge(bh, atr, False) + atr) <= 1e-12
+          for bh, atr, _ in CASES))
+check("the journal prints that sign: SUPPORT stop BELOW the far edge (-), "
+      "RESISTANCE stop ABOVE it (+)",
+      "Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge - 1.0*ATR)" in JRN_RAW and
+      "Buy at Near Edge + 2.0*H + 1.5*ATR | SL at Far Edge + 1.0*ATR)" in JRN_RAW and
+      "Sell at Near Edge - 2.0*H - 1.5*ATR | SL at Far Edge + 1.0*ATR)" not in JRN_RAW)
+
+
 check("the armed header prints the deep gap, not the retired 0.5*ATR offset",
       JRN_RAW.count("(Front-Run: near edge +/- 2.0*H +/- 1.5*ATR)") == 1 and
       "near edge +/- 0.5*ATR" not in JRN_RAW)
