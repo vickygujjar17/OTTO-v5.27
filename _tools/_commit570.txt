@@ -1,0 +1,153 @@
+570: fix — make the High Table aggregate-risk ceiling config-proof
+
+RATIONALE
+
+  v5.63 added an aggregate leg to AuditRiskExposure: it sums the loss-side
+  percentage of every leg behind the shared stop and compares that sum against
+  the stacked design budget, so a pyramid that is correctly sized leg-by-leg but
+  over budget in total is still visible. That leg has one defect, and it is a
+  false-CRITICAL defect of exactly the kind v5.46 removed the MathAbs form to
+  avoid.
+
+  1. THE CEILING WAS NOT PROOF AGAINST ITS OWN INPUTS.
+
+     The budget was
+
+         double nominalStackPct    = RiskPercent + InpRiskT2Pct
+                                   + InpRiskT3Pct + InpRiskT4Pct;
+         double maxAllowedStackPct = nominalStackPct * 1.50;
+
+     The sum is only an upper bound while the tranche inputs are non-negative.
+     InpRiskT2Pct, InpRiskT3Pct and InpRiskT4Pct are operator inputs and are not
+     validated anywhere as a ladder: a zeroed, negative, or mis-typed set drives
+     the sum BELOW RiskPercent, and the ceiling then resolves UNDER the primary
+     rung. A plain single-leg basket trading at its own nominal risk reads above
+     that ceiling and trips the aggregate leg -- firing a WARN on the most
+     ordinary state the EA has, before any scale-in has ever happened. The check
+     meant to catch over-pyramiding would instead punish correct flat sizing.
+
+     The shipped defaults are 1.0 / 1.0 / 0.5 / 0.25, i.e. 2.75% nominal and
+     4.125% with the 50% tolerance, and they are safe. The bug is latent, not
+     active: it needs a bad config. Latent is not acceptable in a ceiling whose
+     entire job is to be an upper bound -- a guard that can be made to under-read
+     by the values it is guarding is not a guard.
+
+  2. THE SUM IS DELIBERATELY RETAINED.
+
+     The obvious "fix" is to drop the sum and test against RiskPercent alone, or
+     to test each rung against its own budget. Both were rejected. The sum IS the
+     pyramid's design ceiling -- 2.75% nominal, 4.125% with tolerance -- and a
+     correctly-sized full ladder sits exactly at it, so it never alerts. Dropping
+     it to a single-rung ceiling would alert WARN on every correctly-sized T1+T2
+     basket, converting a targeted detector into constant noise. The defect is
+     not that the sum is wrong; it is that the sum had no floor.
+
+     The fix floors it at the primary rung:
+
+         double maxAllowedStackPct = MathMax(nominalStackPct, RiskPercent) * 1.50;
+
+     Under every sane config nominalStackPct >= RiskPercent, so the floor is
+     INERT and the shipped ceiling is unchanged at 4.125% -- byte-for-byte the
+     same number v5.63 produced. It only binds when the ladder has been driven
+     below the primary rung, and it binds to the one value a single-leg basket
+     cannot exceed. This is a hardening, not a trade-character change: no entry,
+     no exit, no sizing and no position count moves.
+
+  3. MathMax TAKES TWO ARGUMENTS.
+
+     The release sketch spelled the bound with a four-argument MathMax. MQL5
+     declares `double MathMax(double value1, double value2);`, so that form does
+     not compile, and all 17 pre-existing call sites in this tree pass two args.
+     The two-operand floor above is the compiling equivalent, and the arity is
+     now stated in the doc box at the anchor so the mistake is not repeated.
+
+  4. SCOPE.
+
+     The other three items from the sketch were verified ALREADY SHIPPED in
+     52d1c38 and are untouched here:
+
+       * the deep front-edge entry geometry (near edge -/+ 2.0*H +/- 1.5*ATR),
+         pinned by test_v557_frontrun.py:723/724;
+       * the decoupled break veto anchored on the physical far edge,
+         COttoBlockManager.mqh:731-734;
+       * the journal actionDesc strings, pinned at the same probe lines.
+
+     The journal strings were left verbatim. "SL 1R above/below entry" is
+     factually correct -- CalcSLDistance is blockHeight + 0.5*atr, which is 1R by
+     construction -- and dropping the "1R" would orphan the pin and make a true
+     statement vaguer. No blueprint file exists in the tree; the sketch was the
+     only source, and it was not a wording change.
+
+     So v5.70 is a small hardening release carrying one line of shipped logic.
+
+
+CHANGES
+
+  CHighTableAuditor.mqh
+    * maxAllowedStackPct floored at RiskPercent, tolerance retained.
+    * nominalStackPct left exactly as-is, so the "summed budget" assertion and
+      the hardcoded-sum mutation keep their anchors.
+    * Doc box gains a v5.70 paragraph: the sum is retained, the ceiling is
+      unchanged at 2.75% / 4.125%, the floor binds only on a degenerate ladder,
+      and MathMax is binary.
+    * The v5.68 paragraphs are left intact -- they still describe the shipped
+      geometry correctly, and their "sits exactly at it and never alerts" claim
+      remains true under this change.
+
+  _probe/test_v563_trail_health.py
+    * "keeps the same 50% tolerance" re-anchored to the MathMax form.
+    * New check: "the stacked sum is floored at the primary rung".
+    * Module docstring records the floor.
+
+  _probe/_mutate_v563.py
+    * "loses the 50% tolerance" retargeted to the new literal (drops * 1.50).
+    * New mutation "loses its primary-rung floor" restores the bare sum, so the
+      exact bug this release fixes is now a test case.
+    * Mutation count 38 -> 39; docstring bullet list updated to match. The
+      harness FAILS on a skipped anchor, so the table cannot rot silently.
+
+  Version census: 20 human-facing rows bumped 5.69 -> 5.70 by
+  _tools/_bump_version.py (11 headers + otto.mq5 banner/Print + 4 input groups
+  + OttoDefines banner/description + README). Guard reports "no v5.69 literal
+  remains in the shipped sources or docs".
+
+GATES
+
+  * build_check.ps1 : 0 errors / 0 warnings, GATE PASSED, headers verified from
+    the staging tree (binary 258288 bytes). Run AFTER the bump, so the version
+    rewrite and the MathMax change are both compile-verified.
+  * test_v563_trail_health.py : 165/165 (was 164/164). +1 check.
+  * _mutate_v563.py : 39/39 caught, 0 anchors skipped (was 38/38).
+  * test_v557_frontrun.py | test_v532_pyramid.py | test_v533_adoptmanual.py |
+    test_v530_price_guard.py | test_v526_vector.py | test_v52x_pyramid.py :
+    all GREEN.
+  * Full probe suite: 24 GREEN / 4 RED -- the SAME four reds and the SAME
+    counts as the v5.68/v5.69 baseline:
+        test_v528_hotfix      57 / 68
+        test_v531_smart_trim  15 / 38
+        test_v532_hightable  126 / 136
+        test_v543_session     27 / 29
+    No new red, no count drift.
+  * _vercensus.py : all 20 rows resolve at 5.70.
+  * normalize_eol.py --check : rewritten=0, strict CRLF preserved.
+  * verify_integrity.py : fails BEFORE the commit by design (it compares the
+    worktree against the HEAD blob, so every edited file reports "content
+    differs from HEAD"). Its encoding columns -- HEAD vs worktree non-ASCII and
+    '?' counts -- are matched pairs on all 11 sources, i.e. no corruption was
+    introduced. Re-run after this commit to confirm MATCH.
+
+KNOWN RED, OUT OF SCOPE (identical to the v5.68/v5.69 baseline, none touched)
+
+  * AuditTrimHealth / WalkTrimLegs / TrimHeavyLosers / CountTrimCandidates --
+    referenced by test_v531_smart_trim and test_v532_hightable, defined nowhere
+    in the tree. The smart-trim silo was never shipped.
+  * NY-DST session helpers -- test_v528_hotfix, 0 tree hits.
+  * The v5.543 cancel-write count: the probe expects four save/restore pairs,
+    the source has two.
+
+ROLLBACK
+
+  Single-commit revert. The shipped change is one line plus its comment; the
+  probes and the version stamps revert with it. Reverting restores the unfloored
+  ceiling -- safe under the shipped defaults, and the latent false-CRITICAL
+  returns only for a degenerate tranche config.

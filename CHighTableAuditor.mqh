@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.69"
+#property version   "5.70"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -1348,6 +1348,20 @@ public:
    //| wide the entry gap is. A correctly-sized scale-in therefore reads  |
    //| at its nominal rung and can never false-alarm here, while a real   |
    //| sizing bug still does.                                             |
+   //|                                                                    |
+   //| v5.70 FLOORS THE STACKED BUDGET AT RiskPercent. The sum above is   |
+   //| RETAINED -- it is the ceiling the pyramid was designed against     |
+   //| (2.75% nominal, 4.125% with tolerance), so a correctly-sized ladder|
+   //| still sits exactly at it and still never alerts. The floor exists  |
+   //| for the degenerate case: InpRiskT2Pct/T3Pct/T4Pct are operator     |
+   //| inputs, and a zeroed or negative ladder would drive the sum BELOW  |
+   //| the primary rung, resolving the ceiling under RiskPercent so that a|
+   //| plain single-leg basket trips this leg before any scale-in. The    |
+   //| bound is MathMax(nominalStackPct, RiskPercent) * 1.50, which is    |
+   //| IDENTICAL to the v5.63 value whenever the tranche inputs are       |
+   //| non-negative and never under-reads either. (MathMax takes exactly  |
+   //| two arguments in MQL5, hence the two-operand floor rather than the |
+   //| four-argument form.)                                               |
    //+------------------------------------------------------------------+
    void              AuditRiskExposure(void)
      {
@@ -1440,7 +1454,12 @@ public:
       // before its stop is pushed reads high for one cycle, and that is the
       // normal shape of a fill rather than an incident.
       double nominalStackPct    = RiskPercent + InpRiskT2Pct + InpRiskT3Pct + InpRiskT4Pct;
-      double maxAllowedStackPct = nominalStackPct * 1.50;
+      // v5.70: floor the design sum at the primary rung. The sum is only an
+      // upper bound while the tranche inputs are positive -- a zeroed or
+      // inverted InpRiskT2Pct/T3/T4 would resolve the ceiling BELOW
+      // RiskPercent and trip this leg on a plain single-leg basket. The floor
+      // is inert under every sane config, so the shipped ladder is unaffected.
+      double maxAllowedStackPct = MathMax(nominalStackPct, RiskPercent) * 1.50;
       if(sumRiskPct > maxAllowedStackPct)
         {
          if(m_aggRiskSeen)

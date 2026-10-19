@@ -20,6 +20,7 @@ while "simplifying" the release, not as arbitrary corruption:
   * dropping the two-cycle confirmation on the aggregate leg
   * widening the per-leg sum to include profit-side legs
   * hardcoding the stacked budget instead of summing the live inputs
+  * dropping the v5.70 primary-rung floor so a zeroed ladder under-reads
   * dropping the geometry push, or gating it on the wrong branch
 
 Anchors are written with plain \\n and applied CRLF-tolerantly, so this table
@@ -206,8 +207,12 @@ MUTATIONS += [
      "      double nominalStackPct    = 2.75;"),
 
     ("the aggregate allowance loses the 50% tolerance", AUD,
-     "      double maxAllowedStackPct = nominalStackPct * 1.50;",
-     "      double maxAllowedStackPct = nominalStackPct;"),
+     "      double maxAllowedStackPct = MathMax(nominalStackPct, RiskPercent) * 1.50;",
+     "      double maxAllowedStackPct = MathMax(nominalStackPct, RiskPercent);"),
+
+    ("the aggregate allowance loses its primary-rung floor", AUD,
+     "      double maxAllowedStackPct = MathMax(nominalStackPct, RiskPercent) * 1.50;",
+     "      double maxAllowedStackPct = nominalStackPct * 1.50;"),
 
     ("the aggregate two-cycle confirmation is dropped", AUD,
      "         if(m_aggRiskSeen)\n"

@@ -35,7 +35,9 @@ B. CHighTableAuditor gains AuditTrailingHealth() plus an aggregate
 
    The aggregate leg exists because peakRiskPct is blind to how many legs are
    stacked behind the shared stop: four legs each inside their own budget can
-   still sum past the stacked-pyramid design.
+   still sum past the stacked-pyramid design. v5.70 floors that sum at
+   RiskPercent, so a degenerate tranche config cannot resolve the ceiling
+   below the primary rung.
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -452,8 +454,14 @@ check("the sum starts at zero before the loop",
 check("the stacked budget is the SUM of the four nominal rung risks",
       re.search(r"nominalStackPct\s*=\s*RiskPercent\s*\+\s*InpRiskT2Pct\s*\+"
                 r"\s*InpRiskT3Pct\s*\+\s*InpRiskT4Pct\s*;", RISK_C) is not None)
-check("the stacked allowance keeps the same 50% tolerance",
-      re.search(r"maxAllowedStackPct\s*=\s*nominalStackPct\s*\*\s*1\.50", RISK_C)
+# v5.70: the sum is floored at the primary rung before the tolerance is
+# applied, so a zeroed or inverted tranche config cannot resolve the ceiling
+# BELOW RiskPercent and trip the leg on a plain single-leg basket.
+check("the stacked sum is floored at the primary rung",
+      re.search(r"MathMax\(\s*nominalStackPct\s*,\s*RiskPercent\s*\)", RISK_C)
+      is not None)
+check("the floored allowance keeps the same 50% tolerance",
+      re.search(r"maxAllowedStackPct\s*=\s*MathMax\([^)]*\)\s*\*\s*1\.50", RISK_C)
       is not None)
 check("the aggregate test is strictly greater-than, like the per-leg one",
       re.search(r"if\s*\(\s*sumRiskPct\s*>\s*maxAllowedStackPct\s*\)", RISK_C)
