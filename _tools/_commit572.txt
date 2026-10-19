@@ -1,0 +1,178 @@
+572: feat — strict limit-only execution: retire the virtual fallback
+
+RATIONALE
+
+  Since v5.37 this EA has carried TWO execution engines. A setup whose
+  front-edge entry was legal for a pending order RESTED at the broker
+  (ROUTE A, physical). A setup whose price had already run through the entry
+  was held in memory as an SVirtualOrder and fired as a TRADE_ACTION_DEAL
+  MARKET order the instant price crossed the trigger (ROUTE B, virtual). A
+  refused ROUTE A send fell through to ROUTE B as well.
+
+  v5.69 made ROUTE A the ordinary case by moving the entry to the near side of
+  the zone. That left ROUTE B as a fallback that could only ever fire in the
+  one situation it must not:
+
+      price has ALREADY gapped through the entry.
+
+  The setup's own premise is "fill on the pullback back through the near
+  edge". A gap through that level is the state in which the premise is
+  invalidated -- and the fallback's response was to buy the far side of the
+  move at market and report it as a normal continuation fill. Recording a
+  worse entry as if it were the intended one is precisely the failure mode a
+  limit order exists to prevent.
+
+  This release removes the engine rather than gating it. There is no input, no
+  switch and no "safe mode": an entry is a resting broker limit or it does not
+  happen.
+
+WHY THE FALLBACK DID NOT SURVIVE THE GEOMETRY CHANGE
+
+  Before v5.69 the entry sat BEYOND the far edge as a breakout, so "price has
+  already passed the entry" was the NORMAL arm-time state and the virtual arm
+  was the primary path -- the limit existed for the rare tick that happened to
+  reach the level late. v5.69 inverted that: the entry is now 2.0*blockHeight +
+  1.5*ATR on the opposite side of the zone, below the market for a LONG and
+  above it for a SHORT, which is exactly where a BUY_LIMIT / SELL_LIMIT is
+  legal. The physical route therefore carries the ordinary case, and the
+  fallback's trigger condition became synonymous with "this setup has already
+  failed its own premise".
+
+  A route whose only remaining firing condition is a failed premise is not a
+  fallback. It is a mechanism for converting missed trades into worse ones.
+
+WHAT IS REMOVED
+
+    SVirtualOrder, m_virtualOrders[], m_virtualCount
+    CheckVirtualTriggers()            and its Update() hook
+    VirtualArmGvName()                (v5.49 cross-chart arm lock)
+    ReleaseAllVirtualArmLocks()       (ditto)
+    RemoveVirtualOrderAt()            and all eight element-removal sites
+    the Book-2 half of IsAnyOrderLiveAtPrice()
+    the "+ m_virtualCount" term of CountMyPendingOrders()
+    the virtual walks in CancelOrdersForInvalidBlocks(),
+      CancelOpposingConsensusOrders() and ManageDirectionConflict()
+    the virtual-book empties in the constructor, CancelAllPendingOrders()
+      and ClearBasket()
+
+  SeedActiveTradeFromBlock() also loses its overrideDir parameter: the MARKET
+  fire was its only caller, so the derived direction is the only path left.
+
+  The v5.49 cross-chart arm lock is removed WITH the engine that needed it. A
+  virtual arm lived only in the arming instance's memory, so two charts could
+  arm the same zone; a GlobalVariable was the shared artefact that stopped
+  them. A resting broker limit IS such an artefact -- the duplicate shield
+  reads it directly -- so ROUTE A never required the lock. Nothing else read
+  the name.
+
+WHY A NEW VETO REASON
+
+  A missed limit is not a broken block. VETO_BROKEN means the ZONE failed:
+  price closed back through the physical far edge. A missed limit means the
+  zone is intact and the ENTRY could not be placed -- either price had already
+  run through it, or the venue refused the resting send. Folding the two
+  together would have made the journal print "Block Broken" for a setup whose
+  block was never touched, which is a false statement about the pattern rather
+  than a shortcut in the code.
+
+  So ENUM_VETO_REASON gains VETO_LIMIT_MISSED, appended (never inserted --
+  enum values are persisted and compared), with rows in:
+    * VetoReasonString()               -> "LIMIT-MISSED"
+    * the journal cancelReason chain   -> "Limit Entry Missed (price through
+                                            entry)"
+  VETO_CORRELATION also gains its missing VetoReasonString row ("CORRELATION"):
+  it had been falling through to the "NONE" default since v5.26, so every
+  consensus veto printed as un-vetoed in the block log.
+
+WHAT A MISSED ENTRY NOW DOES
+
+  Both non-resting outcomes journal the setup's OWN session (save/restore, so a
+  live basket keeps the journal), latch the block vetoed with
+  VETO_LIMIT_MISSED, stamp deleteOnBarTime, and return false. No order send
+  follows. The distinction is preserved in the operator-facing text:
+
+    price through the entry -> "Limit Entry Missed: price already through <px>"
+    venue refused the send  -> "Broker Refused Limit Order: <reason> (Code: n)"
+
+THE JOURNAL NOW HAS ONE EXECUTION MODE
+
+  COttoJournal::LogSetupArmed() took a `physical` bool and printed
+  "PHYSICAL (Broker Limit Order)" or "VIRTUAL (In-Memory Arm)". With one route
+  left the parameter is dead weight, so it is removed and the mode is a
+  constant. The journal's Logic label, the session id minting, the one-email-
+  per-trade rule and the arm-is-silent rule (v5.42) are all untouched.
+
+OPERATOR NOTES
+
+  * BROKER-REFUSED LIMIT = NO POSITION. That is the intended trade-off. A
+    refusal is a venue statement that this order cannot sit there; the previous
+    behaviour turned it into a market entry at whatever price the next tick
+    offered. Anyone relying on the EA to "always get in" must stop.
+
+  * STALE GLOBAL VARIABLES. v5.37..v5.71 release builds published
+    "OTTO_V_ARM_<sym>_<serial>" into the terminal's GlobalVariable store.
+    Nothing reads those names any more, so they cannot suppress a setup, but
+    they will linger until deleted. A one-time F3 -> Global Variables cleanup is
+    the only action needed. A delete-on-init sweep was considered and rejected:
+    reinstating the naming convention in order to delete it would have kept the
+    convention alive for no behavioural gain.
+
+WHAT DOES NOT MOVE
+
+  Entry price (CalcEntryPrice), stop distance (CalcSLDistance), the far-edge
+  target anchor, the Front-Run veto and its anchor, the break veto on the
+  physical far edge, the pyramid ladder, the unified one-way ratchet, sizing,
+  the High Table auditor, the journal session ownership rules, and the fill
+  scanner's SAR / redundant-fill / adoption logic. The virtual fire had no
+  behaviour the physical fill path lacks: SAR reversal, redundant-fill close,
+  block retirement, basket seeding and the session hand-off all live in
+  CheckPendingOrderFills() and SeedActiveTradeFromBlock().
+
+PROBES
+
+  * test_v540_hybrid.py -- INVERTED. It used to require the virtual arm, the
+    MARKET fallback and the dual-book sweeps; it now requires their ABSENCE and
+    pins the two-veto router. It also carries the release's negative pin: no
+    `struct SVirtualOrder` anywhere in the tree, no virtual identifier in the
+    manager, no "VIRTUAL (In-Memory Arm)" journal mode.
+  * test_v539_rejection.py -- the terminal-rejection property moved off the
+    retired MARKET fire and onto the resting limit, where a refusal can now
+    actually occur.
+  * test_v541_sarfix.py  -- the physical guard is pinned as the ONLY reversal
+    guard instead of as a mirror of the virtual one.
+  * test_v543_session.py -- save/restore counts 2->1 (router) and 4->1 (cancel
+    sweep); the pre-send repoint property becomes "every LogSetupArmed call is
+    bracket-balanced".
+  * test_v547_filling.py -- chokepoint census 8 -> 7 (1 definition + 6 calls).
+  * test_v548_hourly.py  -- the report walks RESTING TICKETS on the block book
+    instead of the retired descriptors; each row now prints its ticket.
+  * test_v548_seed_dir.py -- overrideDir is pinned ABSENT; the seed census drops
+    to one definition + one call site.
+  * test_v557_frontrun.py -- the ATR-shift census drops 3 -> 2 and the cross
+    predicate becomes an absence pin; the far-edge target anchor is pinned on
+    the single surviving writer.
+  * test_v526_vector.py  -- "sweep releases the block ticket" is matched as a
+    regex, not a column-aligned literal. The retired virtual walk happened to be
+    the only site with single-space spacing, so the old pin was silently
+    tracking column alignment rather than the release.
+
+VERIFICATION
+
+  * _tools/_patch572.py -- 5 files, 47 asserted replacements, from a clean tree.
+  * _tools/_bump_version.py 5.72 -- 20 version rows; no v5.71 literal remains.
+  * build_check.ps1 -- 0 errors, 0 warnings (otto.ex5, 248856 bytes).
+  * test_v540_hybrid.py 48/48, v539 23/23, v541 14/14, v543 27/27,
+    v547 22/22, v548_hourly 48/48, v548_seed_dir 18/18, v557 118/118,
+    v526 83/83.
+  * Full probe suite -- identical to the v5.71 baseline: v528 57/68,
+    v531 15/38, v532 126/136, every other probe green. Those three partial
+    counts are pre-existing and unchanged by this commit.
+  * normalize_eol.py -- 11 files, 0 rewritten, strict CRLF.
+
+  No Strategy Tester run accompanies this commit. The claim that the physical
+  route carries the ordinary case rests on the v5.69 geometry (the entry is on
+  the limit side of the market at arm time) together with the router's
+  priceValid test, not on an observed arm-to-fill trace of a live session. It
+  is the same static-evidence standard the v5.66..v5.71 geometry arguments were
+  accepted on. What is NOT static is the trade-off itself: fewer fills, by
+  construction, in exchange for never paying the far side of a gap.

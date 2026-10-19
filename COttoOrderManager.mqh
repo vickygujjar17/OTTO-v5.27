@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.71"
+#property version   "5.72"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -58,30 +58,14 @@ private:
    bool                    m_adoptedManual;
    datetime                m_manualNoSLWarnTick;
 
-   // --- Virtual Order Engine (v5.37 Part 1) ---------------------------
-   // Armed setups are held in memory and executed as MARKET orders when price
-   // crosses the continuation level, bypassing broker pending-price rules.
-   // v5.69 makes this the FALLBACK path: the TRUE FRONT-EDGE entry sits on the
-   // NEAR side of the zone (below the market for a LONG, above it for a SHORT),
-   // so a broker BUY_LIMIT / SELL_LIMIT can legitimately rest there and the
-   // physical route carries the ordinary case. The virtual arm still exists for
-   // the tick where price has already run through the entry.
-   struct SVirtualOrder
-     {
-      int                  blockIndex;
-      int                  blockSerial;
-      ENUM_TRADE_DIRECTION direction;
-      double               triggerPrice;
-      double               stopLoss;
-      double               lotSize;
-      // v5.38: the per-setup journal session, minted when the setup is ARMED
-      // and reused at the fire path. Carrying it on the descriptor (rather
-      // than re-minting on each event) is what lets the arm snapshot, the
-      // fill, and the exit all land in ONE journal file per setup.
-      string               sessionId;
-     };
-   SVirtualOrder           m_virtualOrders[];
-   int                     m_virtualCount;
+   // --- Order execution: STRICT LIMIT-OR-NOTHING (v5.72) --------------
+   // v5.37..v5.71 held armed setups in memory (SVirtualOrder) and fired them
+   // as MARKET deals when price crossed the level. That engine is RETIRED, on
+   // purpose and without a switch: every entry must be a resting broker limit
+   // or nothing at all. An entry the broker cannot hold is a missed trade, and
+   // chasing it at market is the one outcome that turns a missed pullback into
+   // a fill at the far side of the move. There is therefore no in-memory order
+   // book, no cross test and no per-setup execution state declared here.
 
    // --- Statistics ---
    int                     m_ordersPlaced;
@@ -201,9 +185,10 @@ private:
    //| guard in PlaceOrArmOrder, so a field of that name would be       |
    //| shadowed at every call site.                                     |
    //|                                                                  |
-   //| v5.40: LIVE again. The hybrid router consumes this buffer to      |
-   //| decide whether an entry may REST at the broker (physical route)   |
-   //| or must arm virtually instead.                                    |
+   //| v5.72: LIVE, and it is the whole routing test. The strict limit   |
+   //| router consumes this buffer to decide whether the entry may REST  |
+   //| at the broker; when it may not, the setup is vetoed and no order  |
+   //| is sent.                                                          |
    //+------------------------------------------------------------------+
    double                  GetPriceBoundaryBuffer(void)
      {
@@ -218,9 +203,9 @@ private:
    //| SnapToTick — round a price onto the symbol's trade tick grid.    |
    //| A price that is off-grid is refused by the server with           |
    //| TRADE_RETCODE_INVALID_PRICE even when it sits on the correct     |
-   //| side of the market. Shared by the PlaceOrArmOrder pre-flight     |
-   //| snap and the SendOrderWithRetry re-quote path so the two grids   |
-   //| can never drift apart.                                           |
+   //| side of the market. Shared by the PlaceOrArmOrder entry snap     |
+   //| and the SendOrderWithRetry re-quote path so the two grids can    |
+   //| never drift apart.                                               |
    //+------------------------------------------------------------------+
    double                  SnapToTick(double price)
      {
@@ -297,43 +282,6 @@ private:
       if(GlobalVariableCheck(tName)) GlobalVariableDel(tName);
      }
 
-   //+------------------------------------------------------------------+
-   //| v5.49 — CROSS-CHART VIRTUAL ARM LOCK (Part 3).                   |
-   //|                                                                  |
-   //| ROUTE A (physical) is already cross-chart safe: a resting broker  |
-   //| limit is a shared, visible artefact, so two instances cannot both |
-   //| rest one at the same price. ROUTE B (virtual) is NOT — the armed  |
-   //| order lives only in this instance's m_virtualOrders[], so two     |
-   //| charts on the same symbol would each arm and fire the SAME setup. |
-   //|                                                                  |
-   //| The lock is published into the terminal's GlobalVariable store,   |
-   //| which every EA instance on the terminal shares. Keying it on      |
-   //| symbol + block.serial follows the BasketGvName() convention so all |
-   //| OTTO globals remain greppable under the OTTO_ prefix. The value   |
-   //| carries the trigger price for diagnostics only; presence of the   |
-   //| name is what gates the arm.                                      |
-   //|                                                                  |
-   //| The lock MUST be released on every path that retires a virtual    |
-   //| order or empties the book, otherwise a stale name would silently  |
-   //| suppress the next session's block of the same serial. Release happens |
-   //| in RemoveVirtualOrderAt() (all eight element-removal sites) and in |
-   //| ReleaseAllVirtualArmLocks() (the ArrayResize(...,0) paths).        |
-   //+------------------------------------------------------------------+
-   string                  VirtualArmGvName(int blockSerial)
-     {
-      return "OTTO_V_ARM_" + m_symbol + "_" + IntegerToString(blockSerial);
-     }
-
-   //| Drops every arm lock held by the current book. Used by the paths  |
-   //| that empty m_virtualOrders[] wholesale (deinit / DD halt / basket |
-   //| close), which never call RemoveVirtualOrderAt() per element and so |
-   //| would otherwise orphan their global variables in the terminal.    |
-   void                    ReleaseAllVirtualArmLocks(void)
-     {
-      for(int v = 0; v < m_virtualCount; v++)
-         if(m_virtualOrders[v].blockSerial > 0)
-            GlobalVariableDel(VirtualArmGvName(m_virtualOrders[v].blockSerial));
-     }
 
 
    double                  GetCurrentSpread(void)
@@ -389,11 +337,11 @@ private:
          attempts++;
          request.deviation = MaxSlippage;
          request.magic     = MagicNumber;
-         // v5.37 -- preserve a caller-supplied comment instead of
-         // unconditionally overwriting it. The virtual engine now stamps an
-         // R/C phase tag plus session ID on its request before calling here,
-         // and OrderSend() reads this field on every retry of the loop, so the
-         // guard must live inside the loop. Only a blank comment is defaulted.
+         // Preserve a caller-supplied comment instead of unconditionally
+         // overwriting it. Every order path stamps its own session/phase tag
+         // before calling here (v5.72: the resting limit is the ONLY entry
+         // path), and OrderSend() reads this field on every retry of the
+         // loop, so the guard lives INSIDE the loop. Blank is defaulted.
          if(request.comment == "")
             request.comment = BuildOrderComment(0, 0);
          // FIX (v5.47): filling mode is only meaningful for a MARKET Deal.
@@ -717,32 +665,26 @@ private:
 
 
 
-   //+------------------------------------------------------------------+
-   //| PlaceOrArmOrder — HYBRID ROUTER (v5.40). Translates Pine         |
-   //| strategy.entry(limit=...) into a resting BROKER limit when the   |
-   //| entry price is legal for a pending order, and into an in-memory  |
-   //| SVirtualOrder when price has already reached/through the zone.   |
-   //| NO take-profit is attached on either path (exact mirror: exits   |
-   //| are purely trail-based; localTP is stored on the block only for  |
-   //| the Front-Run veto). A physical fill is caught by                |
-   //| CheckPendingOrderFills(); a virtual arm fires its MARKET leg in  |
-   //| CheckVirtualTriggers() on the cross.                             |
-   //+------------------------------------------------------------------+
+   //| PlaceOrArmOrder - STRICT LIMIT ROUTER (v5.72). Translates Pine     |
+   //| strategy.entry(limit=...) into a resting BROKER limit and          |
+   //| nothing else. An entry that cannot legally rest is VETOED, never   |
+   //| executed at market: limit or nothing. NO take-profit is attached   |
+   //| (exact mirror: exits are purely trail-based; localTP is stored     |
+   //| on the block only for the Front-Run veto). A fill is caught by     |
+   //| CheckPendingOrderFills().                                          |
    // FIX (v5.57) FRONT-RUNNING ANTICIPATION: with InpEntryStyle = ENTRY_FRONT_EDGE
    // the entry sits on the NEAR side of the zone, 2.0*blockHeight + 1.5*ATR out
    // from the edge the arming close clears (v5.69: below the market for a LONG,
    // above it for a SHORT). That is a legal BUY_LIMIT / SELL_LIMIT, so the
-   // PHYSICAL rest is the ordinary path and the VIRTUAL arm is the fallback for
-   // a tick where price already ran through the entry. Either way the trigger
-   // is a MARKET deal when the level is crossed.
+   // PHYSICAL rest is the ordinary path - and, since v5.72, the only one.
    bool                    PlaceOrArmOrder(int blockIndex, SSniperBlock &block)
      {
       if(block.isVetoed || block.isTriggered || block.hasPlacedOrder)
          return false;
 
-      // Start from a clean ticket/pending state. The hybrid router decides
-      // BELOW whether to set a resting broker ticket (physical) or leave it
-      // 0 and register an in-memory SVirtualOrder (virtual).
+      // Start from a clean ticket/pending state. The router below decides
+      // whether the entry can legally REST; it never arms anything in memory,
+      // so a block that leaves this function with ticket 0 has no order.
       block.limitOrderTicket = 0;
       block.pendingOrderCancel = false;
 
@@ -807,12 +749,11 @@ private:
       // the target and the veto all resolve one risk distance.
       double slDist     = CalcSLDistance(block, atr);
 
-      // v5.40 — the duplicate shield and the physical-vs-virtual routing both
-      // live at the TAIL of this function, AFTER the risk sizing, so the router
-      // owns one coherent decision point. See "HYBRID ROUTER" below. The v5.28
-      // live-price pre-flight is NOT re-added here: the router decides legality
-      // itself (a legal price becomes a real broker limit, an illegal one arms
-      // virtually), so it can never dispatch a resting order the server refuses.
+      // v5.72 -- the duplicate shield and the resting-price test both live at
+      // the TAIL of this function, AFTER the risk sizing, so the router owns one
+      // coherent decision point. See "STRICT LIMIT ROUTER" below. A price that
+      // cannot rest is vetoed there and nothing is dispatched, so this function
+      // can never send a resting order the server is bound to refuse.
 
       // slDist was HOISTED above the v5.34 Part 3 shifted Phase 2 entry, which
       // consumed it; that shift is gone but the hoist stays: it is computed once
@@ -875,11 +816,11 @@ private:
       if(!m_riskManager.HasSufficientMargin(lotSize)) return false;
 
       // --- Mint the per-setup journal session (v5.38, reused v5.40) -------
-      // The setup gets ONE journal file the instant it is armed — physical or
-      // virtual — so the arm snapshot and the later fill/exit append into the
-      // same file instead of a re-minted session fragmenting the record. The
-      // id is carried on the BLOCK (v5.40) and the descriptor so the fill and
-      // cancel paths reuse the SAME id whichever route was taken.
+      // The setup gets ONE journal file the instant its limit is ACCEPTED by
+      // the broker, so the arm snapshot and the later fill/exit append into
+      // the same file instead of a re-minted session fragmenting the record.
+      // The id is carried on the BLOCK and reused by the fill and cancel
+      // paths, so ONE setup always maps to ONE journal file.
       MqlDateTime atm;
       TimeToStruct(TimeCurrent(), atm);
       string armSessionId = StringFormat("#OTTO-%s-%04d%02d%02d-%02d%02d%02d-BLK%d",
@@ -887,35 +828,32 @@ private:
                                          atm.hour, atm.min, atm.sec, block.serial);
 
       // ------------------------------------------------------------------
-      // HYBRID ROUTER (v5.40)
+      // STRICT LIMIT ROUTER (v5.72)
       // ------------------------------------------------------------------
-      // Decide ONCE, before any side effect, whether the entry can legally
-      // REST at the broker. A BUY_LIMIT must sit BELOW the market (ask) and a
-      // SELL_LIMIT ABOVE it (bid), each clearing the broker's stops/freeze
-      // boundary. When the price is still valid we send a real pending order
-      // (broker-side resting fill). When price has already reached/through the
-      // zone the resting form is illegal, so we ARM an in-memory virtual order
-      // and let CheckVirtualTriggers() fire it as a MARKET deal on the cross.
+      // There is exactly ONE way an entry can exist: a pending order resting at
+      // the broker. A BUY_LIMIT must sit BELOW the market (ask) and a SELL_LIMIT
+      // ABOVE it (bid), each clearing the broker's stops/freeze boundary. When
+      // that test fails the setup is VETOED as VETO_LIMIT_MISSED and nothing is
+      // sent -- v5.72 removed the in-memory fallback that used to fire a MARKET
+      // deal on the cross.
       //
-      // DEEP FRONT-EDGE NOTE (v5.69). With InpEntryStyle =
-      // ENTRY_FRONT_EDGE the entry is measured out from the NEAR edge by
-      // 2.0*blockHeight + 1.5*ATR and lands on the OPPOSITE side of the zone
-      // from the target: a Resistance LONG at b.bottom-gap (= b.top - bh -
-      // 1.5*ATR), a Support SHORT at b.top+gap (= b.bottom + bh + 1.5*ATR).
-      // At arm time the close has only just cleared the NEAR edge, so a LONG
-      // entry sits BELOW the market and a SHORT entry ABOVE it -- exactly the
-      // side a BUY_LIMIT / SELL_LIMIT must sit on. The limit test below is
-      // therefore TRUE in the ordinary case and the setup RESTS PHYSICALLY at
-      // the broker, filling on the pullback back through the near edge. The
-      // virtual route is the FALLBACK for the case where price has already
-      // run through the entry between the arming close and this call, and
-      // CheckVirtualTriggers() then fires it as a MARKET deal on the cross.
+      // DEEP FRONT-EDGE NOTE (v5.69). With InpEntryStyle = ENTRY_FRONT_EDGE the
+      // entry is measured out from the NEAR edge by 2.0*blockHeight + 1.5*ATR
+      // and lands on the OPPOSITE side of the zone from the target: a Resistance
+      // LONG at b.bottom-gap (= b.top - bh - 1.5*ATR), a Support SHORT at
+      // b.top+gap (= b.bottom + bh + 1.5*ATR). At arm time the close has only
+      // just cleared the NEAR edge, so a LONG entry sits BELOW the market and a
+      // SHORT entry ABOVE it -- exactly the side a BUY_LIMIT / SELL_LIMIT must
+      // sit on. The test below is therefore TRUE in the ordinary case and the
+      // setup RESTS PHYSICALLY at the broker, filling on the pullback back
+      // through the near edge.
+      //
       // The SL sits a full slDist behind the entry, and because the target is
       // still anchored on the FAR edge the realized multiple is exactly
-      // InpMaxRR + 3.0 (see CalcEntryPrice). The break veto is deliberately
-      // NOT anchored on this price: it stays on the physical far edge so the
-      // pending cannot be cancelled on the very close that armed it (v5.69
-      // decoupling, derived in ProcessBlocks).
+      // InpMaxRR + 3.0 (see CalcEntryPrice). The break veto is deliberately NOT
+      // anchored on this price: it stays on the physical far edge so the pending
+      // cannot be cancelled on the very close that armed it (v5.69 decoupling,
+      // derived in ProcessBlocks).
       double boundary = GetPriceBoundaryBuffer();
       bool   priceValid;
       if(isLong)
@@ -923,9 +861,9 @@ private:
       else
          priceValid = (entryPrice > GetAsk() + boundary);
 
-      // HARD ANTI-DUPLICATE: reject (latched) if an order — physical OR virtual
-      // — already sits at (near) this price. Closes the OnTick race and any
-      // bookkeeping write-back lag, independent of which route placed it.
+      // HARD ANTI-DUPLICATE: reject (latched) if an order already sits at
+      // (near) this price. Closes the OnTick race and any bookkeeping
+      // write-back lag between the send and the block write-back.
       if(IsAnyOrderLiveAtPrice(entryPrice, 5.0))
         {
          block.hasPlacedOrder = true;
@@ -992,7 +930,7 @@ private:
                // it -- that is the one-file-per-setup contract.
                string prevSession = m_sessionID;
                m_journal.SetSessionID(armSessionId);
-               m_journal.LogSetupArmed(true, block.tradeId, dir, block.type,
+               m_journal.LogSetupArmed(block.tradeId, dir, block.type,
                                        entryPrice, adjustedSL, lotSize, block);
                if(prevSession != "") m_journal.SetSessionID(prevSession);
               }
@@ -1007,103 +945,70 @@ private:
             return true;
            }
 
-         // The venue refused a RESTING send. This is exactly the class the
-         // router exists for (an off-grid / boundary price the server will not
-         // rest), so FALL BACK to the virtual arm rather than dropping the
-         // setup. Any other refusal falls back too — a virtual arm can still
-         // fire as a MARKET deal, so it is strictly more likely to trade.
+         // The venue refused the RESTING send. v5.71 fell through to a virtual
+         // arm here, i.e. a refused limit became a MARKET deal at whatever the
+         // book offered. v5.72 has no such fallback: the limit could not be
+         // held, so the entry is MISSED and the setup is retired with its own
+         // reason. Journal the refusal, veto, and send nothing else.
+         string refuseErr = GetTradeRetcodeString(result.retcode);
          if(EnableLogging)
-            Print("[OrderManager] PHYSICAL SEND REFUSED (retcode=", result.retcode, " ",
-                  GetTradeRetcodeString(result.retcode), ") — falling back to VIRTUAL arm");
+            Print("[OrderManager] RESTING SEND REFUSED (retcode=", result.retcode, " ",
+                  refuseErr, ") — entry missed, setup vetoed (limit-or-nothing)");
+         if(m_journal != NULL)
+           {
+            // Same save/restore contract as the success path above: a transient
+            // setup write must not steal the journal from a live basket.
+            string prevRefuse = m_sessionID;
+            m_journal.SetSessionID(armSessionId);
+            m_journal.LogCancellation("Broker Refused Limit Order: " + refuseErr +
+                                      " (Code: " + IntegerToString((long)result.retcode) + ")");
+            if(prevRefuse != "") m_journal.SetSessionID(prevRefuse);
+           }
          block.limitOrderTicket   = 0;
          block.pendingOrderCancel = false;
-         m_blockManager.SetBlockAt(blockIndex, block);
-         // fall through to the virtual arm below
-        }
-
-      // ---- ROUTE B: VIRTUAL — price already through the zone (or send refused)
-      // --- v5.49 CROSS-CHART VIRTUAL DUPLICATE SHIELD (Part 3) -----------
-      // ROUTE A is inherently cross-chart safe (a resting broker limit is a
-      // shared, visible artefact). A VIRTUAL arm is not: it lives only in this
-      // instance's memory, so a second chart on the same symbol would arm and
-      // fire the same zone in parallel. The terminal-wide GlobalVariable is
-      // that shared artefact for the virtual route. Checked AFTER ROUTE A has
-      // had its chance, so a physical send that succeeded above never reaches
-      // here and is never double-counted.
-      string virtualGvName = VirtualArmGvName(block.serial);
-      if(GlobalVariableCheck(virtualGvName))
-        {
-         if(EnableLogging)
-            Print("[OrderManager] Cross-Chart Shield: VIRTUAL arm for ", block.tradeId,
-                  " (serial ", block.serial, ") suppressed — another chart already holds ",
-                  virtualGvName, " @ ", DoubleToString(GlobalVariableGet(virtualGvName), _Digits));
-         // Mirror the duplicate shield: latch the block so this instance stops
-         // retrying it every tick, exactly as the hasPlacedOrder guard does.
-         block.hasPlacedOrder     = true;
-         block.limitOrderTicket   = 0;
-         block.pendingOrderCancel = false;
+         block.isVetoed           = true;
+         block.vetoReason         = VETO_LIMIT_MISSED;
+         block.deleteOnBarTime    = iTime(m_symbol, PERIOD_CURRENT, 0);
          m_blockManager.SetBlockAt(blockIndex, block);
          return false;
         }
 
-      SVirtualOrder vo;
-      vo.blockIndex   = blockIndex;
-      vo.blockSerial  = block.serial;
-      vo.direction    = dir;
-      vo.triggerPrice = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
-      vo.stopLoss     = NormalizeDouble(adjustedSL, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
-      vo.lotSize      = lotSize;
-      vo.sessionId    = armSessionId;
-
-      int vIdx = ArraySize(m_virtualOrders);
-      ArrayResize(m_virtualOrders, vIdx + 1);
-      m_virtualOrders[vIdx] = vo;
-      m_virtualCount = ArraySize(m_virtualOrders);
-
-      // v5.49 — publish the terminal-wide ARM LOCK for this zone. The stored
-      // value is the trigger price (diagnostics only). Set AFTER the book is
-      // committed so a lock is never held for an arm that failed to record.
-      GlobalVariableSet(virtualGvName, entryPrice);
-
-      // Optimistic lock to prevent concurrent tick duplicate firing
-      block.hasPlacedOrder     = true;
-      block.limitOrderTicket   = 0;
-      block.pendingOrderCancel = false;
-      block.sessionId          = armSessionId;   // v5.40: pin the setup journal
-      m_blockManager.SetBlockAt(blockIndex, block);
-
-      // --- JOURNAL: create the per-setup file at ARM time --------------
+      // ---- ROUTE B RETIRED (v5.72): the entry cannot legally rest --------
+      // priceValid was FALSE, so no BUY_LIMIT / SELL_LIMIT could sit where this
+      // setup needs its fill. v5.37..v5.71 armed an in-memory SVirtualOrder and
+      // fired a MARKET deal when price crossed the trigger -- i.e. it bought the
+      // one print that invalidates the idea. It is gone: veto the setup, journal
+      // the miss, and leave the book untouched. Limit or nothing.
+      if(EnableLogging)
+         Print("[OrderManager] LIMIT MISSED for block ", block.tradeId,
+               " at price ", DoubleToString(entryPrice, _Digits),
+               " (", (isLong ? "LONG needs BUY_LIMIT below " : "SHORT needs SELL_LIMIT above "),
+               DoubleToString(isLong ? GetBid() : GetAsk(), _Digits),
+               ") — price already through the entry, setup vetoed");
       if(m_journal != NULL)
         {
-         // v5.43 -- save/restore, exactly as ROUTE A above: leave the arm id
-         // resident only when no live basket owns the journal, so a later
-         // fill/cancel of a DIFFERENT setup cannot be logged into this file.
-         string prevSession = m_sessionID;
+         string prevMiss = m_sessionID;
          m_journal.SetSessionID(armSessionId);
-         m_journal.LogSetupArmed(false, block.tradeId, dir, block.type,
-                                 entryPrice, adjustedSL, lotSize, block);
-         if(prevSession != "") m_journal.SetSessionID(prevSession);
+         m_journal.LogCancellation("Limit Entry Missed: price already through " +
+                                   DoubleToString(entryPrice, _Digits));
+         if(prevMiss != "") m_journal.SetSessionID(prevMiss);
         }
-
-      if(EnableLogging)
-         Print("[OrderManager] VIRTUAL ORDER ARMED for block ", block.tradeId,
-               " at price ", DoubleToString(entryPrice, _Digits),
-               " sl=", DoubleToString(adjustedSL, _Digits),
-               " lot=", DoubleToString(lotSize, 2),
-               " rrUnit=", DoubleToString(slDist, _Digits),
-               " session=", armSessionId);
-      return true;
+      block.limitOrderTicket   = 0;
+      block.pendingOrderCancel = false;
+      block.isVetoed           = true;
+      block.vetoReason         = VETO_LIMIT_MISSED;
+      block.deleteOnBarTime    = iTime(m_symbol, PERIOD_CURRENT, 0);
+      m_blockManager.SetBlockAt(blockIndex, block);
+      return false;
      }
 
-
    //+------------------------------------------------------------------+
-   //| HARD ANTI-DUPLICATE (v5.40 hybrid): scans BOTH the broker's LIVE  |
-   //| pending-order pool AND our in-memory VIRTUAL ORDER BOOK for an    |
-   //| order sitting at (near) targetPrice. The router can place either  |
-   //| a physical limit or a virtual arm, so the duplicate source is now |
-   //| both books — this closes the OnTick race where a second tick re-  |
-   //| places a setup before the first is latched, whichever route won.  |
-   //+------------------------------------------------------------------+
+   //| HARD ANTI-DUPLICATE (v5.72): scans the broker's LIVE pending-      |
+   //| order pool for an order sitting at (near) targetPrice. With the    |
+   //| in-memory book retired, a broker pending is the ONLY thing that    |
+   //| can hold a price, so it is also the only duplicate source. This    |
+   //| closes the OnTick race where a second tick re-places a setup       |
+   //| before the first is latched.                                       |
    bool                    IsAnyOrderLiveAtPrice(double targetPrice, double tolerancePoints = 5.0)
      {
       double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
@@ -1132,13 +1037,6 @@ private:
            }
         }
 
-      // ---- Book 2: armed VIRTUAL orders (virtual route) ------------------
-      for(int v = m_virtualCount - 1; v >= 0; v--)
-        {
-         double trigger = m_virtualOrders[v].triggerPrice;
-         if(MathAbs(trigger - targetPrice) <= (tolerancePoints * unit))
-            return true; // Duplicate detected: armed virtual order already sits here
-        }
       return false;
      }
 
@@ -1347,13 +1245,11 @@ private:
       return count;
      }
 
-   //+------------------------------------------------------------------+
-   //| v5.40: the pending book is the HYBRID engine — resting BROKER     |
-   //| pending orders (physical route) PLUS armed in-memory virtual      |
-   //| orders (virtual route). Returns their combined count. Kept under  |
-   //| the old name so every existing caller (AdoptManualPosition()'s    |
-   //| gate, the EA's CountMyPending() wrapper) still reads a total.     |
-   //+------------------------------------------------------------------+
+   //| Count of THIS chart's resting broker pending orders. v5.72: the    |
+   //| in-memory virtual book is gone, so the broker pool is the whole    |
+   //| answer. Kept under the old name so every caller (AdoptManual-      |
+   //| Position()'s gate, the EA's CountMyPending() wrapper) reads the    |
+   //| same total it always did.                                          |
    int                     CountMyPendingOrders(void)
      {
       int count = 0;
@@ -1367,7 +1263,7 @@ private:
                count++;
            }
         }
-      return count + m_virtualCount;
+      return count;
      }
 
    //+------------------------------------------------------------------+
@@ -1518,8 +1414,8 @@ private:
          if(atr > 0)
          {
             // FIX (v5.60) de-duplicated onto the ONE stop-distance definition.
-            // Every other entry path (PlaceOrArmOrder, CheckVirtualTriggers)
-            // already calls CalcSLDistance(); only this SAR fallback re-spelled
+            // Every other entry path (PlaceOrArmOrder) already calls
+            // CalcSLDistance(); only this SAR fallback re-spelled
             // the arithmetic inline. The two spellings agreed numerically, but a
             // future edit to the helper would have diverged this stop ALONE --
             // and with it the whole reversal basket's 1R basis, its pyramid
@@ -1646,20 +1542,17 @@ private:
    //+------------------------------------------------------------------+
    //| Fills SActiveTrade from a FILLED BLOCK (Pine: active_* = b.local_*)|
    //+------------------------------------------------------------------+
-   void                    SeedActiveTradeFromBlock(const SSniperBlock &block, ulong positionTicket,
-                                                     ENUM_TRADE_DIRECTION overrideDir = DIR_NONE)
+   void                    SeedActiveTradeFromBlock(const SSniperBlock &block, ulong positionTicket)
      {
       if(!PositionSelectByTicket(positionTicket)) return;
       m_activeTrade.ticket       = positionTicket;
-      // The direction this basket is seeded with. v5.52 makes the default path
-      // trivially correct: GetDirectionForBlock() is UNCONDITIONAL on the zone
-      // type alone, so it resolves the SAME side the MARKET order executed no
-      // matter what the fill changed on the block. overrideDir is kept as
-      // belt-and-braces -- the virtual fire already knows the exact side it
-      // sent, so passing it costs nothing and cannot desync the trail, the 1R
-      // basis, the journal or the High Table mirror for the leg.
-      m_activeTrade.direction    = (overrideDir != DIR_NONE) ? overrideDir
-                                                             : GetDirectionForBlock(block);
+      // The direction this basket is seeded with. GetDirectionForBlock() is
+      // UNCONDITIONAL on the zone type alone, so it resolves the SAME side the
+      // resting limit was placed on. v5.72 removed the overrideDir parameter
+      // with its only caller (the virtual MARKET fire): a limit fill is a
+      // broker event on a block whose side never moves, so a derived side
+      // cannot lag the fill.
+      m_activeTrade.direction    = GetDirectionForBlock(block);
       m_activeTrade.entryPrice   = block.localEntry;
       m_activeTrade.initialSL    = block.localSL;
       m_activeTrade.initialSLDistance = MathAbs(block.localEntry - block.localSL);
@@ -1825,28 +1718,6 @@ private:
      }
 
 
-   //+------------------------------------------------------------------+
-   //| Removes a virtual order (v5.37 Part 2). Compacts the array in   |
-   //| place, exactly as COttoBlockManager::RemoveBlock() does, so the |
-   //| reverse-walk in CheckVirtualTriggers() stays index-safe.        |
-   //|                                                                  |
-   //| v5.49: also releases the zone's terminal-wide ARM LOCK. Doing it |
-   //| HERE rather than at each call site is deliberate — eight separate |
-   //| paths retire a virtual order, and a single missed release would   |
-   //| leave a stale global that silently suppresses the next session's  |
-   //| block of the same serial. The serial is read BEFORE the in-place  |
-   //| compaction below shifts it away.                                  |
-   //+------------------------------------------------------------------+
-   void                    RemoveVirtualOrderAt(int index)
-     {
-      if(index < 0 || index >= m_virtualCount) return;
-      if(m_virtualOrders[index].blockSerial > 0)
-         GlobalVariableDel(VirtualArmGvName(m_virtualOrders[index].blockSerial));
-      for(int i = index; i < m_virtualCount - 1; i++)
-         m_virtualOrders[i] = m_virtualOrders[i + 1];
-      m_virtualCount--;
-      ArrayResize(m_virtualOrders, m_virtualCount, 3);
-     }
 
    //+------------------------------------------------------------------+
    //| v5.48 — HOURLY STATUS REPORT (gate)                              |
@@ -1992,24 +1863,26 @@ private:
          s += "    Adopted manual: " + (m_adoptedManual ? "YES" : "NO") + "\n";
         }
       s += "  Open pendings   : " + IntegerToString(CountMyPendingOrders()) +
-           " (broker + virtual)\n";
+           " (resting broker limits)\n";
       s += "  Armed blocks    : " + IntegerToString(CountArmedBlocks()) + "\n";
-      // v5.51 Part 3 -- R/C PHASE TAG (hourly report). v5.52 made every armed
-      // setup a CONTINUATION, so there is no phase left to discriminate on and
-      // the report opens with one constant label. The per-serial walk is kept
-      // because it proves each armed order still resolves to a live block.
-      for(int v = 0; v < m_virtualCount; v++)
+      // v5.72 -- walk the RESTING LIMITS. With the in-memory book retired, a
+      // live setup is exactly a block holding a broker ticket, so the report
+      // reads that ticket instead of a descriptor. The v5.51/v5.52 property is
+      // unchanged: every armed order must still resolve to a live block, and an
+      // unresolved one degrades to a VISIBLE UNKNOWN rather than a blank.
+      int hTotal = m_blockManager.GetBlockCount();
+      for(int h = 0; h < hTotal; h++)
         {
-         int vs   = m_virtualOrders[v].blockSerial;
-         int bIdx = m_blockManager.FindBlockIndexBySerial(vs);
          SSniperBlock b;
+         if(!m_blockManager.GetBlockAt(h, b)) continue;
+         if(b.limitOrderTicket <= 0) continue;
          // Unresolved block -> a VISIBLE UNKNOWN, never a blank or a guess.
          string phaseLabel = "UNKNOWN";
-         if(bIdx >= 0 && m_blockManager.GetBlockAt(bIdx, b))
-            phaseLabel = "C (Continuation)";
-         s += "    Setup #" + IntegerToString(vs) + " " +
-              (m_virtualOrders[v].direction == DIR_LONG ? "LONG" : "SHORT") +
-              " | Phase : " + phaseLabel + "\n";
+         if(!b.isVetoed && !b.isTriggered) phaseLabel = "C (Continuation)";
+         s += "    Setup #" + IntegerToString(b.serial) + " " +
+               (GetDirectionForBlock(b) == DIR_LONG ? "LONG" : "SHORT") +
+               " | Phase : " + phaseLabel +
+               " | Ticket: #" + IntegerToString((long)b.limitOrderTicket) + "\n";
         }
       s += "  Basket tranches : " + IntegerToString(m_basketCount) + "\n";
       s += "  Session         : " + (m_sessionID == "" ? "(flat)" : m_sessionID) + "\n";
@@ -2045,11 +1918,12 @@ private:
    //|                                                                  |
    //| A block is ARMED when it has passed its gates and is waiting on   |
    //| price -- but NOT once it is vetoed, triggered or already retired. |
-   //| This is the "how many live setups do I have" number, which the    |
-   //| pending-order count alone cannot answer: a virtual order is armed |
-   //| before it ever produces a broker row, and a physical one keeps a  |
-   //| row that already exists. Counted here rather than read off        |
-   //| CountMyPendingOrders() so the two agree by construction.          |
+   //| This is the "how many live setups do I have" number. v5.72: a     |
+   //| live setup is a block whose limit the broker ACCEPTED, so this    |
+   //| counts armed blocks while CountMyPendingOrders() counts the       |
+   //| resting broker rows they produced -- the two agree by             |
+   //| construction, because every arm attempt now ends either in a      |
+   //| resting ticket or in VETO_LIMIT_MISSED.                          |
    //+------------------------------------------------------------------+
    int                     CountArmedBlocks(void)
      {
@@ -2101,21 +1975,9 @@ public:
       m_sessionSL      = 0.0;
       m_adoptedManual  = false;
       m_manualNoSLWarnTick = 0;
-      // v5.49: the book is about to be dropped wholesale, so release the
-      // cross-chart arm locks it holds before the descriptors vanish.
-      ReleaseAllVirtualArmLocks();
-      m_virtualCount   = 0;
-      ArrayResize(m_virtualOrders, 0);
-
+      // v5.72: there is no in-memory book and no terminal-wide arm lock to
+      // seed or release -- a resting broker limit IS the cross-chart artefact.
      }
-
-   // v5.49: true teardown. The book may still hold armed zones when the
-   // instance is torn down (parameter change / recompile), so their
-   // terminal-wide arm locks are released here. Left behind, a stale
-   // "OTTO_V_ARM_<sym>_<serial>" would suppress the next session's block of
-   // the same serial, because GVs outlive the EA and the serial counter
-   // reseeds at 0 on re-init.
-                    ~COttoOrderManager(void) { ReleaseAllVirtualArmLocks(); }
 
    //+------------------------------------------------------------------+
    //| Initialize                                                        |
@@ -2459,25 +2321,22 @@ public:
      }
 
    //+------------------------------------------------------------------+
-   //| Main update — hourly report + reversal completion + physical fill |
-   //| scan + virtual trigger.                                          |
+   //| Main update — hourly report + reversal completion + fill scan.    |
+   //| v5.72: the virtual trigger stage is GONE with its engine, so a    |
+   //| fill can only arrive as a broker event on a resting limit.        |
    //+------------------------------------------------------------------+
    void              Update(void)
      {
       // v5.48: FIRST, so the hourly report describes the state at the top of
-      // the tick -- before CompleteReversal() and the two fill scans mutate
-      // the book underneath it. The gate is a timestamp comparison, so this
-      // costs nothing on the ticks that are not due.
+      // the tick -- before CompleteReversal() and the fill scan mutate the
+      // book underneath it. The gate is a timestamp comparison, so this costs
+      // nothing on the ticks that are not due.
       EmitHourlyStatusReportIfDue();
       CompleteReversal();
-      // v5.40: the PHYSICAL route rests a real broker limit, so a fill is a
-      // broker event, not a memory trigger — scan for it first. Recovers the
-      // pre-v5.37 CheckPendingOrderFills() contract.
+      // v5.40: the entry rests a real broker limit, so a fill is a broker
+      // event, not a memory trigger -- scan for it. Since v5.72 this is the
+      // ONLY fill path: an entry that never rested was vetoed at arm time.
       CheckPendingOrderFills();
-      // v5.37 Part 3: fire any armed VIRTUAL order whose level the live market
-      // has reached. This is the execution half of the in-memory engine whose
-      // ARM half is PlaceOrArmOrder().
-      CheckVirtualTriggers();
       // v5.33: LAST, so an EA fill detected in this same tick becomes the
       // primary first and AdoptManualPosition()'s one-basket-at-a-time gate
       // then refuses. Called every tick; the gates above are pure reads and
@@ -2486,11 +2345,11 @@ public:
      }
 
    //+------------------------------------------------------------------+
-   //| PINE ORDER PLACEMENT — for every armed, non-vetoed, non-        |
-   //| triggered, not-yet-placed block, apply the Pine gates and route  |
-   //| it through the HYBRID engine: a resting broker limit when the    |
-   //| price is valid, else an in-memory virtual order. Called from     |
-   //| OnTick (hasPlacedOrder prevents duplicates).                     |
+   //| PINE ORDER PLACEMENT — for every armed, non-vetoed, non-         |
+   //| triggered, not-yet-placed block, apply the Pine gates and route   |
+   //| it through the STRICT LIMIT router: a resting broker limit, or a  |
+   //| VETO_LIMIT_MISSED when the price cannot legally rest. Called from |
+   //| OnTick (hasPlacedOrder prevents duplicates).                      |
    //+------------------------------------------------------------------+
    void              PlaceOrdersForArmedBlocks(void)
      {
@@ -2506,11 +2365,10 @@ public:
             blocks[i].hasPlacedOrder || blocks[i].limitOrderTicket > 0)
             continue;
 
-         // v5.52: EVERY armed block routes through PlaceOrArmOrder(), which
-         // picks PHYSICAL (broker limit) vs VIRTUAL (CheckVirtualTriggers fires
-         // the MARKET leg on the cross) per setup by live-price validity. With
-         // the two-phase engine gone there is no Phase 2 to shift, so this is
-         // the single, phase-free execution path for every armed block.
+         // v5.72: EVERY armed block routes through PlaceOrArmOrder(), which
+         // either RESTS a broker limit or vetoes the setup as VETO_LIMIT_MISSED.
+         // With the two-phase engine gone there is no Phase 2 to shift either,
+         // so this is the single, phase-free execution path for every block.
 
          // STACKED / OVERLAPPING BLOCK LOCKOUT — skip if an older active
          // primary block of the same type is within 3.0*ATR (keep disarmed).
@@ -2522,13 +2380,13 @@ public:
      }
 
    //+------------------------------------------------------------------+
-   //| v5.40 — PHYSICAL FILL SCANNER (recovered from pre-v5.37).        |
-   //| The hybrid router may rest a real broker limit order. When one    |
-   //| fills, the broker removes the pending and opens a position whose  |
-   //| ticket is UNRELATED, so resolve it via the 3-tier detector, seed  |
-   //| the basket, and consume the block's single continuation entry     |
-   //| exactly as the virtual trigger does. A pending that VANISHED      |
-   //| without a position is a cancel/expiry — just release the ticket.  |
+   //| v5.40 — PHYSICAL FILL SCANNER.                                   |
+   //| The entry rests a real broker limit order. When one fills, the    |
+   //| broker removes the pending and opens a position whose ticket is   |
+   //| UNRELATED, so resolve it via the 3-tier detector, seed the        |
+   //| basket, and consume the block's single continuation entry. A      |
+   //| pending that VANISHED without a position is a cancel/expiry —    |
+   //| just release the ticket. Since v5.72 this is the ONLY fill path.  |
    //+------------------------------------------------------------------+
    void              CheckPendingOrderFills(void)
      {
@@ -2553,8 +2411,8 @@ public:
             // v5.41 -- DIRECTION GUARD. A fill landing while a basket is live
             // is a reversal ONLY when it OPPOSES that basket. Without the
             // direction clause a same-direction scale-in fill would fratricide
-            // the incumbent it is meant to add to. Mirrors the virtual trigger's
-            // by-construction guard (m_activeDirection != newDir).
+            // the incumbent it is meant to add to. The direction clause is the
+            // whole guard: same side = scale-in, opposite side = reversal.
             if(m_hasActiveTrade && m_activeTrade.ticket != newTicket &&
                m_activeDirection != newDir)
               {
@@ -2638,8 +2496,8 @@ public:
                  {
                   // RETIRE the block: its ONE continuation entry has filled,
                   // so latch it dead and date it for deletion. isTriggered
-                  // stops PlaceOrArmOrder and the virtual engine from arming
-                  // a second tranche; hasPlacedOrder stops the duplicate;
+                  // stops PlaceOrArmOrder from arming a second tranche once
+                  // this one has filled; hasPlacedOrder stops the duplicate;
                   // deleteOnBarTime lets ProcessBlocks delete it next bar.
                   mod.limitOrderTicket   = 0;
                   mod.pendingOrderCancel = false;
@@ -2675,300 +2533,15 @@ public:
      }
 
 
-   //+------------------------------------------------------------------+
-   //| v5.37 Part 2 - VIRTUAL MARKET TRIGGER. Watches the live price on |
-   //| every tick and fires a MARKET order the moment an armed virtual  |
-   //| order's level is reached. This is the execution half of the in-  |
-   //| memory engine whose ARM half is PlaceOrArmOrder().               |
-   //|                                                                  |
-   //| The cross test mirrors Pine's own strategy fill logic and is the   |
-   //| LIMIT predicate for the true front-edge entry (v5.69): the trigger  |
-   //| sits on the NEAR side of the zone, so a LONG fires once the market  |
-   //| has come back DOWN to/through its trigger and a SHORT once it has   |
-   //| rallied UP to/through it - a gap through the level still triggers.  |
-   //| (v5.57..v5.68 ran this the other way, because the entry then sat    |
-   //| BEYOND the far edge as a STOP-style breakout.)                     |
-   //+------------------------------------------------------------------+
-   void              CheckVirtualTriggers(void)
-     {
-      if(m_reversalInProgress) return;
-      if(InpSimNewsShield) return;          // Pine sim_news_shield: absolute lockdown
-      if(InpSimMacroVeto) return;           // Pine sim_macro_veto
-      if(m_virtualCount <= 0) return;
-
-      double ask = GetAsk();
-      double bid = GetBid();
-
-      SSniperBlock blocks[];
-      int count = m_blockManager.GetAllBlocks(blocks);
-
-      // Reverse walk: RemoveVirtualOrderAt() compacts the array in place, so
-      // an ascending walk would skip the element shifted into a fired slot.
-      for(int v = m_virtualCount - 1; v >= 0; v--)
-        {
-         SVirtualOrder vo = m_virtualOrders[v];
-
-         // Re-resolve the LIVE block by SERIAL, never by the stored index:
-         // COttoBlockManager::RemoveBlock() compacts m_blocks, so a stored
-         // blockIndex can point at a different zone by the time the trigger
-         // fires. serial is the stable identity (it also names tradeId).
-         int bi = -1;
-         for(int i = 0; i < count; i++)
-            if(blocks[i].serial == vo.blockSerial) { bi = i; break; }
-
-         if(bi < 0)                              // block gone -> drop orphan
-           { RemoveVirtualOrderAt(v); continue; }
-         if(blocks[bi].isVetoed || blocks[bi].isTriggered)
-           { RemoveVirtualOrderAt(v); continue; }
-
-         bool isLong = (vo.direction == DIR_LONG);
-         // v5.48 -- the side THIS fill actually executes, captured from the
-         // arm-time virtual order and threaded into SeedActiveTradeFromBlock().
-         // The seed must describe the order that was SENT, never a value
-         // re-derived from a mutable block. v5.52's derived mapping is
-         // unconditional, so this is now belt-and-braces (see the seed's own
-         // note) -- kept because the virtual fire knows the exact side it sent.
-         ENUM_TRADE_DIRECTION seedDir = isLong ? DIR_LONG : DIR_SHORT;
-
-         // THE CROSS TEST. A MARKET condition, not a resting price. The trigger
-         // sits on the NEAR side of the zone (v5.69): a LONG entry is BELOW the
-         // arming close and a SHORT entry ABOVE it, so the trigger is a PULLBACK
-         // level -- the LONG fires when the ask returns DOWN to it, the SHORT
-         // when the bid rallies UP to it. Either way the fill is a market deal,
-         // and a gap through the level still fires. This is the resting limit's
-         // own predicate applied to a fill the broker could not hold:
-         // identical semantics, market execution. See PlaceOrArmOrder's router --
-         // this route is now the fallback, and it is the physical BUY_LIMIT /
-         // SELL_LIMIT that carries the ordinary case.
-         if(isLong ? (ask > vo.triggerPrice) : (bid < vo.triggerPrice))
-            continue;
-
-         // --- Pine gates: the identical ladder every other path applies ---
-         if(!IsSpreadAcceptable()) continue;
-         if(!CanPlaceForDirection(blocks[bi])) continue;
-
-         if(m_correlationFilter != NULL && m_correlationFilter.IsTradeVetoed(vo.direction))
-           {
-            if(EnableLogging)
-               Print("[Correlation] VETO on ", m_symbol,
-                     (isLong ? " LONG" : " SHORT"), " (virtual trigger)");
-            continue;
-           }
-         if(m_correlationFilter != NULL &&
-            m_correlationFilter.IsConsensusOpposed(m_symbol, vo.direction))
-           {
-            SSniperBlock vet = blocks[bi];
-            vet.isVetoed   = true;
-            vet.vetoReason = VETO_CORRELATION;
-            m_blockManager.SetBlockAt(bi, vet);
-            if(EnableLogging)
-               Print("[Correlation] VECTOR VETO on ", m_symbol,
-                     (isLong ? " LONG" : " SHORT"), " (virtual trigger)");
-            RemoveVirtualOrderAt(v);
-            continue;
-           }
-         if(!SentimentPasses(blocks[bi])) continue;
-         if(m_blockManager.IsBlockedByPrimary(bi)) continue;
-
-         // v5.38 -- R/C PHASE TAG + REUSE OF THE ARM SESSION. v5.52: the marker
-         // is CONSTANT -- every setup is the single continuation entry (the
-         // breakout / breakdown), so there is no phase left to discriminate and
-         // the "_C" tag below is written as a literal. The SESSION id is NOT
-         // re-minted here: it was minted when the setup was ARMED and is carried
-         // on the descriptor, so the arm snapshot, this fill and the later exit
-         // all resolve to ONE journal file, and a fallback mint keeps the
-         // identifier defined.
-         string newSessionId = vo.sessionId;
-         if(newSessionId == "")
-           {
-            MqlDateTime ntm;
-            TimeToStruct(TimeCurrent(), ntm);
-            newSessionId = StringFormat("#OTTO-%s-%04d%02d%02d-%02d%02d%02d-BLK%d",
-                                        m_symbol, ntm.year, ntm.mon, ntm.day,
-                                        ntm.hour, ntm.min, ntm.sec, blocks[bi].serial);
-           }
-         // v5.43 -- do NOT repoint the journal before the send. This setup's own
-         // arm snapshot already created its file (PlaceOrArmOrder), and the live
-         // basket (if any) must keep owning the journal until a fill is actually
-         // adopted. Pointing it here would leak the new session into any exit
-         // logged before the fill commits. The deal COMMENT below still carries
-         // newSessionId; the journal is repointed only after the fill is seeded
-         // (see the m_sessionID hand-off at the commit step).
-
-         // --- Build the MARKET request (DEAL, not PENDING) ---
-         MqlTradeRequest request;
-         MqlTradeResult  result;
-         ZeroMemory(request);
-         ZeroMemory(result);
-         request.action    = TRADE_ACTION_DEAL;
-         request.symbol    = m_symbol;
-         request.type      = isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-         request.volume    = vo.lotSize;            // stored size
-         request.price     = SnapToTick(isLong ? ask : bid);
-         request.sl        = vo.stopLoss;           // stored SL
-         request.tp        = 0;                     // NO TP - Pine trail-only exits
-         request.deviation = MaxSlippage;
-         request.magic     = MagicNumber;
-         // R/C + session marker, clamped to the MT5 31-char limit. The same
-         // string is already the journal session ID set above, so the terminal
-         // row and the journal agree without a second source of truth.
-         request.comment   = ClampOrderComment(newSessionId + "_C");
-
-         // Optimistic one-shot lock (mirrors PlaceOrArmOrder). Prevents a
-         // concurrent tick or a requote retry from firing this order twice.
-         SSniperBlock block = blocks[bi];
-         block.hasPlacedOrder = true;
-         m_blockManager.SetBlockAt(bi, block);
-
-         if(!SendOrderWithRetry(request, result))
-           {
-            // v5.39 -- TERMINAL REJECTION. A broker rejection at a fired market
-            // cross is fatal: the deal was refused, so the setup is spent. Map
-            // the raw retcode to a human-readable cause, journal the
-            // cancellation, then KILL the block and drop its virtual order so
-            // no later tick re-fires it. (The v5.37 latch-then-retry path left
-            // the order armed and leaked a second SVirtualOrder every tick.)
-            string errorStr = GetTradeRetcodeString(result.retcode);
-            if(EnableLogging)
-               Print("[OrderManager] VIRTUAL REJECTED session=", newSessionId,
-                     " retcode=", result.retcode, " (", errorStr, ")",
-                     " broker=", result.comment,
-                     " sym=", m_symbol, " side=", (isLong ? "LONG" : "SHORT"),
-                     " price=", DoubleToString(request.price, _Digits),
-                     " sl=", DoubleToString(request.sl, _Digits));
-            SSniperBlock rej = blocks[bi];
-            rej.isVetoed   = true;
-            rej.vetoReason = VETO_BROKEN;
-            m_blockManager.SetBlockAt(bi, rej);
-            if(m_journal != NULL)
-              {
-               // v5.43 -- this setup's cancellation must rename ITS OWN arm
-               // file to CANCELLED_. The early session repoint was removed, so
-               // point the journal at the setup's session for this terminal
-               // write, then restore the live basket's pointer afterwards.
-               string prevSession = m_sessionID;
-               m_journal.SetSessionID(newSessionId);
-               m_journal.LogCancellation("Broker Rejected Market Order: " + errorStr +
-                                         " (Code: " + IntegerToString((long)result.retcode) + ")");
-               if(prevSession != "") m_journal.SetSessionID(prevSession);
-              }
-            RemoveVirtualOrderAt(v);
-            continue;
-           }
-
-         // --- STOP-AND-REVERSE (SAR) BASKET ADOPTION ---
-         // A fill landing while a basket is already live is a reversal ONLY
-         // when it OPPOSES that basket. Same-direction scale-in fills cannot
-         // reach here: CanPlaceForDirection() above refuses to arm a block
-         // whose direction matches the live basket, so this is the reversal
-         // case by construction. CloseEntireBasket() spares result.order via
-         // keepTicket, then its logExit path runs ClearBasket() so the old
-         // basket is wiped before SeedActiveTradeFromBlock() below adopts the
-         // reversal through the normal basket machinery.
-         if(m_hasActiveTrade && m_activeTrade.ticket != result.order &&
-            m_activeDirection != (isLong ? DIR_LONG : DIR_SHORT))
-           {
-            if(EnableLogging)
-               Print("[OrderManager] SAR REVERSAL (virtual): closing basket ",
-                     "ticket=", m_activeTrade.ticket,
-                     " dir=", (m_activeDirection == DIR_LONG ? "LONG" : "SHORT"),
-                     " -> new=", result.order,
-                     " dir=", (isLong ? "LONG" : "SHORT"));
-            // v5.43 -- lock the journal to the INCUMBENT basket before the
-            // close so its exit record lands in the incumbent's file, not in
-            // whichever setup last touched the journal.
-            if(m_journal != NULL) m_journal.SetSessionID(m_sessionID);
-            bool wasReversing    = m_reversalInProgress;
-            m_reversalInProgress = true;
-            CloseEntireBasket("SAR Reversal", true, result.order);
-            m_reversalInProgress = wasReversing;
-           }
-
-         // --- Commit the filled state ---
-         // rrUnit is recomputed from the block's OWN geometry (not the broker-
-         // adjusted stop) so SeedActiveTradeFromBlock() rebuilds exactly the
-         // basket 1R math a resting physical limit fill would have produced.
-         // FIX (v5.57) — shift-1 ATR so the recovered rrUnit matches the entry build.
-         double atr    = m_blockManager.GetATRAtShift(1);
-         if(atr <= 0) atr = m_blockManager.GetATR();
-         double slDist = (atr > 0) ? CalcSLDistance(block, atr)
-                                   : MathAbs(vo.triggerPrice - vo.stopLoss);
-         // FIX (v5.58) FAR-EDGE ANCHOR, twin of PlaceOrArmOrder() above. localTP
-         // MUST stay the one price the Front-Run veto reads (the veto compares
-         // the market against block.localTP once the order rests), so the
-         // recovered projection is re-derived with the identical arithmetic
-         // rather than from the trigger: target = farEdge +/- tpRR * slDist.
-         // The retired form anchored on the anticipation ENTRY -- now a full
-         // blockHeight + 1.5*ATR out, the stretch PlaceOrArmOrder was
-         // re-anchored to undo -- and leaving it here would let the veto judge
-         // a different price after a virtual fire. At the reachable arm paths
-         // localTP already holds this exact value, so this is a consistency
-         // guarantee, not a behaviour change.
-         double tpRR    = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-         double farEdge = isLong ? MathMax(block.top, block.bottom)
-                                 : MathMin(block.top, block.bottom);
-         block.localEntry = vo.triggerPrice;
-         block.localSL    = vo.stopLoss;
-         block.localTP    = isLong ? farEdge + tpRR * slDist
-                                   : farEdge - tpRR * slDist;
-         block.rrUnit     = slDist;
-
-         // RETIRE the block: its ONE continuation entry has filled (this
-         // fire IS that entry), so latch it dead and date it for deletion.
-         // Mirrors CheckPendingOrderFills(). isTriggered stops the engine
-         // from arming a second tranche; hasPlacedOrder stops the duplicate;
-         // deleteOnBarTime lets ProcessBlocks delete it next bar. seedDir
-         // above is still threaded into SeedActiveTradeFromBlock() below, so
-         // the basket is seeded from the side the MARKET order executed.
-         block.limitOrderTicket    = 0;
-         block.pendingOrderCancel  = false;
-         block.priceAbortLogged    = false;
-         block.isTriggered         = true;
-         block.hasPlacedOrder      = true;
-         block.isArmed             = false;
-         block.hasExited           = false;
-         block.deleteOnBarTime     = iTime(m_symbol, PERIOD_CURRENT, 0);
-         m_blockManager.SetBlockAt(bi, block);
-
-         // v5.43 -- hand the setup's pre-minted session to THIS basket before
-         // seeding. InitBasket() reuses m_sessionID verbatim when it is already
-         // set, so the fill's entry record, the exit and every later append all
-         // resolve to the ONE file the arm created. Pointing the journal here is
-         // safe: any incumbent basket was closed (and ClearBasket() wiped
-         // m_sessionID) above, so nothing else owns the journal now.
-         m_sessionID = newSessionId;
-         if(m_journal != NULL) m_journal.SetSessionID(m_sessionID);
-
-         // v5.48 -- seed the basket from the side the MARKET order actually
-         // executed (seedDir, captured above), NOT by re-deriving it: a fill
-         // commits the block and the seed should describe the order that was
-         // SENT. v5.52's derived mapping is unconditional now, so this override
-         // is belt-and-braces rather than a desync fix.
-         SeedActiveTradeFromBlock(block, result.order, seedDir);
-         m_ordersFilled++;
-
-         // The virtual order is now consumed - drop it from the engine.
-         RemoveVirtualOrderAt(v);
-
-         if(EnableLogging)
-            Print("[OrderManager] VIRTUAL TRIGGER FILLED: ", block.tradeId,
-                  " ticket=", result.order,
-                  " dir=", (isLong ? "LONG" : "SHORT"),
-                  " trigger=", DoubleToString(vo.triggerPrice, _Digits),
-                  " entry=", DoubleToString(request.price, _Digits),
-                  " sl=", DoubleToString(vo.stopLoss, _Digits),
-                  " rrUnit=", DoubleToString(slDist, _Digits));
-        }
-     }
 
 
    //+------------------------------------------------------------------+
-   //| ROBUST CLEANUP — drops in-memory virtual orders belonging to     |
-   //| blocks that are vetoed, triggered, flipped, deleted, or flagged  |
-   //| for cancellation. Runs before/after the block funnel so no armed |
-   //| setup is ever orphaned, and so the block array can release the   |
-   //| struct safely. (v5.37 Part 3: the book IS the virtual engine —   |
-   //| there is no broker pending order to delete any more.)            |
+   //| ROBUST CLEANUP — deletes the resting broker limit of any block    |
+   //| that is vetoed, triggered, flipped, deleted, or flagged for       |
+   //| cancellation. Runs before/after the block funnel so no abandoned  |
+   //| order is ever left live, and so the block array can release the   |
+   //| struct safely. v5.72: a broker pending is the ONLY order artefact |
+   //| in the system, so this walk IS the whole cleanup.                 |
    //+------------------------------------------------------------------+
    void              CancelOrdersForInvalidBlocks(void)
      {
@@ -3020,6 +2593,7 @@ public:
                   else if(blocks[i].vetoReason == VETO_BROKEN)        cancelReason = "Block Broken";
                   else if(blocks[i].vetoReason == VETO_FLIPPED)       cancelReason = "Block Flipped";
                   else if(blocks[i].vetoReason == VETO_CORRELATION)   cancelReason = "Vector Consensus Veto";
+                  else if(blocks[i].vetoReason == VETO_LIMIT_MISSED)  cancelReason = "Limit Entry Missed (price through entry)";
                   else if(blocks[i].pendingOrderCancel)               cancelReason = "Manual / Direction Conflict";
                   // v5.43 -- save/restore: a transient setup log must not steal the
                   // journal from a live basket (see PlaceOrArmOrder).
@@ -3031,54 +2605,6 @@ public:
               }
            }
 
-         // Drop the armed virtual order (if any) that belongs to this block.
-         // Matched by SERIAL, never by a stored index: RemoveBlock() compacts
-         // the block array, so the index captured at arm time can be stale.
-         for(int v = m_virtualCount - 1; v >= 0; v--)
-           {
-            if(m_virtualOrders[v].blockSerial != blocks[i].serial)
-               continue;
-
-            if(EnableLogging)
-               Print("[OrderManager] Cancelled virtual order for block ",
-                     blocks[i].tradeId, " (serial ", blocks[i].serial, ")");
-
-            if(m_journal != NULL)
-              {
-               // v5.52: the conversion branch that used to guard this is gone with
-               // TryConvertToReversal(). conversionReason is now permanently
-               // VETO_NONE, so every drop is a plain cancellation.
-               string cancelReason = "Manual";
-               if(blocks[i].vetoReason == VETO_FRONTRUN)       cancelReason = "Fired Front-Run 1:4 Veto";
-               else if(blocks[i].vetoReason == VETO_STALE)     cancelReason = "Stale Veto (45D)";
-               else if(blocks[i].vetoReason == VETO_NEARMISS)  cancelReason = "Near-Miss Veto (6D)";
-               else if(blocks[i].vetoReason == VETO_MOMENTUM)  cancelReason = "Momentum Veto";
-               else if(blocks[i].vetoReason == VETO_FVG)        cancelReason = "FVG Veto";
-               else if(blocks[i].vetoReason == VETO_SIZING)     cancelReason = "Sizing Veto";
-               else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
-               else if(blocks[i].vetoReason == VETO_BROKEN)     cancelReason = "Block Broken";
-               else if(blocks[i].vetoReason == VETO_FLIPPED)    cancelReason = "Block Flipped";
-               else if(blocks[i].vetoReason == VETO_CORRELATION) cancelReason = "Vector Consensus Veto";
-               else if(blocks[i].pendingOrderCancel)           cancelReason = "Manual / Direction Conflict";
-               // v5.38: reuse the arm-time session so the cancel lands in the
-               // setup's ONE journal, with a fresh mint as the fallback.
-               string voSession = m_virtualOrders[v].sessionId;
-               if(voSession == "")
-                 {
-                  MqlDateTime ctm; TimeToStruct(TimeCurrent(), ctm);
-                  string cts = StringFormat("%04d%02d%02d-%02d%02d%02d", ctm.year, ctm.mon, ctm.day, ctm.hour, ctm.min, ctm.sec);
-                  voSession = StringFormat("#OTTO-%s-%s-BLK%d", m_symbol, cts, blocks[i].serial);
-                 }
-               // v5.43 -- save/restore (see the physical-cancel path above).
-               string prevSession = m_sessionID;
-               m_journal.SetSessionID(voSession);
-               m_journal.LogCancellation(cancelReason);
-               if(prevSession != "") m_journal.SetSessionID(prevSession);
-              }
-
-            RemoveVirtualOrderAt(v);
-            break;   // at most one virtual order per block
-           }
 
          // Release the block's arm latch so the array can drop the struct.
          SSniperBlock mod = blocks[i];
@@ -3147,41 +2673,6 @@ public:
            }
         }
 
-      // v5.37 Part 3: walk our own in-memory virtual book (reverse, so
-      // RemoveVirtualOrderAt()'s compaction stays index-safe). Scoping this
-      // to m_virtualOrders[] is what the v5.28 note below always wanted:
-      // each chart now prunes only ITS OWN armed setups -- no shared broker
-      // book, no cancel storm across the portfolio.
-      for(int v = m_virtualCount - 1; v >= 0; v--)
-        {
-         SVirtualOrder vo = m_virtualOrders[v];
-         if(vo.direction == DIR_NONE) continue;
-
-         string sym = m_symbol;
-         if(!m_correlationFilter.IsConsensusOpposed(sym, vo.direction)) continue;
-
-         if(EnableLogging)
-            Print("[OrderManager] VECTOR CANCEL: serial ", vo.blockSerial, " ", sym,
-                  (vo.direction == DIR_LONG ? " LONG" : " SHORT"),
-                  " | consensus = ",
-                  DoubleToString(m_correlationFilter.GetPairConsensus(sym), 1), "%");
-
-         // Release any block still latched to this serial so the array can
-         // free the struct and the duplicate shield stays consistent.
-         int bi = m_blockManager.FindBlockIndexBySerial(vo.blockSerial);
-         if(bi >= 0)
-           {
-            SSniperBlock mod;
-            if(m_blockManager.GetBlockAt(bi, mod))
-              {
-               mod.limitOrderTicket = 0;
-               mod.pendingOrderCancel = false;
-               m_blockManager.SetBlockAt(bi, mod);
-              }
-           }
-
-         RemoveVirtualOrderAt(v);
-        }
      }
 
 
@@ -3228,17 +2719,6 @@ public:
            }
         }
 
-      // v5.37 Part 3: drop armed virtual orders that fight the live trade's
-      // direction. Reverse walk keeps RemoveVirtualOrderAt() index-safe.
-      for(int v = m_virtualCount - 1; v >= 0; v--)
-        {
-         if(m_virtualOrders[v].direction != m_activeDirection)
-            continue;
-         if(EnableLogging)
-            Print("[OrderManager] DIRECTION CONFLICT: dropping virtual order ",
-                  m_virtualOrders[v].blockSerial, " (dir ", m_activeDirection, ")");
-         RemoveVirtualOrderAt(v);
-        }
      }
 
    //+------------------------------------------------------------------+
@@ -3246,8 +2726,8 @@ public:
    //+------------------------------------------------------------------+
    void              CancelAllPendingOrders(void)
      {
-      // v5.40: the book is the HYBRID engine — delete every resting BROKER
-      // pending this chart owns, then empty the in-memory virtual book.
+      // v5.72: a resting BROKER pending is the only order artefact this chart
+      // can own, so deleting those IS emptying the book.
       for(int i = OrdersTotal() - 1; i >= 0; i--)
         {
          ulong t = OrderGetTicket(i);
@@ -3256,11 +2736,6 @@ public:
          if(OrderGetString(ORDER_SYMBOL) != m_symbol) continue;
          DeleteOrder(t);
         }
-      // v5.49: release the cross-chart arm locks this chart published before
-      // the in-memory book is emptied (deinit / DD halt path).
-      ReleaseAllVirtualArmLocks();
-      ArrayResize(m_virtualOrders, 0, 3);
-      m_virtualCount = 0;
      }
 
    //+------------------------------------------------------------------+
@@ -3331,10 +2806,9 @@ public:
       PersistBasketR(rrUnit, ticket);
         // v5.43 -- SESSION OWNERSHIP. m_sessionID is the single source of
         // truth for the live basket's journal, and it is WHO the basket's
-        // whole lifecycle resolves against (see the SAR locks in
-        // CheckPendingOrderFills / CheckVirtualTriggers). Reuse it verbatim
-        // when it is already resolved -- an EA block path hands over the
-        // arm-time session, a virtual fill hands over its pre-minted id, a
+        // whole lifecycle resolves against (see the SAR lock in
+        // CheckPendingOrderFills). Reuse it verbatim when it is already
+        // resolved -- an EA block path hands over the arm-time session, a
         // restart rebuilds from the persisted block. Only mint a NEW id when
         // it is empty (a legacy path with no arm-time session). An ADOPTED
         // basket always mints its own "-MAN" id: it must never inherit the
@@ -3646,10 +3120,6 @@ public:
      {
       ArrayResize(m_basket, 0, 3);
       m_basketCount = 0;
-      // v5.49: a closed basket takes its unconsumed arm locks with it.
-      ReleaseAllVirtualArmLocks();
-      ArrayResize(m_virtualOrders, 0, 3);
-      m_virtualCount = 0;
       m_nextTranche = 2;
       m_hasActiveTrade = false;
       m_activeDirection = DIR_NONE;

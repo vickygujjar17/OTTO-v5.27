@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                       OttoEA.mq5 |
 //|                    OTTO — Goat Funded Trader (GFT) Master Build    |
-//|                    Pine Script Master Build Port (v5.71)            |
+//|                    Pine Script Master Build Port (v5.72)            |
 //|                                    Institutional / Real-Money    |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.71"
+#property version   "5.72"
 #property description "OTTO EA â€” Goat Funded Trader (GFT) Master Build"
 #property description "Separation | Sizing | Front-Run | Near-Miss | Stale vetoes"
 #property description "Modules: News Shield | Risk | Block Manager | Order Mgmt | Trail"
@@ -180,7 +180,7 @@ int OnInit(void)
    g_symbol = _Symbol;
 
    Print("==============================================================");
-   Print("  OTTO EA v5.71 — 28-Pair Institutional Master Build — INITIALIZING");
+   Print("  OTTO EA v5.72 — 28-Pair Institutional Master Build — INITIALIZING");
    Print("  Symbol: ", g_symbol, " | Magic: ", MagicNumber);
    Print("==============================================================");
 
@@ -779,11 +779,11 @@ void OnTick(void)
    // ================================================================
    if(!g_newsFilter.IsInNewsBlackout() && !g_dailyDD_Paused)
      {
-      // Every armed block routes through the single hybrid engine:
-      // PlaceOrdersForArmedBlocks() ARMS the order -- a resting broker limit
-      // when the price permits one, else an in-memory virtual order -- and the
-      // order manager's CheckVirtualTriggers() FIRES the MARKET leg once the
-      // continuation level trades through. v5.52 has no per-phase split.
+      // Every armed block routes through the single LIMIT engine:
+      // PlaceOrdersForArmedBlocks() either RESTS a broker limit at the deep
+      // front-edge entry or vetoes the setup as VETO_LIMIT_MISSED. v5.72
+      // retired the in-memory arm: an entry the broker cannot hold is a
+      // missed trade, never a MARKET chase. v5.52 has no per-phase split.
       g_orderManager.PlaceOrdersForArmedBlocks();
      }
 

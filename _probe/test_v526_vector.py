@@ -194,7 +194,13 @@ check("sweep filters by magic",
 check("sweep covers all four pending types",
       all(t in OM_T for t in ("ORDER_TYPE_BUY_LIMIT", "ORDER_TYPE_BUY_STOP",
                               "ORDER_TYPE_SELL_LIMIT", "ORDER_TYPE_SELL_STOP")))
-check("sweep releases the block ticket", "mod.limitOrderTicket = 0;" in OM_T)
+# v5.72: pinned as a BEHAVIOUR, not a column. The retired virtual
+# consensus walk happened to be the only site writing
+# `mod.limitOrderTicket = 0;` with single spaces, so the old literal was
+# silently tracking column alignment rather than the release. The
+# property is that the sweep clears the ticket on the block.
+check("sweep releases the block ticket",
+      re.search(r"mod\.limitOrderTicket\s*=\s*0\s*;", OM_T) is not None)
 
 # ----------------------------------------------------------------------
 # 10. Integration order in otto.mq5

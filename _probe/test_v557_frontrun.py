@@ -234,30 +234,31 @@ print("\n-- 1. ATR shift sync --")
 SHIFT1 = "m_blockManager.GetATRAtShift(1)"
 FALLBACK = "if(atr <= 0) atr = m_blockManager.GetATR();"
 
+# v5.72: the virtual fire was the third consumer of this pair and is retired,
+# leaving PlaceOrArmOrder and OpenReversalPosition -- the two paths that still
+# build a price. The census moves 3 -> 2 with it; the PROPERTY (both survivors
+# read shift 1, with GetATR() only as a fallback) does not change.
 for label, fn in (("PlaceOrArmOrder", OM_PLACE),
-                  ("CheckVirtualTriggers", OM_VIRT),
                   ("OpenReversalPosition", OM_REV)):
     blob = norm(fn or "")
     check("%s prices from GetATRAtShift(1)" % label, SHIFT1 in blob)
     check("%s keeps GetATR() only as the fallback" % label, FALLBACK in blob)
 
-check("exactly 3 shift-1 ATR reads order the manager's geometry",
-      len(re.findall(r"GetATRAtShift\(1\)", OM_C)) == 3,
+check("exactly 2 shift-1 ATR reads order the manager's geometry",
+      len(re.findall(r"GetATRAtShift\(1\)", OM_C)) == 2,
       "found %d" % len(re.findall(r"GetATRAtShift\(1\)", OM_C)))
-check("exactly 3 matching GetATR() fallbacks",
-      len(re.findall(r"atr <= 0\) atr = m_blockManager\.GetATR\(\)", OM_C)) == 3,
+check("exactly 2 matching GetATR() fallbacks",
+      len(re.findall(r"atr <= 0\) atr = m_blockManager\.GetATR\(\)", OM_C)) == 2,
       "found %d" % len(re.findall(r"atr <= 0\) atr = m_blockManager\.GetATR\(\)", OM_C)))
 check("the live entry path abandons the setup when no ATR is available",
       re.search(r"if\(atr <= 0\) return false;", OM_PLACE or "") is not None)
 check("the reversal fallback is guarded by atr > 0, not a hard return",
       "if(atr > 0)" in (OM_REV or ""))
-check("the virtual-fill recovery degrades to the trigger/stop distance",
-      "MathAbs(vo.triggerPrice - vo.stopLoss)" in (OM_VIRT or ""))
 
 # An extraction failure must surface as ONE named failure, not an obscure
 # TypeError deep inside norm() -- a probe that crashes reports nothing.
 check("every OrderManager price path resolved",
-      all(f is not None for f in (OM_PLACE, OM_VIRT, OM_REV, OM_CALC, OM_SLD)))
+      all(f is not None for f in (OM_PLACE, OM_REV, OM_CALC, OM_SLD)))
 check("both BlockManager passes plus the entry helper resolved",
       all(f is not None for f in (BM_GET, BM_BEP, BM_PROC, BM_INTRA)))
 
@@ -462,24 +463,24 @@ check("the decoupling from InpEntryStyle is stated in the source",
 check("ATRBufferBreak is the documented 0.5 ATR buffer",
       re.search(r"ATRBufferBreak\s*=\s*0\.5;", DEFS_T) is not None)
 
-print("\n-- 5. Near-side (limit) cross test --")
+print("\n-- 5. Limit-only entry: no cross predicate --")
 
-LIVE_CROSS = "isLong ? (ask > vo.triggerPrice) : (bid < vo.triggerPrice)"
 RETIRED_CROSS = "isLong ? (ask < vo.triggerPrice) : (bid > vo.triggerPrice)"
 
-check("the virtual engine fires on a pullback THROUGH the trigger",
-      LIVE_CROSS in (OM_VIRT or ""))
+# A cross predicate only exists if something has to WATCH price cross a level.
+# v5.72 handed that job to the broker: a limit either rests and fills, or it is
+# vetoed. So the property is no longer the SIGN of a comparison but its
+# ABSENCE -- plus the geometrical consequence, that the entry price is snapped
+# and normalized onto the grid it must sit on before the send.
+check("no cross predicate survives (the virtual engine is retired)",
+      "vo.triggerPrice" not in OM_C and "vo.stopLoss" not in OM_C)
 check("the retired v5.66 breakout-follow predicate is gone",
-      RETIRED_CROSS not in (OM_VIRT or "") and RETIRED_CROSS not in OM_C)
-check("the cross is documented as a market condition",
-      "THE CROSS TEST" in OM_RAW and
-      "a gap through the level still fires" in OM_RAW)
-# Only the entry-side comparison may be inverted; the exit-side must still
-# read the opposite way or a fired order would seed its basket on the
-# wrong trigger point.
-check("exactly one cross predicate survives",
-      len(re.findall(r"vo\.triggerPrice\)", OM_C)) >= 1,
-      "found %d" % len(re.findall(r"vo\.triggerPrice\)", OM_C)))
+      RETIRED_CROSS not in OM_C)
+check("the entry price is snapped before the send",
+      "double entryPrice = SnapToTick(CalcEntryPrice(block, atr));" in (OM_PLACE or ""))
+check("the resting price is normalized to the symbol's digit grid",
+      "request.price     = NormalizeDouble(entryPrice, "
+      "(int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));" in (OM_PLACE or ""))
 
 
 # ----------------------------------------------------------------------
@@ -490,7 +491,6 @@ print("\n-- 6. SL/TP wiring --")
 check("the stop is one slDist on the far side of the entry",
       "isLong ? entryPrice - slDist : entryPrice + slDist;" in (OM_PLACE or ""))
 PLACE_W = norm(OM_PLACE or "")
-VIRT_W = norm(OM_VIRT or "")
 # The quo/  column spacing is part of the shipped literal, so normalise
 # whitespace before matching rather than pinning a column.
 check("rrUnit is seeded from the SAME slDist the order used",
@@ -502,14 +502,6 @@ check("the BlockManager checkout projects from the SAME InpMaxRR input",
 check("the SL and TP both land on the block for the veto to read back",
       "block.localSL = stopLoss;" in PLACE_W and
       "block.localTP = takeProfit;" in PLACE_W)
-check("the entry is reclaimed from the virtual trigger, not recomputed",
-      "block.localEntry = vo.triggerPrice;" in VIRT_W)
-check("the stop is reclaimed from the armed virtual order",
-      "block.localSL = vo.stopLoss;" in VIRT_W)
-check("the virtual-fill path rebuilds rrUnit from the block's own geometry",
-      "block.rrUnit = slDist;" in VIRT_W)
-check("the reclaimed entry is normalized to the symbol's digit grid",
-      "vo.triggerPrice = NormalizeDouble(entryPrice," in PLACE_W)
 check("the basket 1R is the block's rrUnit, not the broker-adjusted stop",
       "block.rrUnit;" in OM_C and
       "m_activeTrade.rrUnit" in OM_C)
@@ -816,13 +808,19 @@ check("all four block-creation passes populate the full W1/W2 candle",
                            len(re.findall(r"nb\.wick1\.lowPrice\s*=", BM_C)),
                            len(re.findall(r"nb\.wick2\.lowPrice\s*=", BM_C))))
 
-# The virtual-fire commit re-derives localTP on the SAME far-edge anchor as
-# PlaceOrArmOrder; the retired form anchored it on the anticipation trigger, a
-# further 0.5*ATR out, which would let the veto judge a different price after
-# a virtual fire than it did while the order was armed.
-check("CheckVirtualTriggers re-derives localTP on the far edge (twin of PlaceOrArmOrder)",
-      "block.localTP = isLong ? farEdge + tpRR * slDist : farEdge - tpRR * slDist;" in VIRT_W and
-      "double farEdge = isLong ? MathMax(block.top, block.bottom) : MathMin(block.top, block.bottom);" in VIRT_W)
+# The far-edge anchor is now asserted on the ONE surviving projection site.
+# v5.72 retired the virtual fire, which re-derived localTP with identical
+# arithmetic; PlaceOrArmOrder is the only writer of block.localTP left, so the
+# "twin" property collapses into "the single writer is on the far edge".
+check("PlaceOrArmOrder anchors the target on the FAR edge",
+      re.search(r"double\s+farEdge\s*=\s*isLong\s*\?\s*MathMax\(block\.top,\s*block\.bottom\)",
+                PLACE_W) is not None and
+      re.search(r"double\s+takeProfit\s*=\s*isLong\s*\?\s*farEdge\s*\+\s*tpRR\s*\*\s*slDist",
+                PLACE_W) is not None and
+      "block.localTP = takeProfit;" in PLACE_W)
+check("exactly one writer of block.localTP remains in the OrderManager",
+      len(re.findall(r"block\.localTP\s*=[^=]", OM_C)) == 1,
+      "found %d" % len(re.findall(r"block\.localTP\s*=[^=]", OM_C)))
 check("the retired trigger-anchored projection is gone from the OrderManager",
       "vo.triggerPrice + slDist" not in (OM_C or "") and
       "vo.triggerPrice - slDist" not in (OM_C or ""))

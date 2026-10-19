@@ -129,8 +129,11 @@ if FILLS is not None:
 
 
 # ----------------------------------------------------------------------
-# 2. SAR close locks the journal to the INCUMBENT basket (both routes)
+# 2. SAR close locks the journal to the INCUMBENT basket
 # ----------------------------------------------------------------------
+# v5.72: only the physical fill path can trigger a reversal now, so the one
+# surviving lock is the whole property. The retired virtual twin is asserted
+# absent rather than merely unchecked.
 print("\n-- SAR close locks the incumbent journal --")
 
 if FILLS is not None:
@@ -139,12 +142,8 @@ if FILLS is not None:
     check("physical SAR locks the incumbent before the close",
           0 <= lock < close, "lock=%d close=%d" % (lock, close))
 
-check("CheckVirtualTriggers located", VTRIG is not None)
-if VTRIG is not None:
-    lock = VTRIG.find("SetSessionID(m_sessionID)")
-    close = VTRIG.find('CloseEntireBasket("SAR Reversal"')
-    check("virtual SAR locks the incumbent before the close",
-          0 <= lock < close, "lock=%d close=%d" % (lock, close))
+check("the retired virtual SAR path is gone (v5.72)",
+      "CheckVirtualTriggers" not in OM_C)
 
 
 # ----------------------------------------------------------------------
@@ -154,23 +153,24 @@ print("\n-- Fill-path session hand-off --")
 
 check("physical fill adopts the block's arm session",
       FILLS is not None and "m_sessionID = blocks[i].sessionId;" in FILLS)
-check("virtual fill adopts its pre-minted session",
-      VTRIG is not None and "m_sessionID = newSessionId;" in VTRIG)
+check("the virtual fill's pre-minted session hand-off is gone (v5.72)",
+      "m_sessionID = newSessionId;" not in OM_C)
 
 
 # ----------------------------------------------------------------------
-# 4. Virtual route no longer repoints the journal BEFORE the send
+# 4. No journal repoint can precede a send (v5.72 assertion of absence)
 # ----------------------------------------------------------------------
-print("\n-- No pre-send journal repoint (virtual) --")
+# v5.43's rule was that a fill must never repoint the journal BEFORE the order
+# is sent. The route that made this subtle was the virtual MARKET fire, and it
+# is retired -- so what must hold now is the stronger form: every
+# LogSetupArmed call is bracketed by a save/restore pair.
+print("\n-- No pre-send journal repoint --")
 
-if VTRIG is not None:
-    send = VTRIG.find("SendOrderWithRetry(request, result)")
-    repoint = VTRIG.find("SetSessionID(newSessionId)")
-    check("the only newSessionId repoint is the post-send rejection path",
-          0 <= send < repoint, "send=%d repoint=%d" % (send, repoint))
-    check("exactly one newSessionId repoint remains in the trigger",
-          VTRIG.count("SetSessionID(newSessionId)") == 1,
-          "found %d" % VTRIG.count("SetSessionID(newSessionId)"))
+check("every LogSetupArmed call is save/restore bracketed",
+      ROUTER is not None and "LogSetupArmed(" in ROUTER and
+      ROUTER.find("string prevSession = m_sessionID;") < ROUTER.find("LogSetupArmed(") and
+      ROUTER.find("LogSetupArmed(") <
+      ROUTER.find('if(prevSession != "") m_journal.SetSessionID(prevSession);'))
 
 
 # ----------------------------------------------------------------------
@@ -178,19 +178,23 @@ if VTRIG is not None:
 # ----------------------------------------------------------------------
 print("\n-- Transient-write save/restore --")
 
+# v5.72: the router has ONE journal writer (the resting limit) and the cancel
+# sweep has ONE (the physical delete), where v5.43 had two of each. The counts
+# therefore drop 2 -> 1 and 4 -> 1, and the assertion moves with them: the pair
+# must still be balanced around the single write.
 check("PlaceOrArmOrder located", ROUTER is not None)
 if ROUTER is not None:
-    check("arm saves the live session (physical + virtual)",
-          ROUTER.count(SAVE) == 2, "found %d" % ROUTER.count(SAVE))
-    check("arm restores the live session (physical + virtual)",
-          ROUTER.count(RESTORE) == 2, "found %d" % ROUTER.count(RESTORE))
+    check("arm saves the live session before its ONE write",
+          ROUTER.count(SAVE) == 1, "found %d" % ROUTER.count(SAVE))
+    check("arm restores the live session after its ONE write",
+          ROUTER.count(RESTORE) == 1, "found %d" % ROUTER.count(RESTORE))
 
 check("CancelOrdersForInvalidBlocks located", CANCEL is not None)
 if CANCEL is not None:
-    check("cancel saves the live session at all four writes",
-          CANCEL.count(SAVE) == 4, "found %d" % CANCEL.count(SAVE))
-    check("cancel restores the live session at all four writes",
-          CANCEL.count(RESTORE) == 4, "found %d" % CANCEL.count(RESTORE))
+    check("cancel saves the live session before its ONE write",
+          CANCEL.count(SAVE) == 1, "found %d" % CANCEL.count(SAVE))
+    check("cancel restores the live session after its ONE write",
+          CANCEL.count(RESTORE) == 1, "found %d" % CANCEL.count(RESTORE))
 
 
 # ----------------------------------------------------------------------

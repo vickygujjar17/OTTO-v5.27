@@ -122,15 +122,16 @@ if UPD is not None:
     hook = UPD.find("EmitHourlyStatusReportIfDue();")
     rev = UPD.find("CompleteReversal();")
     fill = UPD.find("CheckPendingOrderFills();")
-    virt = UPD.find("CheckVirtualTriggers();")
     check("the hook runs BEFORE CompleteReversal()",
           hook >= 0 and rev >= 0 and hook < rev, "hook=%d rev=%d" % (hook, rev))
     check("the hook runs BEFORE the physical fill scan",
           hook >= 0 and fill >= 0 and hook < fill, "hook=%d fill=%d" % (hook, fill))
-    check("the hook runs BEFORE the virtual trigger",
-          hook >= 0 and virt >= 0 and hook < virt, "hook=%d virt=%d" % (hook, virt))
-    check("the existing four Update() stages are all still present",
-          rev >= 0 and fill >= 0 and virt >= 0 and "AdoptManualPosition();" in UPD)
+    # v5.72: the virtual trigger stage is gone with its engine. The remaining
+    # ordering is what still matters -- the report must predate BOTH mutations.
+    check("the virtual trigger stage is retired (v5.72)",
+          "CheckVirtualTriggers" not in UPD)
+    check("the three surviving Update() stages are all still present",
+          rev >= 0 and fill >= 0 and "AdoptManualPosition();" in UPD)
 
 # ----------------------------------------------------------------------
 # 2. The interval is one hour, declared once
@@ -241,12 +242,15 @@ check("the body reports the hybrid pending count",
 # UNKNOWN rather than a blank.
 print("\n-- Per-setup label in the hourly report (v5.51 Part 3) --")
 
-check("the report walks the live virtual book (armed setups)",
-      BODY is not None and "m_virtualOrders" in BODY and "m_virtualCount" in BODY)
-check("it re-resolves each armed setup's block by SERIAL, not by index",
-      BODY is not None and "FindBlockIndexBySerial(" in BODY)
-check("it reads the block snapshot it just resolved",
-      BODY is not None and re.search(r"GetBlockAt\s*\(\s*bIdx\s*,", BODY) is not None)
+# v5.72: the walk reads the RESTING LIMITS off the block book, because the
+# in-memory descriptors are gone. The v5.51 property is unchanged -- every armed
+# order must still resolve to a live block, and an unresolved one must degrade
+# to a VISIBLE UNKNOWN rather than a blank.
+check("the report walks the resting limits on the block book (v5.72)",
+      BODY is not None and "GetBlockCount()" in BODY and
+      "limitOrderTicket" in BODY and "m_virtualOrders" not in BODY)
+check("it reads each block through GetBlockAt()",
+      BODY is not None and re.search(r"GetBlockAt\s*\(\s*h\s*,", BODY) is not None)
 check("the label is the constant continuation (v5.52)",
       BODY is not None and
       re.search(r'phaseLabel\s*=\s*"C \(Continuation\)"', BODY) is not None)
@@ -256,6 +260,8 @@ check("the Continuation label is spelled out",
       BODY is not None and "C (Continuation)" in BODY)
 check("an unresolved block degrades to a visible UNKNOWN, never a blank",
       BODY is not None and "UNKNOWN" in BODY)
+check("the resting ticket is reported so the row is actionable",
+      BODY is not None and "Ticket: #" in BODY)
 check("the serial lookup helper exists with the pinned signature",
       re.search(r"int\s+FindBlockIndexBySerial\s*\(\s*int\s+serial\s*\)",
                 BM_C) is not None)

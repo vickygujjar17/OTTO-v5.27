@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.71 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.72 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.71"
-#property description "OTTO v5.71 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.72"
+#property description "OTTO v5.72 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -69,7 +69,13 @@ enum ENUM_VETO_REASON
    // a newly forming block) opposes the global currency-vector consensus beyond
    // InpConsensusVetoThreshold. Distinct from the geographic block vetoes above,
    // which are per-chart; this one is portfolio-wide.
-   VETO_CORRELATION         // Opposes the 8-currency vector consensus
+   VETO_CORRELATION,        // Opposes the 8-currency vector consensus
+   // v5.72 STRICT LIMIT-OR-NOTHING: the entry could not be placed as a resting
+   // broker limit -- either price had already run through it (no legal
+   // BUY_LIMIT / SELL_LIMIT side) or the venue refused the send. Deliberately
+   // NOT VETO_BROKEN: that one says the ZONE failed (price closed back through
+   // the far edge), while here the zone is intact and the ENTRY was missed.
+   VETO_LIMIT_MISSED        // Limit entry missed (price through it / send refused)
   };
 
 // Pine entry_style: "Midpoint" or "Front Edge"
@@ -87,8 +93,9 @@ enum ENUM_ENTRY_STYLE
                             //   for a LONG and above it for a SHORT: a legal
                             //   BUY_LIMIT / SELL_LIMIT, so the order RESTS AT
                             //   THE BROKER and fills on the pullback. That is
-                            //   the ordinary route; the virtual MARKET arm is
-                            //   the fallback (see CheckVirtualTriggers).
+                            //   the ONLY route (v5.72): an entry that cannot
+                            //   rest is vetoed VETO_LIMIT_MISSED, never chased
+                            //   at market.
                             //   slDist is unchanged at blockHeight + 0.5*ATR, so
                             //   entry<->SL stays exactly slDist -- the offset is
                             //   carried by the entry alone, never a wider stop.
@@ -181,9 +188,9 @@ struct SSniperBlock
    double            rrUnit;           // = blockHeight + 0.5*ATR (Pine b.rr_unit)
    bool              priceAbortLogged; // v5.30: one-shot gate for the Invalid-Price abort
                                        //   (0 from ZeroMemory at every creation site)
-   // v5.40: the per-setup journal session, minted when the setup is ARMED (a
-   // physical broker limit OR an in-memory virtual arm) and reused at the fill,
-   // cancel and conversion paths so ONE setup maps to ONE journal file. Empty
+   // v5.40: the per-setup journal session, minted when the setup's resting
+   // broker limit is ACCEPTED, and reused at the fill and cancel paths so ONE
+   // setup maps to ONE journal file. Empty
    // until arm time; ZeroMemory() clears it at every block-creation site. The
    // string member is safe because SSniperBlock is never raw-serialised (no
    // FileWriteStruct / FileReadStruct / memcpy / sizeof use anywhere in the tree).
@@ -425,7 +432,7 @@ input double   SafetyDailyDDLimit  = 3.0;     // Soft breach: pause new orders a
 input double   SafetyTotalDDLimit  = 5.0;     // Hard breach: close all + halt at this % (Trailing)
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.71"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.72"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart
@@ -437,7 +444,7 @@ input int      InpAnchorTF           = PERIOD_H1;  // Anchor candle timeframe (H
 input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
 
 input group "══════════════════════════════════════════════════"
-input group "  [10] HIGH TABLE AUDITOR — v5.71"
+input group "  [10] HIGH TABLE AUDITOR — v5.72"
 input group "══════════════════════════════════════════════════"
 // Decoupled watchdog: audits live state on its OWN timer cadence rather
 // than inside OnTick, so a halted / paused / tick-starved trade loop can
@@ -447,7 +454,7 @@ input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
 input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
 
 input group "══════════════════════════════════════════════════"
-input group "  [11] MANUAL TRADE ADOPTION — v5.71"
+input group "  [11] MANUAL TRADE ADOPTION — v5.72"
 input group "══════════════════════════════════════════════════"
 // Let this EA manage positions opened BY HAND on its own chart symbol.
 // A manual position is identified as a MAGIC-0 position on m_symbol: the
@@ -464,7 +471,7 @@ input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual
 
 //+------------------------------------------------------------------+
 input group "══════════════════════════════════════════════════"
-input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.71"
+input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.72"
 input group "══════════════════════════════════════════════════"
 // v5.34 built five switches that let a vetoed Phase 1 setup be re-used as a
 // Phase 2 REVERSAL instead of being discarded.

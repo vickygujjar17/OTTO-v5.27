@@ -9,8 +9,9 @@ properties of the shipped sources.
      basket on ANY fill whose ticket differed from the tracked one. A
      SAME-direction scale-in fill was therefore read as a stop-and-reverse and
      fratricided the basket it was meant to add to. The guard now ALSO requires
-     m_activeDirection != newDir, mirroring the virtual trigger's by-construction
-     reversal check.
+     m_activeDirection != newDir. v5.72 retired the virtual MARKET fire that
+     carried the twin of this guard, so the physical guard is now the ONLY
+     one and is pinned as such.
 
   2. CONTINUATION COMMENT TAG (physical). PlaceOrArmOrder() ROUTE A stamps a
      CONSTANT continuation marker ("_C_P") into the resting broker limit's MT5
@@ -112,13 +113,12 @@ check("direction clause is welded onto the same if() as the ticket clause",
       re.search(r"m_activeTrade\.ticket\s*!=\s*newTicket\s*&&\s*"
                 r"m_activeDirection\s*!=\s*newDir", FILLS) is not None)
 
-# The physical guard must mirror the virtual trigger's, which already carried
-# a direction clause -- there expressed as a bool->enum mapping
-# (m_activeDirection != (isLong ? DIR_LONG : DIR_SHORT)).
-check("physical guard mirrors the virtual trigger's direction check",
-      FILLS is not None and VTRIG is not None and
+# v5.72: the virtual trigger that carried the twin guard is retired, so the
+# property is no longer "mirrors the other route" but "is the ONLY route".
+check("the physical guard is the ONLY reversal guard left (v5.72)",
+      FILLS is not None and
       "m_activeDirection != newDir" in FILLS and
-      re.search(r"m_activeDirection\s*!=", VTRIG) is not None)
+      "CheckVirtualTriggers" not in OM_C)
 
 # newDir is resolved by the 3-tier detector as DIR_LONG / DIR_SHORT, so the
 # comparison is always meaningful (never DIR_NONE on a resolved fill).

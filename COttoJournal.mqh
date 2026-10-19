@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.71"
+#property version   "5.72"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__
@@ -152,17 +152,16 @@ public:
 
    //+--------------------------------------------------------------+
    //| LOG SETUP ARMED - create file + SUBJECT line + setup details.   |
-   //| v5.40: the hybrid router arms a setup EITHER as a physical      |
-   //| broker pending limit (price valid for a resting order) OR as an |
-   //| in-memory virtual order (price already through the zone). This  |
-   //| CREATES the per-setup journal either way and stamps the two     |
-   //| facts the operator needs on the header: the Logic and the       |
-   //| Execution Mode (PHYSICAL vs VIRTUAL). v5.52: every setup is a   |
-   //| single CONTINUATION entry, so the header no longer names a      |
-   //| phase. The later entry/cancel/exit append into the same file;   |
-   //| the email ships the full snapshot.                              |
+   //| A setup exists only once its RESTING BROKER LIMIT is accepted,  |
+   //| so there is exactly one execution mode to stamp (v5.72 removed  |
+   //| the in-memory arm that used to be the second). This CREATES the |
+   //| per-setup journal and records the Logic and the Execution Mode  |
+   //| on the header. v5.52: every setup is a single CONTINUATION      |
+   //| entry, so the header no longer names a phase. The later entry/  |
+   //| cancel/exit append into the same file; the email ships the full |
+   //| snapshot.                                                       |
    //+--------------------------------------------------------------+
-   void              LogSetupArmed(bool physical, string tradeId, ENUM_TRADE_DIRECTION dir, ENUM_BLOCK_TYPE btype, double entryPrice, double slPrice, double lotSize, const SSniperBlock &blk)
+   void              LogSetupArmed(string tradeId, ENUM_TRADE_DIRECTION dir, ENUM_BLOCK_TYPE btype, double entryPrice, double slPrice, double lotSize, const SSniperBlock &blk)
      {
       if(!m_ready) return;
       if(!OpenWrite()) return;
@@ -170,7 +169,9 @@ public:
       // (a breakout above Resistance or a breakdown below Support) -- so the
       // header names that and never a phase.
       string phase    = "C (Deep Front-Edge Anticipation)";
-      string execMode = physical ? "PHYSICAL (Broker Limit Order)" : "VIRTUAL (In-Memory Arm)";
+      // v5.72: constant. A setup reaches this writer only after the broker
+      // accepted its resting limit, so there is no second copy to print.
+      string execMode = "PHYSICAL (Broker Limit Order)";
       W("SUBJECT: [ACTIVE] Session " + SubjectLine());
       W("================================================================");
       W("[SETUP ARMED] Session " + m_sessionID + " | " + m_symbol + " (" + (dir==DIR_LONG?"BUY / LONG":"SELL / SHORT") + ") | " + TimeToString(TimeCurrent()));

@@ -194,8 +194,11 @@ check("all four request actions still reach the chokepoint",
       "actions=%s" % sorted(ACTIONS))
 
 calls = len(re.findall(r"\bSendOrderWithRetry\s*\(", OM_CODE))
-check("all seven call sites still route through the chokepoint",
-      calls == 8, "matches=%d (1 definition + 7 call sites expected)" % calls)
+# v5.72: the virtual MARKET fire was one of the seven call sites and went
+# with its engine, so the census is 1 definition + 6 call sites. Asserted as
+# an EQUALITY so a new un-chokepointed send cannot hide behind a >= test.
+check("all six call sites still route through the chokepoint",
+      calls == 7, "matches=%d (1 definition + 6 call sites expected)" % calls)
 
 # The pending builder is the one the defect mis-served; it must keep NO
 # private filling assignment, or a future edit can re-introduce a split path.
