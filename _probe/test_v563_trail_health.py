@@ -33,11 +33,12 @@ B. CHighTableAuditor gains AuditTrailingHealth() plus an aggregate
    circular: a fully frozen stop reads NEGATIVE R and would sail through the
    very test meant to catch it.
 
-   The aggregate leg exists because peakRiskPct is blind to how many legs are
-   stacked behind the shared stop: four legs each inside their own budget can
-   still sum past the stacked-pyramid design. v5.70 floors that sum at
-   RiskPercent, so a degenerate tranche config cannot resolve the ceiling
-   below the primary rung.
+   The aggregate leg exists because peakRiskPct is blind to what the WHOLE
+   basket puts at risk: one leg can sit inside its own budget while the total
+   does not. v5.71 bounds that total by the LARGEST rung plus tolerance, not
+   by the sum of the ladder: the shared ratchet absorbs every older leg, so
+   the nominal sum is unreachable through the live geometry. RiskPercent still
+   participates in the max, so a zeroed ladder cannot under-read.
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -451,20 +452,27 @@ check("the sum accumulates each leg's loss-side percentage",
       re.search(r"sumRiskPct\s*\+=\s*posRiskPct\s*;", RISK_C) is not None)
 check("the sum starts at zero before the loop",
       re.search(r"double\s+sumRiskPct\s*=\s*0\.0\s*;", RISK_C) is not None)
-check("the stacked budget is the SUM of the four nominal rung risks",
-      re.search(r"nominalStackPct\s*=\s*RiskPercent\s*\+\s*InpRiskT2Pct\s*\+"
-                r"\s*InpRiskT3Pct\s*\+\s*InpRiskT4Pct\s*;", RISK_C) is not None)
-# v5.70: the sum is floored at the primary rung before the tolerance is
-# applied, so a zeroed or inverted tranche config cannot resolve the ceiling
-# BELOW RiskPercent and trip the leg on a plain single-leg basket.
-check("the stacked sum is floored at the primary rung",
-      re.search(r"MathMax\(\s*nominalStackPct\s*,\s*RiskPercent\s*\)", RISK_C)
-      is not None)
-check("the floored allowance keeps the same 50% tolerance",
-      re.search(r"maxAllowedStackPct\s*=\s*MathMax\([^)]*\)\s*\*\s*1\.50", RISK_C)
+# v5.71: the bound is keyed to the LARGEST rung, not the sum of the ladder.
+# The shared ratchet puts every older leg at or beyond the live stop, so the
+# nominal sum (2.75%) is unreachable and could not fire on the stacking it was
+# documented to catch. maxRungRiskPct folds in RiskPercent, which preserves the
+# v5.70 property: a zeroed or inverted ladder cannot resolve the ceiling below
+# the primary rung.
+check("the aggregate bound is the largest rung, not the summed ladder",
+      re.search(r"maxRungRiskPct\s*=\s*MathMax\(\s*InpRiskT2Pct\s*,"
+                r"\s*InpRiskT3Pct\s*\)", RISK_C) is not None and
+      re.search(r"maxRungRiskPct\s*=\s*MathMax\(\s*maxRungRiskPct\s*,"
+                r"\s*InpRiskT4Pct\s*\)", RISK_C) is not None)
+check("the unreachable nominal sum is retired from the leg",
+      "nominalStackPct" not in RISK_C)
+check("RiskPercent still participates, so a zeroed ladder cannot under-read",
+      re.search(r"maxRungRiskPct\s*=\s*MathMax\(\s*maxRungRiskPct\s*,"
+                r"\s*RiskPercent\s*\)", RISK_C) is not None)
+check("the worst-rung allowance keeps the same 50% tolerance",
+      re.search(r"maxAllowedAggPct\s*=\s*maxRungRiskPct\s*\*\s*1\.50", RISK_C)
       is not None)
 check("the aggregate test is strictly greater-than, like the per-leg one",
-      re.search(r"if\s*\(\s*sumRiskPct\s*>\s*maxAllowedStackPct\s*\)", RISK_C)
+      re.search(r"if\s*\(\s*sumRiskPct\s*>\s*maxAllowedAggPct\s*\)", RISK_C)
       is not None)
 check("the aggregate breach dispatches through its OWN latch",
       "DispatchAlertOnce(m_alertSent_AggRiskBreach" in RISK_C)

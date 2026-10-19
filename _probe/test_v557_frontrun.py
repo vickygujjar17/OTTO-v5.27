@@ -720,10 +720,19 @@ check("the startup banner names the current release",
 print("\n-- 10. Journal & wick geometry sync --")
 
 check("the journal names the true deep front-edge geometry per direction",
-      JRN_RAW.count("SUPPORT (Front-Run Breakdown / Sell at Near Edge + 2.0*H + 1.5*ATR | SL 1R above entry)") == 2 and
-      JRN_RAW.count("RESISTANCE (Front-Run Breakout / Buy at Near Edge - 2.0*H - 1.5*ATR | SL 1R below entry)") == 2,
-      "S=%d R=%d" % (JRN_RAW.count("Sell at Near Edge + 2.0*H + 1.5*ATR"),
-                     JRN_RAW.count("Buy at Near Edge - 2.0*H - 1.5*ATR")))
+      JRN_RAW.count("SUPPORT (Deep Front-Edge Anticipation / Sell from Near Edge + 2.0*H + 1.5*ATR | SL 1R above entry)") == 2 and
+      JRN_RAW.count("RESISTANCE (Deep Front-Edge Anticipation / Buy from Near Edge - 2.0*H - 1.5*ATR | SL 1R below entry)") == 2,
+      "S=%d R=%d" % (JRN_RAW.count("Sell from Near Edge + 2.0*H + 1.5*ATR"),
+                     JRN_RAW.count("Buy from Near Edge - 2.0*H - 1.5*ATR")))
+# v5.71: the entry captions moved onto the model's canonical vocabulary. The
+# retired "Front-Run Breakdown/Breakout" phrasing described an entry that has
+# not shipped since v5.66, so it must not survive -- while "Front-Run veto"
+# legitimately remains, because the veto is still a front-run veto.
+check("the retired Front-Run entry captions are gone",
+      "Front-Run Breakdown" not in JRN_RAW and
+      "Front-Run Breakout" not in JRN_RAW)
+check("the front-run VETO wording is retained",
+      "Front-Run veto anchor" in JRN_RAW)
 # The retired v5.66/v5.67 captions described a far-edge-anchored stop. That is
 # no longer where the stop lives, so they must not survive anywhere.
 check("the retired far-edge SL captions are gone",
@@ -732,7 +741,7 @@ check("the retired inverted near-edge signs are gone",
       "Sell at Near Edge - 2.0*H" not in JRN_RAW and
       "Buy at Near Edge + 2.0*H" not in JRN_RAW)
 check("the armed header prints the deep gap, not the retired 0.5*ATR offset",
-      JRN_RAW.count("(Front-Run: near edge +/- 2.0*H +/- 1.5*ATR)") == 1 and
+      JRN_RAW.count("(Deep Front-Edge: near edge +/- 2.0*H +/- 1.5*ATR)") == 1 and
       "near edge +/- 0.5*ATR" not in JRN_RAW)
 check("the retired 'Aggressive' block wording is gone",
       "Aggressive" not in JRN_RAW)

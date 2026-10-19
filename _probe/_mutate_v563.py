@@ -19,8 +19,8 @@ while "simplifying" the release, not as arbitrary corruption:
   * losing a healthy-path re-arm on either new latch
   * dropping the two-cycle confirmation on the aggregate leg
   * widening the per-leg sum to include profit-side legs
-  * hardcoding the stacked budget instead of summing the live inputs
-  * dropping the v5.70 primary-rung floor so a zeroed ladder under-reads
+  * reverting the bound to the summed ladder (unreachable, so inert)
+  * dropping the RiskPercent term so a zeroed ladder under-reads
   * dropping the geometry push, or gating it on the wrong branch
 
 Anchors are written with plain \\n and applied CRLF-tolerantly, so this table
@@ -202,17 +202,20 @@ MUTATIONS += [
      "         sumRiskPct += posRiskPct;",
      "         ;"),
 
-    ("the stacked budget is hardcoded instead of summing the live inputs", AUD,
-     "      double nominalStackPct    = RiskPercent + InpRiskT2Pct + InpRiskT3Pct + InpRiskT4Pct;",
-     "      double nominalStackPct    = 2.75;"),
+    # v5.71 retarget: the bound is the largest rung. "Simplifying" it back to the
+    # summed ladder is the most plausible regression, and it is exactly the
+    # unreachable form v5.71 removed -- so it must be caught.
+    ("the aggregate bound reverts to summing the ladder", AUD,
+     "      double maxRungRiskPct   = MathMax(InpRiskT2Pct, InpRiskT3Pct);",
+     "      double maxRungRiskPct   = RiskPercent + InpRiskT2Pct + InpRiskT3Pct + InpRiskT4Pct;"),
 
     ("the aggregate allowance loses the 50% tolerance", AUD,
-     "      double maxAllowedStackPct = MathMax(nominalStackPct, RiskPercent) * 1.50;",
-     "      double maxAllowedStackPct = MathMax(nominalStackPct, RiskPercent);"),
+     "      double maxAllowedAggPct = maxRungRiskPct * 1.50;",
+     "      double maxAllowedAggPct = maxRungRiskPct;"),
 
-    ("the aggregate allowance loses its primary-rung floor", AUD,
-     "      double maxAllowedStackPct = MathMax(nominalStackPct, RiskPercent) * 1.50;",
-     "      double maxAllowedStackPct = nominalStackPct * 1.50;"),
+    ("the aggregate allowance drops the RiskPercent term", AUD,
+     "      maxRungRiskPct          = MathMax(maxRungRiskPct, RiskPercent);\n",
+     ""),
 
     ("the aggregate two-cycle confirmation is dropped", AUD,
      "         if(m_aggRiskSeen)\n"

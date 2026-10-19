@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.70"
+#property version   "5.71"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -1326,42 +1326,49 @@ public:
    //|      The exception is keyed to the EXACT tracked ticket, so an     |
    //|      unrelated manual or foreign-EA magic-0 leg still cannot be    |
    //|      counted -- the blast radius stays one position.              |
-   //|                                                                   |
-   //| v5.63 adds a SECOND, independent leg to this body: the SUM of the  |
-   //| loss-side risk across the basket, measured against the stacked     |
-   //| design budget (RiskPercent + InpRiskT2Pct + InpRiskT3Pct +        |
-   //| InpRiskT4Pct, plus the same 50% tolerance). The per-leg peak above |
-   //| cannot see it: four legs each comfortably inside 1.5% can still    |
-   //| sum past what the pyramid was designed to carry. The two checks    |
+   //|                                                                    |
+   //| v5.63 adds a SECOND, independent leg to this body: the loss-side   |
+   //| risk AGGREGATED across the basket, measured against the largest    |
+   //| single rung plus the same 50% tolerance. The per-leg peak above    |
+   //| cannot see it: one leg can be comfortably inside its own budget    |
+   //| while the total the basket puts at risk is not. The two checks     |
    //| share the loop and the loss-side guard, and each owns its own      |
    //| latch, so a basket can report either, both, or neither.            |
-   //|                                                                   |
-   //| v5.68 DELIBERATELY CHANGED NOTHING HERE. With the shipped inputs    |
-   //| the stacked budget resolves to 1.0 + 1.0 + 0.5 + 0.25 = 2.75%      |
-   //| nominal, 4.125% with tolerance, which is the pyramid's design      |
-   //| ceiling -- so the deep entry geometry (2.0*bh + 1.5*ATR) and the   |
-   //| pyramiding tranches are already fully covered by this body and     |
-   //| needed no new check. Note in particular that the DEEP ENTRY GAP     |
-   //| cannot inflate either measure: both read the distance from entry   |
-   //| to the LIVE broker stop, and that leg starts as m_basketRRUnit     |
-   //| (bh + 0.5*ATR), which is 1R by construction and independent of how |
-   //| wide the entry gap is. A correctly-sized scale-in therefore reads  |
-   //| at its nominal rung and can never false-alarm here, while a real   |
-   //| sizing bug still does.                                             |
    //|                                                                    |
-   //| v5.70 FLOORS THE STACKED BUDGET AT RiskPercent. The sum above is   |
-   //| RETAINED -- it is the ceiling the pyramid was designed against     |
-   //| (2.75% nominal, 4.125% with tolerance), so a correctly-sized ladder|
-   //| still sits exactly at it and still never alerts. The floor exists  |
-   //| for the degenerate case: InpRiskT2Pct/T3Pct/T4Pct are operator     |
-   //| inputs, and a zeroed or negative ladder would drive the sum BELOW  |
-   //| the primary rung, resolving the ceiling under RiskPercent so that a|
-   //| plain single-leg basket trips this leg before any scale-in. The    |
-   //| bound is MathMax(nominalStackPct, RiskPercent) * 1.50, which is    |
-   //| IDENTICAL to the v5.63 value whenever the tranche inputs are       |
-   //| non-negative and never under-reads either. (MathMax takes exactly  |
-   //| two arguments in MQL5, hence the two-operand floor rather than the |
-   //| four-argument form.)                                               |
+   //| v5.71 RE-KEYS THE BOUND TO THE LARGEST RUNG. v5.63/v5.70 measured  |
+   //| the SUM of the four nominal rung risks (1.0 + 1.0 + 0.5 + 0.25 =   |
+   //| 2.75%, 4.125% with tolerance) and called that the design ceiling.  |
+   //| The shipped geometry cannot reach it. Every rung is opened about 1R|
+   //| from ONE shared stop, and ApplyUnifiedSL() ratchets that stop      |
+   //| forward only:                                                      |
+   //|                                                                    |
+   //|     T2 at +1.0R  ->  stop at breakeven     (primary entry +/- fric)|
+   //|     T3 at +2.0R  ->  stop at primary +1.0R                         |
+   //|     T4 at +3.0R  ->  stop at primary +2.0R                         |
+   //|                                                                    |
+   //| so an OLDER leg is already behind the stop and its loss-side       |
+   //| distance is <= 0. The guard skips it, and it adds nothing to the   |
+   //| sum. A healthy ladder therefore reads roughly its NEWEST rung:     |
+   //| ~1.0% at T2, ~0.5% at T3, ~0.25% at T4 -- never 2.75%. The 4.125%  |
+   //| bound could not fire on the stacking it was documented to catch,   |
+   //| and the only way to reach it was a sizing error the per-leg check  |
+   //| had already reported.                                              |
+   //|                                                                    |
+   //| The bound is now max(rungs, RiskPercent) * 1.50, i.e. 1.50% on the |
+   //| shipped 1.0% ladder. A correctly-sized T1+T2 basket reads ~1.0%    |
+   //| against 1.50%, so it keeps 33% headroom and still never alerts. The|
+   //| RiskPercent term preserves the v5.70 property: a zeroed or inverted|
+   //| InpRiskT2Pct/T3/T4 cannot resolve the ceiling below the primary    |
+   //| rung, so a plain single-leg basket cannot trip this leg. A breach  |
+   //| now means the ratchet is NOT absorbing the older legs, which is the|
+   //| failure this leg exists to report.                                 |
+   //|                                                                    |
+   //| Note that the DEEP ENTRY GAP cannot inflate either measure: both   |
+   //| read the distance from entry to the LIVE broker stop, and that leg |
+   //| starts as m_basketRRUnit (bh + 0.5*ATR), which is 1R by            |
+   //| construction and independent of how wide the entry gap is. A       |
+   //| correctly-sized scale-in therefore reads at its nominal rung and   |
+   //| can never false-alarm here, while a real sizing bug still does.    |
    //+------------------------------------------------------------------+
    void              AuditRiskExposure(void)
      {
@@ -1445,22 +1452,29 @@ public:
         }
 
       // ---- v5.63: the AGGREGATE leg --------------------------------------
-      // The per-leg test above is blind to how many legs are stacked behind
-      // the shared stop: four legs each inside their own budget can still sum
-      // past the design. The stacked budget is the same 50% tolerance applied
-      // to the SUM of the nominal rung risks, so a correctly-sized pyramid at
-      // full size sits exactly at it and never alerts. Confirmed across two
-      // cycles for the same reason as the trail check: a tranche landing just
-      // before its stop is pushed reads high for one cycle, and that is the
-      // normal shape of a fill rather than an incident.
-      double nominalStackPct    = RiskPercent + InpRiskT2Pct + InpRiskT3Pct + InpRiskT4Pct;
-      // v5.70: floor the design sum at the primary rung. The sum is only an
-      // upper bound while the tranche inputs are positive -- a zeroed or
-      // inverted InpRiskT2Pct/T3/T4 would resolve the ceiling BELOW
-      // RiskPercent and trip this leg on a plain single-leg basket. The floor
-      // is inert under every sane config, so the shipped ladder is unaffected.
-      double maxAllowedStackPct = MathMax(nominalStackPct, RiskPercent) * 1.50;
-      if(sumRiskPct > maxAllowedStackPct)
+      // The per-leg test above is blind to what the whole basket carries: one
+      // leg can sit inside its own budget while the total does not.
+      //
+      // v5.71 keys the bound to the LARGEST rung, not to the sum of the
+      // ladder. Under the shared one-way ratchet every older leg sits at or
+      // beyond the live stop, so its loss-side distance is <= 0, the guard
+      // above skips it, and a healthy ladder sums to roughly its newest rung
+      // (~1.0% at T2, ~0.5% at T3, ~0.25% at T4). The 2.75% sum was therefore
+      // unreachable and could not fire on the stacking it was written to
+      // catch. Still confirmed across two cycles for the same reason as the
+      // trail check: a tranche landing just before its stop is pushed reads
+      // high for one cycle, which is the normal shape of a fill rather than
+      // an incident.
+      // v5.71: measure the LARGEST rung, not the sum. The sum is unreachable
+      // through the live ratchet (see the doc box above), so it could not fire
+      // on the stacking it claimed to catch. RiskPercent is folded into the
+      // max so the v5.70 property survives: a zeroed or inverted tranche
+      // config can never resolve the ceiling below the primary rung.
+      double maxRungRiskPct   = MathMax(InpRiskT2Pct, InpRiskT3Pct);
+      maxRungRiskPct          = MathMax(maxRungRiskPct, InpRiskT4Pct);
+      maxRungRiskPct          = MathMax(maxRungRiskPct, RiskPercent);
+      double maxAllowedAggPct = maxRungRiskPct * 1.50;
+      if(sumRiskPct > maxAllowedAggPct)
         {
          if(m_aggRiskSeen)
            {
@@ -1468,14 +1482,14 @@ public:
                               "HighTable: aggregate basket risk breach",
                               "Summed loss-side risk across the basket is " +
                               DoubleToString(sumRiskPct, 2) +
-                              "% of equity, above the stacked-pyramid allowance " +
-                              DoubleToString(maxAllowedStackPct, 2) + "% (" +
-                              DoubleToString(nominalStackPct, 2) +
-                              "% nominal design + 50% tolerance). The worst single" +
+                              "% of equity, above the worst-rung allowance " +
+                              DoubleToString(maxAllowedAggPct, 2) + "% (" +
+                              DoubleToString(maxRungRiskPct, 2) +
+                              "% largest rung + 50% tolerance). The worst single" +
                               " leg is " + DoubleToString(peakRiskPct, 2) +
                               "%, so every leg may be individually in budget - the" +
-                              " problem is how many of them are stacked behind the" +
-                              " shared stop.",
+                              " problem is that the shared ratchet is NOT absorbing" +
+                              " the legs behind the newest one.",
                               HT_SEV_WARN);
            }
          else

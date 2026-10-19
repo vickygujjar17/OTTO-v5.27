@@ -1,0 +1,151 @@
+571: fix — key the High Table aggregate ceiling to the worst rung (4.125% -> 1.50%)
+
+RATIONALE
+
+  v5.63 added an aggregate leg to AuditRiskExposure(): it sums the loss-side
+  percentage of every leg behind the shared stop and compares that sum against
+  the "stacked design budget" -- RiskPercent + InpRiskT2Pct + InpRiskT3Pct +
+  InpRiskT4Pct, times the same 1.50 the per-leg check uses. On the shipped
+  inputs that resolves to 2.75% nominal / 4.125% with tolerance, and both v5.63
+  and v5.68 documented it as the pyramid's design ceiling, which "a
+  correctly-sized ladder sits exactly at" and therefore "never alerts".
+
+  That is false, and this release corrects the bound rather than the prose.
+
+  1. THE 4.125% BOUND WAS UNREACHABLE.
+
+     Every rung is opened roughly 1R from ONE shared stop, and ApplyUnifiedSL()
+     ratchets that stop forward one way only (it refuses any looser value):
+
+         T2 at +1.0R  ->  stop at breakeven    (primary entry +/- friction)
+         T3 at +2.0R  ->  stop at primary +1.0R
+         T4 at +3.0R  ->  stop at primary +2.0R
+
+     The aggregate leg skips any leg whose loss-side distance is <= 0
+     ("if(lossDist <= 0.0) continue;"). By the time T3 exists, T1 and T2 are
+     both BEHIND the stop and contribute nothing; by T4, three legs contribute
+     nothing. A healthy ladder therefore sums to roughly its NEWEST rung only:
+
+         ~1.0% at T2      ~0.5% at T3      ~0.25% at T4
+
+     never 2.75%. The ceiling could not fire on the stacking it was documented
+     to catch, and the only way to reach it was a sizing error large enough
+     that the per-leg check had already reported it. A guard that is
+     unreachable through the geometry it guards is not an upper bound; it is
+     dead weight that reads as coverage.
+
+  2. THE BOUND IS NOW THE LARGEST RUNG.
+
+         double maxRungRiskPct   = MathMax(InpRiskT2Pct, InpRiskT3Pct);
+         maxRungRiskPct          = MathMax(maxRungRiskPct, InpRiskT4Pct);
+         maxRungRiskPct          = MathMax(maxRungRiskPct, RiskPercent);
+         double maxAllowedAggPct = maxRungRiskPct * 1.50;   // 1.50% shipped
+
+     nominalStackPct is REMOVED, not kept beside the new bound: it has no
+     remaining reader and an unused MQL5 local is a build warning.
+
+  3. THE v5.70 PROPERTY SURVIVES.
+
+     RiskPercent is folded into the max, so a zeroed or inverted
+     InpRiskT2Pct/T3/T4 still cannot resolve the ceiling below the primary
+     rung. A plain single-leg basket keeps exactly the 1.50% bound v5.70
+     intended for it, and cannot trip this leg before any scale-in. The floor
+     was never the part that was wrong; the SUM was.
+
+  4. THIS REVERSES A DOCUMENTED DECISION, DELIBERATELY.
+
+     _commit570.txt:37-43 rejected "dropping it to a single-rung ceiling" on
+     the grounds that it "would alert WARN on every correctly-sized T1+T2
+     basket, converting a targeted detector into constant noise", and stated
+     that such a ladder "sits exactly at" 4.125%.
+
+     Measured against the ratchet above, a correctly-sized T1+T2 basket reads
+     ~1.0% against a 1.50% ceiling: 33% headroom, no alert. The rejection
+     reasoned about the sum as if every leg were still exposed, which the
+     shared stop prevents. It was recorded as a design claim rather than an
+     observation, and it is wrong.
+
+  5. WHAT DOES NOT MOVE.
+
+     No entry, no exit, no sizing, no position count, no stop level. The leg
+     keeps its own latch (m_alertSent_AggRiskBreach), its two-cycle
+     confirmation (m_aggRiskSeen), its ClearLatch re-arm on the healthy path,
+     and HT_SEV_WARN. Only the bound and the wording that explains it change.
+     The alert text no longer blames "how many of them are stacked behind the
+     shared stop" -- under the ratchet that condition is normal and healthy.
+     It now reports the actual failure: the ratchet is NOT absorbing the legs
+     behind the newest one.
+
+  6. JOURNAL: DEEP FRONT-EDGE WORDING.
+
+     COttoJournal still captioned the entry as a "Front-Run" in six
+     operator-facing literals, while the shipped model has been the deep
+     front-edge anticipation entry since v5.66/v5.69 ("TRUE DEEP FRONT-EDGE
+     (v5.69)" in the ENTRY_FRONT_EDGE banner). The literals move onto the
+     tree's own canonical vocabulary:
+
+       * phase label    "C (Pure Trend Continuation)"
+                     -> "C (Deep Front-Edge Anticipation)"
+       * LogSetupArmed  "SUPPORT (Front-Run Breakdown / Sell at Near Edge
+                         + 2.0*H + 1.5*ATR | SL 1R above entry)"
+                     -> "SUPPORT (Deep Front-Edge Anticipation / Sell from
+                         Near Edge + 2.0*H + 1.5*ATR | SL 1R above entry)"
+       * the same for the RESISTANCE / Buy caption, and for the second copy
+         of both pairs in LogEntry (four captions in total)
+       * armed header   "(Front-Run: near edge +/- 2.0*H +/- 1.5*ATR)"
+                     -> "(Deep Front-Edge: near edge +/- 2.0*H +/- 1.5*ATR)"
+
+     The "Front-Run veto" wording is RETAINED on purpose, in the journal and
+     everywhere else: the veto is still a front-run veto and
+     InpEnableFrontRunVeto still names it. The retired phrases were the ones
+     describing the ENTRY, which has not been a front-run since v5.66.
+
+     CAVEAT: no release sketch for this wording was found on disk (searched
+     *.txt, *.md, *.pine, *.json under Downloads). These strings are composed
+     from the vocabulary already shipped in OttoDefines.mqh rather than copied
+     from an operator spec. They are cosmetic -- printed text only, no parsed
+     consumer -- but if a specific wording was intended, only the literals
+     change; the ceiling work is independent of it.
+
+PROBE IMPACT
+
+  Retargeted, not weakened. Every changed pin keeps its original purpose:
+
+    * test_v563_trail_health.py: the "sum of four rungs" and "floored sum"
+      pins become the worst-rung pins, PLUS a new negative pin
+      ("nominalStackPct" not in RISK_C) so the unreachable sum cannot quietly
+      return. The comparison pin follows maxAllowedAggPct.
+    * _mutate_v563.py: the three aggregate mutations were anchored on the
+      removed symbols and would have reported SKIPPED -- which fails the run by
+      design. They are retargeted onto the new bound: reverting it to the
+      summed ladder, dropping the 1.50 tolerance, and dropping the RiskPercent
+      term. Still 39 mutations, 0 skipped.
+    * test_v557_frontrun.py: journal captions follow the new literals, plus two
+      new pins -- the retired "Front-Run Breakdown/Breakout" phrases are gone,
+      and "Front-Run veto anchor" SURVIVES (guarding against over-reach in
+      exactly the direction this commit was tempted to go).
+    * test_v540_hybrid.py: the constant-logic pin names the new phase string and
+      asserts the old one is absent.
+
+  All pins run against comment-stripped source, so prose describing the old
+  layout can neither satisfy nor break them.
+
+VERIFICATION
+
+  * _tools/_patch571.py -- 6 files, 16 asserted replacements, from a clean tree.
+  * _tools/_bump_version.py 5.71 -- 20 version rows; no v5.70 literal remains.
+  * build_check.ps1 -- 0 errors, 0 warnings (otto.ex5, 259022 bytes).
+  * test_v563_trail_health.py -- 166/166.
+  * _mutate_v563.py -- 39/39 caught, 0 skipped.
+  * test_v557_frontrun.py -- 124/124.
+  * test_v540_hybrid.py -- 41/41.
+  * Full probe suite -- identical to the v5.70 baseline: v528 57/68,
+    v531 15/38, v532 126/136, v543 27/29, every other probe green. Those four
+    partial counts are pre-existing and unchanged by this commit.
+  * normalize_eol.py -- 11 files, 0 rewritten, strict CRLF.
+
+  No Strategy Tester run accompanies this commit. The claim that a healthy
+  ladder sums to ~1.0% at T2 rests on reading the loss-side guard together
+  with the one-way ratchet, not on an observed tick-by-tick trace of a live
+  basket. It is the same static-evidence standard the v5.61/v5.63 ratchet
+  arguments were accepted on.
