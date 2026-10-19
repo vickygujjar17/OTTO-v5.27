@@ -216,12 +216,18 @@ OM_SLD = body(OM_C, "CalcSLDistance(const SSniperBlock &block, double atr)")
 BM_GET = body(BM_C, "GetATRAtShift(int shift)")
 BM_BEP = body(BM_C, "BlockEntryPrice(const SSniperBlock &b, double atr) const")
 BM_PROC = body(BM_C, "ProcessBlocks(int marketDay)")
+# v5.80 ARCHITECTURAL STRIP: UpdateIntraBar() -- the intra-bar twin of the
+# Front-Run veto -- is DELETED, together with CheckVetoesInTick(). The
+# extraction is kept so section 2 can assert its ABSENCE by name rather than
+# leaving a dangling `None` that crashes later code.
 BM_INTRA = body(BM_C, "UpdateIntraBar(int marketDay)")
 
 # The gate count is asserted as an EQUALITY so a third (ungated) pass added
 # later fails the probe instead of passing it. The leading text guard stops
 # the lookbehind escaping a named constant such as !InpUseFrontRunVeto, and
 # \b admits the bar-close form that ANDs a hasExited/!isTriggered guard on.
+# v5.80: the Front-Run veto is RETIRED, so the expected count is now ZERO --
+# the equality still does its job, in the other direction.
 _gates0 = re.findall(r"(?<![\w!])if\(InpUseFrontRunVeto\b", BM_RAW)
 _gates = len(_gates0)
 
@@ -259,8 +265,8 @@ check("the reversal fallback is guarded by atr > 0, not a hard return",
 # TypeError deep inside norm() -- a probe that crashes reports nothing.
 check("every OrderManager price path resolved",
       all(f is not None for f in (OM_PLACE, OM_REV, OM_CALC, OM_SLD)))
-check("both BlockManager passes plus the entry helper resolved",
-      all(f is not None for f in (BM_GET, BM_BEP, BM_PROC, BM_INTRA)))
+check("the BlockManager helpers still resolve",
+      all(f is not None for f in (BM_GET, BM_BEP, BM_PROC)))
 
 # ----------------------------------------------------------------------
 # 2. GetATRAtShift() is reachable, and reads the shift it names
@@ -277,22 +283,21 @@ check("it honours the named shift rather than a hardcoded slot",
 check("it returns 0 for an unpopulated slot rather than EMPTY_VALUE",
       "EMPTY_VALUE" in (BM_GET or "") and "return 0" in (BM_GET or ""))
 
-# The veto must read the same shift the order does, or the two judge
-# different ATRs. All three BlockManager consumers are named here so a
-# future shift change is a conscious edit.
-check("the Front-Run veto projection reads shift 1",
-      re.search(r"double atrNow = GetATRAtShift\(1\);", BM_PROC or "") is not None)
-check("the intra-bar twin reads shift 1",
-      re.search(r"double atrNow = GetATRAtShift\(1\);", BM_INTRA or "") is not None)
-check("BOTH veto passes are gated on InpUseFrontRunVeto",
-      _gates == 2, "found %d" % _gates)
-check("the bar-close pass only judges blocks that left the zone untriggered",
-      "if(InpUseFrontRunVeto && b.hasExited && !b.isTriggered)" in norm(BM_PROC or ""))
-check("the intra-bar pass re-checks every block, triggered or not",
-      "if(InpUseFrontRunVeto)" in norm(BM_INTRA or ""))
+# v5.80: the Front-Run veto that used to read shift 1 in BOTH BlockManager
+# passes is RETIRED. What must hold now is the reverse -- no BlockManager pass
+# reads shift 1 for veto purposes any more, and the intra-bar twin is gone.
+check("the Front-Run veto pass is gone from the BlockManager",
+      _gates == 0, "found %d InpUseFrontRunVeto gate(s)" % _gates)
+check("the retired bar-close veto predicate is gone",
+      "if(InpUseFrontRunVeto && b.hasExited && !b.isTriggered)"
+      not in norm(BM_PROC or ""))
+check("the intra-bar twin UpdateIntraBar() was deleted",
+      BM_INTRA is None and "UpdateIntraBar" not in BM_C)
+check("its public wrapper CheckVetoesInTick() was deleted",
+      "CheckVetoesInTick" not in BM_C and
+      "CheckVetoesInTick(" not in strip_comments(MAIN_T))
 check("the anticipation entry applies at EVERY entry style, not just the default",
-      len(re.findall(r"ENTRY_FRONT_EDGE", BM_PROC or "")) == 0
-      and len(re.findall(r"ENTRY_FRONT_EDGE", BM_INTRA or "")) == 0,
+      len(re.findall(r"ENTRY_FRONT_EDGE", BM_PROC or "")) == 0,
       "the front-run pass must not be switchable away by InpEntryStyle")
 
 
@@ -341,47 +346,34 @@ for _label, _blob in (("BlockEntryPrice", BEP_BODY), ("CalcEntryPrice", CALC_BOD
           "(bottom + gap)" not in _blob and "(top - gap)" not in _blob)
 
 # ----------------------------------------------------------------------
-# 4. The far-edge target anchor, in BOTH BlockManager passes
+# 4. The far-edge target anchor (OrderManager only since v5.80)
 # ----------------------------------------------------------------------
+# The Front-Run veto was the ONLY consumer of a BlockManager-side TP
+# projection, so both its bar-close copy and the intra-bar twin went with it.
+# What remains -- and must remain -- is the projection that actually SETS the
+# take-profit: the OrderManager's. Its anchor is pinned in section 6.
 print("\n-- 4. Far-edge target anchor --")
 
 FAR_EDGE_LONG = "isLong ? MathMax(top, bottom) : MathMin(top, bottom);"
-for label, fn in (("ProcessBlocks", BM_PROC), ("UpdateIntraBar", BM_INTRA)):
-    blob = canon(norm(fn or ""), "b")
-    check("%s anchors the target on the FAR edge" % label, FAR_EDGE_LONG in blob)
-    check("%s projects it by tpRR * calcSLDist" % label,
-          "isLong ? farEdge + tpRR * calcSLDist : farEdge - tpRR * calcSLDist;" in blob)
-    check("%s defers to the placed order's localTP once it exists" % label,
-          "target = localTP;" in blob)
-    check("%s measures the hit off the high/low pair" % label,
-          "bool hit = isLong ? (high" in blob)
-    check("%s still vetoes with VETO_FRONTRUN" % label,
-          "SetVeto(i, VETO_FRONTRUN);" in blob)
-    check("%s prices from the SAME shift-1 ATR the order uses" % label,
-          "double calcSLDist = blockHeight + (0.5 * atrNow);" in blob)
 
-check("both BlockManager passes carry the far-edge anchor",
-      len(re.findall(r"double farEdge = isLong \? MathMax\(b\.top, b\.bottom\)",
-                     BM_C)) == 2,
-      "found %d" % len(re.findall(r"double farEdge = isLong \? MathMax\(b\.top, b\.bottom\)", BM_C)))
-check("both passes defer to block.localTP",
-      len(re.findall(r"target = b\.localTP;", BM_C)) == 2)
-check("neither pass recalls a single-arg entry helper",
-      "BlockEntryPrice(b)" not in BM_PROC and
-      "BlockEntryPrice(b)" not in BM_INTRA)
+check("the BlockManager no longer projects a target at all (veto retired)",
+      "farEdge" not in BM_C and "calcSLDist" not in BM_C,
+      "a residual projection means a veto pass survived")
+check("neither BlockManager pass vetoes with VETO_FRONTRUN",
+      "SetVeto(i, VETO_FRONTRUN);" not in BM_C)
+check("the BlockManager does not recall a single-arg entry helper",
+      "BlockEntryPrice(b)" not in (BM_PROC or ""))
 
 # The anchor is only FAR if the high edge is named first: on a valid block
 # top > bottom, so MathMax(top,bottom) SHORT would be near-edge anchored.
 # PlaceOrArmOrder holds the block by reference (&block), so its operand
 # names the variable rather than the literal field -- hence `\w+\.top`.
-anchor_kind = [re.search(r"isLong \? (Math\w+)\(\w+\.top, \w+\.bottom\)", c)
-               for c in (norm(BM_PROC or ""), norm(BM_INTRA or ""),
-                         norm(OM_PLACE or ""))]
-check("all three projections take the HIGH edge for a LONG",
-      all(m is not None and m.group(1) == "MathMax" for m in anchor_kind),
-      "ops=%s" % [m.group(1) if m else None for m in anchor_kind])
-check("the anchor comments state the top/bottom LONG-SHORT mapping",
-      "top LONG / b.bottom SHORT" in BM_RAW and
+anchor_kind = re.search(r"isLong \? (Math\w+)\(\w+\.top, \w+\.bottom\)",
+                        norm(OM_PLACE or ""))
+check("the surviving projection takes the HIGH edge for a LONG",
+      anchor_kind is not None and anchor_kind.group(1) == "MathMax",
+      "op=%s" % (anchor_kind.group(1) if anchor_kind else None))
+check("the anchor comment states the top/bottom LONG-SHORT mapping",
       "top LONG / block.bottom SHORT" in OM_RAW)
 
 # The OrderManager must project the veto an IDENTICAL target from the same
@@ -439,16 +431,14 @@ check("the entry helper is not called from the break test at all",
 check("the retired inline far-edge literals stay retired (no double buffer)",
       "b.bottom - ATRBufferBreak" not in BM_C and
       "b.top + ATRBufferBreak" not in BM_C)
-# Exactly ONE declaration, and only in ProcessBlocks: a second (un-decoupled)
-# break test in the intra-bar twin would kill the block independently. One
-# declaration plus the two predicate arms is 3 mentions, and the wording of the
-# surrounding comments keeps that exact so a stray identifier in prose fails
-# here rather than passing silently.
+# Exactly ONE declaration, and only in ProcessBlocks. v5.80 deleted the
+# intra-bar twin (UpdateIntraBar) that used to be checked here, so the guard
+# now asserts against the whole file: one declaration plus the two predicate
+# arms is 3 mentions, and the surrounding comments keep that exact so a stray
+# identifier in prose fails here rather than passing silently.
 check("exactly one break level is declared, and only in ProcessBlocks",
-      BM_C.count("breakLevel") == 3 and
-      "breakLevel" not in (BM_INTRA or ""),
-      "count=%d intra=%s" % (BM_C.count("breakLevel"),
-                             "breakLevel" in (BM_INTRA or "")))
+      BM_C.count("breakLevel") == 3,
+      "count=%d" % BM_C.count("breakLevel"))
 # Ordering inside ProcessBlocks is the whole defence: the block must already be
 # armed when the break is evaluated, or the veto could fire on a block that
 # never placed anything (and the arming close is the one that still looks past
@@ -497,8 +487,12 @@ check("rrUnit is seeded from the SAME slDist the order used",
       "rrUnit = slDist;" in PLACE_W)
 check("InpMaxRR is the one projection input, defaulting to 1.0 if unset",
       "tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;" in PLACE_W)
-check("the BlockManager checkout projects from the SAME InpMaxRR input",
-      "tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;" in norm(BM_PROC or ""))
+# v5.80: the BlockManager no longer projects a target, so it no longer reads
+# InpMaxRR at all. The input survives ONLY as the OrderManager's TP multiple --
+# which is exactly the "one input" property this pair of checks protects.
+check("the BlockManager no longer projects a TP from InpMaxRR",
+      "tpRR" not in BM_C and "InpMaxRR" not in BM_C,
+      "a BlockManager InpMaxRR read means a veto pass survived")
 check("the SL and TP both land on the block for the veto to read back",
       "block.localSL = stopLoss;" in PLACE_W and
       "block.localTP = takeProfit;" in PLACE_W)
@@ -656,10 +650,17 @@ check("neither twin consults ENTRY_FRONT_EDGE directly (it is the else-branch)",
       "ENTRY_FRONT_EDGE" not in (BM_BEP or ""))
 check("InpMaxRR defaults to 4.0",
       re.search(r"InpMaxRR\s*=\s*4\.0", DEFS_T) is not None)
-check("the front-run veto is switchable and defaults on",
-      re.search(r"InpUseFrontRunVeto\s*=\s*true", DEFS_T) is not None)
-check("the BlockManager gates both veto passes on InpUseFrontRunVeto",
-      _gates == 2)
+# v5.80: the Front-Run VETO is retired, but InpMaxRR is NOT -- it still sets the
+# take-profit multiple, so it must keep its shipped 4.0 default. The veto's own
+# switch must now be OFF and labelled retired, or an operator would reasonably
+# believe the filter still runs.
+check("InpMaxRR survives as the live TP multiple (not a filter knob)",
+      "Take-profit projection" in DEFS_T)
+check("the retired Front-Run veto switch is off and labelled RETIRED",
+      re.search(r"InpUseFrontRunVeto\s*=\s*false", DEFS_T) is not None and
+      re.search(r"InpUseFrontRunVeto[^\n]*RETIRED \(v5\.80\)", DEFS_T) is not None)
+check("no BlockManager veto pass is gated on InpUseFrontRunVeto",
+      _gates == 0)
 check("the retired single-arg helper left no call site anywhere",
       "BlockEntryPrice(b)" not in BM_C and
       "CalcEntryPrice(block)" not in OM_C)
@@ -688,7 +689,7 @@ missing = [f for f in ALL_FILES
                             read(os.path.join(ROOT, f)))]
 check("all %d shipped sources carry one common stamp" % len(ALL_FILES),
       not missing, "missing: %s" % ", ".join(missing))
-check("the common stamp is v5.57 or later", rel_parts(STAMPS) >= (5, 57),
+check("the common stamp is v5.80 or later", rel_parts(STAMPS) >= (5, 80),
       "stamps=%s" % sorted(set(STAMPS)))
 check("the two-twin invariant is justified in BOTH files",
       "the Front-Run veto would judge a different price" in BM_RAW and

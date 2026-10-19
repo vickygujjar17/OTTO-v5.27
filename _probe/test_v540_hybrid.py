@@ -192,8 +192,15 @@ check("pending count is the broker pool alone (v5.72)",
       "m_virtualCount" not in COUNT)
 check("invalid-block cleanup deletes a resting physical order",
       "DeleteOrder(physTicket)" in OM_T)
-check("consensus sweep deletes physical pendings",
-      "VECTOR CANCEL (physical)" in OM_T)
+# v5.80 ARCHITECTURAL STRIP: the consensus sweep is DELETED, so it can no
+# longer delete anything -- physical or otherwise. The property this check
+# exists to protect (every surviving cancel path acts on a REAL broker row, not
+# an in-memory phantom) is asserted below by naming the paths that remain.
+check("consensus sweep no longer deletes physical pendings",
+      "VECTOR CANCEL (physical)" not in OM_T)
+check("every surviving cancel path deletes a real broker row",
+      "DeleteOrder(physTicket)" in OM_T and
+      "DeleteOrder(t)" in OM_T)
 check("direction conflict deletes physical pendings",
       "DIRECTION CONFLICT (physical)" in OM_T)
 check("cancel-all prunes physical pendings before emptying the book",

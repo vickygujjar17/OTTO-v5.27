@@ -160,25 +160,22 @@ check("order manager stores the projection as block.localTP",
 check("order manager still records block.rrUnit = slDist",
       re.search(r"block\.rrUnit\s*=\s*slDist\s*;", OM_C) is not None)
 
-# Both block-manager passes (deletion pass + the OnTick re-check) must use the
-# same input, or one of them decides against a target the other never sends.
+# v5.80 ARCHITECTURAL STRIP: the Front-Run veto is RETIRED, so the two
+# BlockManager passes that used to project a target are DELETED. InpMaxRR now
+# has exactly ONE consumer -- the OrderManager's take-profit -- which is a
+# STRONGER version of the property this block was written to protect (one
+# input, one projection, no drift between a veto and the order it gates).
 bm_sites = re.findall(r"double\s+tpRR\s*=\s*\(InpMaxRR\s*>\s*0\.0\)\s*\?\s*InpMaxRR"
                       r"\s*:\s*1\.0\s*;", BM_C)
-check("both block-manager front-run passes read InpMaxRR", len(bm_sites) == 2,
+check("the retired block-manager front-run passes are gone", len(bm_sites) == 0,
       "found %d site(s)" % len(bm_sites))
-check("block-manager front-run projects from tpRR * calcSLDist on the FAR edge",
-      re.search(r"double\s+farEdge\s*=\s*isLong\s*"
-                r"\?\s*MathMax\(b\.top,\s*b\.bottom\)\s*"
-                r":\s*MathMin\(b\.top,\s*b\.bottom\)\s*;", BM_C) is not None and
-      re.search(r"double\s+target\s*=\s*isLong\s*"
-                r"\?\s*farEdge\s*\+\s*tpRR\s*\*\s*calcSLDist", BM_C) is not None and
-      re.search(r":\s*farEdge\s*-\s*tpRR\s*\*\s*calcSLDist\s*;", BM_C) is not None)
-check("front-run prefers the exact sent TP once the order is live",
-      BM_C.count("target = b.localTP;") == 2,
-      "found %d" % BM_C.count("target = b.localTP;"))
-check("OttoDefines documents InpMaxRR as the Front-Run/TP projection",
-      "InpMaxRR target hit before entry" in DEFS_T and
-      "InpMaxRR projection (used ONLY for Front-Run Veto)" in DEFS_T)
+check("the order manager is now the ONLY InpMaxRR consumer",
+      len(re.findall(r"InpMaxRR", OM_C)) >= 1 and "InpMaxRR" not in BM_C)
+check("no BlockManager pass projects a target any more",
+      "calcSLDist" not in BM_C and "target = b.localTP;" not in BM_C)
+check("OttoDefines documents InpMaxRR as the TP multiple",
+      "Take-profit projection" in DEFS_T and
+      "InpMaxRR target hit before entry" not in DEFS_T)
 
 
 # ----------------------------------------------------------------------

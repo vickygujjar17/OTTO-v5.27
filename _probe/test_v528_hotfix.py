@@ -334,19 +334,15 @@ if b5:
 # ----------------------------------------------------------------------
 print("\n-- Order manager guards --")
 
-sweep = func_body(OM_T, r"void\s+CancelOpposingConsensusOrders\s*\(void\)")
-check("CancelOpposingConsensusOrders located", sweep is not None)
-if sweep is not None:
-    body = sweep
-    check("consensus sweep is symbol-scoped",
-          re.search(r"OrderGetString\(ORDER_SYMBOL\)\s*!=\s*m_symbol", body) is not None)
-    check("consensus sweep still applies the magic filter",
-          "ORDER_MAGIC) != MagicNumber" in body)
-    check("consensus test is still the global portfolio one",
-          "IsConsensusOpposed(" in body)
-    check("sweep honours InpCancelOpposingPendings",
-          "InpCancelOpposingPendings" in body)
-    check("sweep no longer re-reads the row symbol", "string sym = OrderGetString" not in body)
+# v5.80 ARCHITECTURAL STRIP: CancelOpposingConsensusOrders() is DELETED. The
+# four properties this section used to pin (symbol scoping, magic filter,
+# global consensus test, enable flag) described a filter that no longer exists,
+# so the check is INVERTED: the sweep must be absent from executable code.
+# Comments may still name it -- the v5.80 tombstone explains the deletion.
+OM_CODE = strip_comments(OM_T) if "strip_comments" in globals() else OM_T
+check("CancelOpposingConsensusOrders is deleted",
+      func_body(OM_CODE, r"void\s+CancelOpposingConsensusOrders\s*\(void\)") is None
+      and "CancelOpposingConsensusOrders" not in OM_CODE)
 
 check("no CancelQuorumOpposingOrders exists (never did)", "CancelQuorum" not in OM_T)
 

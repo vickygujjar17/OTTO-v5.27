@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                   OttoDefines.mqh |
-//|             OTTO EA v5.72 — 28-Pair Institutional Master Build |
+//|             OTTO EA v5.80 — 28-Pair Institutional Master Build |
 //|                 Central Definitions / Enums / Input Parameters    |
 //|         Exact MQL5 port of Pine Script "prop_guard_tester.pine"   |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.72"
-#property description "OTTO v5.72 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation | Front-Run | Near-Miss | Stale Vetoes | Currency-Vector Consensus)"
+#property version   "5.80"
+#property description "OTTO v5.80 — Goat Funded Trader (GFT) Master Build (Wick1+Wick2 | Separation + ATR Sizing at creation | structural Break/Flip | NO execution-path vetoes, NO news/correlation filters)"
 
 #ifndef __OTTO_DEFINES__
 #define __OTTO_DEFINES__
@@ -52,24 +52,20 @@ enum ENUM_TRAIL_STEP
    STEP_TRAILING   = 3    // InpLockProfitRR reached (3.0R) — step lock + ATR trail
   };
 
-// v4.70 veto reasons — each maps to a block deletion path
+// v4.70 veto reasons. v5.80 ARCHITECTURAL STRIP: only the two CREATION-TIME
+// separation/sizing vetoes and the structural break/flip outcomes remain.
+// Every post-arming execution-path veto (stale, front-run, near-miss,
+// momentum, FVG) and the external correlation veto were REMOVED outright, so
+// their enum members are gone too -- a phantom enum member with no writer is
+// a lie in the journal. VETO_LIMIT_MISSED survives: it is not a filter, it is
+// the record of an entry the venue could not hold (v5.72 strict-limit router).
 enum ENUM_VETO_REASON
   {
    VETO_NONE          = 0,  // Not vetoed
    VETO_SIZING,             // h > (1.5*ATR) or h < (0.1*ATR)
    VETO_NO_SEPARATION,      // No candle strictly outside the zone between W1 & W2
-   VETO_MOMENTUM,           // (high-low) > 3.5*ATR in the last 8 bars
-   VETO_FVG,                // Fair Value Gap (FVG) present in the last 8 bars
-   VETO_STALE,              // 45 market days from W1 without an entry
-   VETO_FRONTRUN,           // InpMaxRR target hit before entry
-   VETO_NEARMISS,           // 6 market days in the proximity zone without entry
    VETO_BROKEN,             // Broken without flip capability
    VETO_FLIPPED,            // Broken -> block flipped (S<->R)
-   // FIX (v5.26): portfolio-consensus veto. Set when a resting pending order (or
-   // a newly forming block) opposes the global currency-vector consensus beyond
-   // InpConsensusVetoThreshold. Distinct from the geographic block vetoes above,
-   // which are per-chart; this one is portfolio-wide.
-   VETO_CORRELATION,        // Opposes the 8-currency vector consensus
    // v5.72 STRICT LIMIT-OR-NOTHING: the entry could not be placed as a resting
    // broker limit -- either price had already run through it (no legal
    // BUY_LIMIT / SELL_LIMIT side) or the venue refused the send. Deliberately
@@ -151,7 +147,7 @@ struct SSniperBlock
    SFractalPeak      wick2;            // W2 retest candle
    datetime          wick1Time;        // server time of W1 candle
    datetime          wick2Time;        // server time of W2 candle
-   int               wick1Day;         // market-day of W1 (Pine w1_day) — stale veto
+   int               wick1Day;         // market-day of W1 (Pine w1_day) — provenance only since v5.80
 
    // --- v4.70 state machine ---
    bool              isArmed;          // Pine b.is_armed   (close beyond zone + arm_atr)
@@ -196,12 +192,11 @@ struct SSniperBlock
    // FileWriteStruct / FileReadStruct / memcpy / sizeof use anywhere in the tree).
    string            sessionId;
 
-   // --- v4.30 Near-Miss trackers (Pine: min_prox_dist / anchor_*) ---
-   double            minProxDist;      // closest proximity wick distance (0 = unset)
-   datetime          anchorTime;       // bar of the closest approach
-   int               anchorDay;        // market-day of the anchor
-   double            anchorPrice;      // closest wick price
-   int               anchorId;         // unique anchor counter
+   // v5.80 ARCHITECTURAL STRIP: the v4.30 Near-Miss trackers
+   // (minProxDist / anchorTime / anchorDay / anchorPrice / anchorId) are GONE.
+   // They existed only to age a proximity anchor for the 6-market-day
+   // near-miss veto, and that veto no longer exists, so the fields had no
+   // reader left.
   };
 
 // Active-tracked position (mirrors Pine active_* variables)
@@ -263,21 +258,32 @@ input int      MaxBlockDistance  = 150;        // Max bars between W1 and W2 for
 input int      LookbackBars      = 300;        // Bars the pivot engine may reference
 
 input group "══════════════════════════════════════════════════"
-input group "  [2] VETO SETTINGS (NOISE REDUCTION) — v4.70"
+input group "  [2] VETO SETTINGS — v5.80 (creation-time only)"
 input group "══════════════════════════════════════════════════"
-input bool     InpUseFvgVeto        = false;   // FVG veto (Disabled)
-input bool     InpUseMomVeto        = false;   // Momentum veto (Disabled)
-input bool     InpUseSeparationVeto = true;    // Separation veto (Enabled)
-input bool     InpUseNearMissVeto   = true;    // Near Miss (6D) veto (Enabled)
-input bool     InpUseFrontRunVeto   = true;    // Front-Run veto (Enabled)
+// v5.80 ARCHITECTURAL STRIP. Every POST-ARMING execution-path veto is gone:
+// stale, front-run, near-miss, momentum and FVG no longer exist anywhere in
+// the tree, so nothing reads the six inputs below. They are KEPT as DECLARED
+// NO-OPS (the v5.52 InpRev* / InpShiftReversalEntry precedent) so an old .set
+// file from a v5.7x build still loads instead of aborting on an unknown input.
+// What still vetoes here is CREATION-TIME only: separation below, plus the
+// ATR sizing window in group [3]. Structural VETO_BROKEN / VETO_FLIPPED live in
+// the break detector and are NOT configuration.
+input bool     InpUseFvgVeto        = false;   // RETIRED (v5.80) - no-op, kept for .set compatibility
+input bool     InpUseMomVeto        = false;   // RETIRED (v5.80) - no-op, kept for .set compatibility
+input bool     InpUseSeparationVeto = true;    // Separation veto (Enabled) - CREATION TIME
+input bool     InpUseNearMissVeto   = false;   // RETIRED (v5.80) - no-op, kept for .set compatibility
+input bool     InpUseFrontRunVeto   = false;   // RETIRED (v5.80) - no-op, kept for .set compatibility
 // v5.31: the Front-Run veto's target projection was hardcoded to exactly
 // 3 * slDist across four sites. It is now a single input so the projection
 // that vetoes a trade and the take-profit the trade is actually sent with
 // can never drift apart again -- the veto compares against the live TP once
 // an order is resting, so a mismatch silently retires the veto.
-input double   InpMaxRR             = 4.0;     // Front-Run / TP projection (risk-reward multiple)
-input bool     InpUseStaleVeto      = true;    // Stale (45D) veto (Enabled)
-input int      InpStaleDays         = 45;     // Stale veto market-days (Pine stale_days)
+// v5.80: the VETO is retired, but InpMaxRR is NOT. It remains the live
+// take-profit multiple (PlaceOrArmOrder projects TP from the far edge with
+// it), so it is a strategy parameter, not a filter knob.
+input double   InpMaxRR             = 4.0;     // Take-profit projection (risk-reward multiple)
+input bool     InpUseStaleVeto      = false;   // RETIRED (v5.80) - no-op, kept for .set compatibility
+input int      InpStaleDays         = 45;      // RETIRED (v5.80) - no-op, kept for .set compatibility
 
 input group "══════════════════════════════════════════════════"
 input group "  [3] ATR / SIZING (Pine: 0.1x – 1.5x window)"
@@ -432,19 +438,25 @@ input double   SafetyDailyDDLimit  = 3.0;     // Soft breach: pause new orders a
 input double   SafetyTotalDDLimit  = 5.0;     // Hard breach: close all + halt at this % (Trailing)
 
 input group "══════════════════════════════════════════════════"
-input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.72"
+input group "  [9] CURRENCY VECTOR & AFFINITY ENGINE — v5.80"
 input group "══════════════════════════════════════════════════"
 // FIX (v5.26): portfolio-wide consensus engine ported from the theoretical
 // Base/Quote + Regional Affinity model. Additive to the per-chart
 // GetCorrelationScore() ladder, which still drives the TS_Bias_* hive mind.
-input bool     InpEnableVectorEngine = true;   // Enable currency-vector consensus layer
-input double   InpConsensusVetoThreshold = 50.0; // |consensus| % to veto/cancel opposing orders
+//
+// v5.80 ARCHITECTURAL STRIP: this layer NO LONGER TOUCHES TRADING. The
+// per-block IsTradeVetoed / IsConsensusOpposed guards and the
+// CancelOpposingConsensusOrders sweep are deleted, and HiveMind() no longer
+// deletes zones or publishes a bias GV. The vectors are computed and shown as
+// DIAGNOSTICS ONLY -- no path from this module to an order exists any more.
+input bool     InpEnableVectorEngine = true;   // Enable currency-vector consensus layer (diagnostics)
+input double   InpConsensusVetoThreshold = 50.0; // RETIRED (v5.80) - no-op, kept for .set compatibility
 input bool     InpUseExternalAnchors = true;   // Factor untraded DXY / XAUUSD macro anchors
 input int      InpAnchorTF           = PERIOD_H1;  // Anchor candle timeframe (H1 default)
-input bool     InpCancelOpposingPendings = true; // Cancel resting pendings against consensus
+input bool     InpCancelOpposingPendings = false; // RETIRED (v5.80) - no-op, kept for .set compatibility
 
 input group "══════════════════════════════════════════════════"
-input group "  [10] HIGH TABLE AUDITOR — v5.72"
+input group "  [10] HIGH TABLE AUDITOR — v5.80"
 input group "══════════════════════════════════════════════════"
 // Decoupled watchdog: audits live state on its OWN timer cadence rather
 // than inside OnTick, so a halted / paused / tick-starved trade loop can
@@ -454,7 +466,7 @@ input bool     InpEnableHighTable       = true;  // Enable High Table watchdog
 input int      InpHighTableAuditSeconds = 5;     // Audit cadence (seconds, >= 1)
 
 input group "══════════════════════════════════════════════════"
-input group "  [11] MANUAL TRADE ADOPTION — v5.72"
+input group "  [11] MANUAL TRADE ADOPTION — v5.80"
 input group "══════════════════════════════════════════════════"
 // Let this EA manage positions opened BY HAND on its own chart symbol.
 // A manual position is identified as a MAGIC-0 position on m_symbol: the
@@ -471,7 +483,7 @@ input int      InpManualNoSLWarnMinutes = 5;     // Re-warn cadence for a manual
 
 //+------------------------------------------------------------------+
 input group "══════════════════════════════════════════════════"
-input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.72"
+input group "  [12] RETIRED VETO REVERSAL CONVERSIONS — v5.80"
 input group "══════════════════════════════════════════════════"
 // v5.34 built five switches that let a vetoed Phase 1 setup be re-used as a
 // Phase 2 REVERSAL instead of being discarded.

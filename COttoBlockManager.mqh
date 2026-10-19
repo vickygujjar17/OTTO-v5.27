@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 block logic port          |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.72"
+#property version   "5.80"
 
 #ifndef __OTTO_BLOCK_MANAGER__
 #define __OTTO_BLOCK_MANAGER__
@@ -14,11 +14,18 @@
 
 //+------------------------------------------------------------------+
 //| COttoBlockManager class                                         |
-//| Owns the S/R block array and runs the complete v4.70 state      |
-//| machine: W1/W2 formation, Separation & Sizing vetoes, Stale      |
-//| (45D), Front-Run (InpMaxRR), Near-Miss (6D), Momentum & FVG vetoes,|
-//| arming, break/flip — with robust memory management (blocks are   |
-//| released when vetoed, flipped, broken or expired).              |
+//| Owns the S/R block array and runs the v5.80 state machine:       |
+//| W1/W2 formation, the two CREATION-time vetoes (Separation &       |
+//| Sizing), arming, break/flip — with robust memory management      |
+//| (blocks are released when vetoed, flipped, broken or expired).   |
+//|                                                                  |
+//| v5.80 ARCHITECTURAL STRIP: every POST-ARMING execution-path veto |
+//| is gone -- stale, front-run, near-miss, momentum and FVG are no  |
+//| longer evaluated anywhere, and neither is the external currency  |
+//| correlation filter. The funnel is now exactly:                   |
+//|   deletion -> hasExited -> arming -> break/flip -> persist       |
+//| Break/flip is a STRUCTURAL test on the physical far edge and is  |
+//| therefore kept byte-identical (see ProcessBlocks).               |
 //+------------------------------------------------------------------+
 class COttoBlockManager
   {
@@ -51,7 +58,6 @@ private:
    int                     m_blocksBroken;
    int                     m_blocksVetoed;
    int                     m_blockSerialCounter;
-   int                     m_anchorCounter;
    datetime                m_lastProcessedBarTime;
    int                     m_currentMarketDay;
 
@@ -200,6 +206,9 @@ private:
 
    //+------------------------------------------------------------------+
    //| Human-readable veto reason (diagnostics)                         |
+   //| v5.80: only the surviving outcomes are mapped. Stale / Front-Run |
+   //| / Near-Miss / Momentum / FVG / Correlation are gone from the     |
+   //| enum, so mapping them here would not compile -- by design.        |
    //+------------------------------------------------------------------+
    string                  VetoReasonString(ENUM_VETO_REASON r)
      {
@@ -207,14 +216,8 @@ private:
         {
          case VETO_SIZING:        return "SIZING";
          case VETO_NO_SEPARATION: return "NO_SEPARATION";
-         case VETO_MOMENTUM:      return "MOMENTUM";
-         case VETO_FVG:           return "FVG";
-         case VETO_STALE:         return "STALE";
-         case VETO_FRONTRUN:      return "FRONT-RUN";
-         case VETO_NEARMISS:      return "NEAR-MISS";
          case VETO_BROKEN:        return "BROKEN";
          case VETO_FLIPPED:       return "FLIPPED";
-         case VETO_CORRELATION:   return "CORRELATION";
          case VETO_LIMIT_MISSED:  return "LIMIT-MISSED";
          default:                 return "NONE";
         }
@@ -523,10 +526,9 @@ private:
 
 
    //+------------------------------------------------------------------+
-   //| BLOCK MANAGEMENT FUNNEL — the exact v4.70 state machine.         |
-   //| Runs once per new bar (calc_on_every_tick=false mirror). Order  |
-   //| per Pine: deletion -> hasExited -> Stale(45) -> Front-Run(InpMaxRR)|
-   //| -> Near-Miss(6D) -> Arming -> Break/Flip -> Momentum/FVG.       |
+   //| BLOCK MANAGEMENT FUNNEL — v5.80 (creation-time vetoes + structure)|
+   //| Runs once per new bar (calc_on_every_tick=false mirror). Order:  |
+   //| deletion -> hasExited -> Arming -> Break/Flip.                   |
    //|                                                                  |
 //| v5.52 -- the state machine is PHASE-FREE. v5.49's geometry  |
 //| inversion existed only to measure a reclaimed zone against  |
@@ -534,6 +536,15 @@ private:
 //| hasExited, arming and break/flip are each a single test     |
 //| that reads no lifecycle counter. See the break block below: |
 //| its test is the OPPOSITE edge from arming, on purpose.      |
+//|                                                             |
+//| v5.80 -- THE STRIP. The per-bar passes that used to sit     |
+//| between hasExited and arming (Stale 45D, Front-Run,         |
+//| Near-Miss 6D) and the one that used to sit after break/flip |
+//| (Momentum & FVG) are DELETED, together with the intra-bar   |
+//| twin UpdateIntraBar(). Nothing between arming and the broker |
+//| may veto a setup any more: once a block arms, the ONLY exit  |
+//| is the structural break/flip below (or the venue refusing    |
+//| the resting price in the router).                           |
    //+------------------------------------------------------------------+
    void                    ProcessBlocks(int marketDay)
      {
@@ -568,108 +579,6 @@ private:
             if((b.type == BLOCK_SUPPORT && low1 > b.top) ||
                (b.type == BLOCK_RESISTANCE && high1 < b.bottom))
                b.hasExited = true;
-           }
-
-         // --- STALE VETO (45 market days from W1) ---
-         if(InpUseStaleVeto && !b.isTriggered)
-           {
-            if(b.wick1Day > 0 && (marketDay - b.wick1Day) >= InpStaleDays)
-              {
-               SetVeto(i, VETO_STALE);
-               continue;
-              }
-           }
-
-         // --- FRONT-RUN VETO (InpMaxRR target hit before entry) ---
-         if(InpUseFrontRunVeto && b.hasExited && !b.isTriggered)
-           {
-            double calcSLDist = b.blockHeight + (0.5 * atrNow);
-            double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-            // Projected TP keys off the MAPPED direction (was: b.type ==
-            // BLOCK_SUPPORT), mirroring the identical arithmetic in
-            // COttoOrderManager::PlaceOrArmOrder. Both must agree or b.localTP
-            // -- which supersedes this projection once the order is placed --
-            // would sit on the wrong side of price.
-            bool   isLong = (BlockDirection(b) == DIR_LONG);
-            // v5.34 Part 2 once re-anchored this projection to the Phase 2
-            // outer-boundary entry; v5.52 dropped Phase 2 and FIX (v5.57) pins
-            // the FAR-EDGE anchor. The target is measured from the edge the
-            // zone breaks through (b.top LONG / b.bottom SHORT), NOT from the
-            // deep entry BlockEntryPrice() returns: since v5.69 that entry sits
-            // on the OPPOSITE (NEAR) side of the zone, so projecting the target
-            // from it would pull the target inside the zone and veto setups
-            // that were never front-runs. This is the one price the Front-Run
-            // veto is allowed to judge; COttoOrderManager::PlaceOrArmOrder()
-            // projects it with identical arithmetic, and once the order rests
-            // b.localTP supersedes this anyway.
-            //
-            // REALIZED RR (true deep front-edge entry, v5.69). Long side, near
-            // edge at 0, far edge at bh, slDist = bh + 0.5*a, and the entry on
-            // the NEAR side: entry = -(2*bh + 1.5*a). Target anchored on the
-            // far edge:
-            //   TP     = bh + rr*(bh + 0.5*a)
-            //   reward = TP - entry = 3*bh + 1.5*a + rr*(bh + 0.5*a)
-            //                       = (3 + rr) * slDist
-            //   risk   = slDist     =  bh + 0.5*a
-            // so the realized multiple is EXACTLY rr + 3.0 at every zone height
-            // and every ATR, independent of both:
-            //   bh 1.0 / a 2.0 / rr 4.0 -> 7.0R   (the shipped defaults)
-            //   bh 2.0 / a 1.0 / rr 4.0 -> 7.0R
-            //   bh 0.5 / a 4.0 / rr 4.0 -> 7.0R
-            // It therefore cannot go negative for any positive InpMaxRR, and
-            // the pre-v5.69 "InpMaxRR MUST stay above 3.0" floor is RETIRED --
-            // that floor was an artifact of an entry anchored PAST the far edge,
-            // whose reward carried a (0.5*rr - 1.5) coefficient on the ATR term.
-            // Intentional: the target reproduces the pre-anticipation projection
-            // and keeps the veto strict. Do NOT "fix" it by anchoring the target
-            // on the entry.
-            double farEdge = isLong ? MathMax(b.top, b.bottom)
-                                    : MathMin(b.top, b.bottom);
-            double target  = isLong ? farEdge + tpRR * calcSLDist
-                                    : farEdge - tpRR * calcSLDist;
-            if(b.hasPlacedOrder && b.localTP > 0)
-               target = b.localTP;   // use exact TP parameter once placed
-
-            // TP above entry is hit by the HIGH, TP below by the LOW; both are
-            // independent of how the trade direction was mapped.
-            bool hit = isLong ? (high1 >= target) : (low1 <= target);
-            if(hit)
-              {
-               SetVeto(i, VETO_FRONTRUN);
-               continue;
-              }
-           }
-
-         // --- NEAR-MISS VETO (1-unit proximity zone + 6 market days) ---
-         if(InpUseNearMissVeto && b.hasExited && !b.isTriggered)
-           {
-            bool inProx = false;
-            double curDist = 0, curAnchor = 0;
-            if(b.type == BLOCK_SUPPORT && low1 <= b.top + b.blockHeight && low1 > b.top)
-              { inProx = true; curDist = low1 - b.top; curAnchor = low1; }
-            else if(b.type == BLOCK_RESISTANCE && high1 >= b.bottom - b.blockHeight && high1 < b.bottom)
-              { inProx = true; curDist = b.bottom - high1; curAnchor = high1; }
-
-            // Record the CLOSEST proximity wick as the anchor
-            if(inProx)
-              {
-               if(b.minProxDist <= 0 || curDist < b.minProxDist)
-                 {
-                  b.minProxDist  = curDist;
-                  b.anchorTime   = iTime(m_symbol, PERIOD_CURRENT, 0);
-                  b.anchorDay    = marketDay;
-                  b.anchorPrice  = curAnchor;
-                  if(b.anchorId == 0)
-                     b.anchorId = ++m_anchorCounter;
-                 }
-              }
-
-            // 6-market-day expiry from the anchor
-            if(b.anchorDay > 0 && (marketDay - b.anchorDay) >= 6)
-              {
-               SetVeto(i, VETO_NEARMISS);
-               continue;
-              }
            }
 
          // --- ARMING (price exits the zone on a close basis) ---
@@ -761,101 +670,8 @@ private:
               }
            }
 
-
-         // --- MOMENTUM & FVG VETO (8-bar scan, armed blocks) ---
-         if(b.isArmed && !b.isTriggered)
-           {
-            bool momentum = false, fvg = false;
-            for(int j = 1; j <= 8; j++)   // Pine j = 0..7 -> shift j+1
-              {
-               double atrJ = GetATRAtShift(j);
-               if(InpUseMomVeto && atrJ > 0 &&
-                  (iHigh(m_symbol, PERIOD_CURRENT, j) - iLow(m_symbol, PERIOD_CURRENT, j)) > (3.5 * atrJ))
-                  momentum = true;
-
-               if(InpUseFvgVeto)
-                 {
-                  if(b.type == BLOCK_SUPPORT && iHigh(m_symbol, PERIOD_CURRENT, j) < iLow(m_symbol, PERIOD_CURRENT, j + 2))
-                     fvg = true;
-                  if(b.type == BLOCK_RESISTANCE && iLow(m_symbol, PERIOD_CURRENT, j) > iHigh(m_symbol, PERIOD_CURRENT, j + 2))
-                     fvg = true;
-                 }
-              }
-            if(momentum || fvg)
-              {
-               SetVeto(i, momentum ? VETO_MOMENTUM : VETO_FVG);
-               continue;
-              }
-           }
-
          // --- Persist block mutations made during this funnel pass ---
          m_blocks[i] = b;
-        }
-     }
-
-   //+------------------------------------------------------------------+
-   //| INTRA-BAR TARGET CHECKS (called inside OnTick).                 |
-   //| Mirrors the requirement that trailing stops & target checks run |
-   //| within OnTick. The Front-Run InpMaxRR target is re-checked      |
-   //| the live forming bar so a hit is caught immediately.           |
-   //+------------------------------------------------------------------+
-   void                    UpdateIntraBar(int marketDay)
-     {
-      double atrNow = GetATRAtShift(1);
-      if(atrNow <= 0) atrNow = m_currentATR;
-      double high0 = iHigh(m_symbol, PERIOD_CURRENT, 0);
-      double low0  = iLow(m_symbol, PERIOD_CURRENT, 0);
-
-      for(int i = 0; i < m_blockCount; i++)
-        {
-         SSniperBlock b = m_blocks[i];
-         if(b.isVetoed || b.isTriggered || !b.hasExited)
-            continue;
-
-         if(InpUseFrontRunVeto)
-           {
-            double calcSLDist = b.blockHeight + (0.5 * atrNow);
-            double tpRR = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
-            // Intra-bar twin of the ProcessBlocks() projection above — same
-            // unconditional mapped direction AND the same FAR-EDGE anchor.
-            // FIX (v5.57) measures the target from the edge the zone breaks
-            // through -- never from the deep front-edge entry, which now sits on
-            // the OPPOSITE side of the zone (v5.69) -- so both passes judge one
-            // price; see the detailed derivation in ProcessBlocks().
-            // REALIZED RR (true deep front-edge entry): with the near edge at 0,
-            // the far edge at bh, entry = -(2.0*bh + 1.5*a) for a LONG and
-            // slDist = bh + 0.5*a, the reward from the ENTRY to the far-edge
-            // target is 3.0*bh + 1.5*a + rr*slDist = (3.0 + rr)*slDist, so the
-            // realized multiple is exactly rr + 3.0 at EVERY zone height and
-            // ATR -- 7.0R on the shipped InpMaxRR 4.0. It therefore cannot fall
-            // behind the entry for any positive InpMaxRR, and the pre-v5.69
-            // "InpMaxRR must stay above 3.0" floor is retired: it was an
-            // artifact of an entry anchored past the far edge. Intentional: the
-            // target reproduces the pre-anticipation projection and keeps the
-            // veto strict. Do NOT "fix" it by anchoring the target on the
-            // entry.
-            bool   isLong = (BlockDirection(b) == DIR_LONG);
-            double farEdge = isLong ? MathMax(b.top, b.bottom)
-                                    : MathMin(b.top, b.bottom);
-            double target  = isLong ? farEdge + tpRR * calcSLDist
-                                    : farEdge - tpRR * calcSLDist;
-            if(b.hasPlacedOrder && b.localTP > 0)
-               target = b.localTP;
-
-            bool hit = isLong ? (high0 >= target) : (low0 <= target);
-            if(hit)
-              {
-               SetVeto(i, VETO_FRONTRUN);
-               continue;
-              }
-           }
-
-         // 6-Day near-miss expiry re-check (harmless within a bar)
-         if(InpUseNearMissVeto && b.anchorDay > 0 && (marketDay - b.anchorDay) >= 6)
-           {
-            SetVeto(i, VETO_NEARMISS);
-            continue;
-           }
         }
      }
 
@@ -877,7 +693,6 @@ public:
       m_blocksBroken     = 0;
       m_blocksVetoed     = 0;
       m_blockSerialCounter = 0;
-      m_anchorCounter    = 0;
       m_lastProcessedBarTime = 0;
       m_currentMarketDay = 0;
       ArrayResize(m_blocks, 0, MAX_BLOCKS);
@@ -932,15 +747,6 @@ public:
 
       TryCreateNewBlocks(marketDay);
       ProcessBlocks(marketDay);
-     }
-
-   //+------------------------------------------------------------------+
-   //| PUBLIC WRAPPER — intra-bar target checks (called from OnTick).   |
-   //| The underlying UpdateIntraBar() lives in the private section.    |
-   //+------------------------------------------------------------------+
-   void              CheckVetoesInTick(int marketDay)
-     {
-      UpdateIntraBar(marketDay);
      }
 
    //+------------------------------------------------------------------+
@@ -1289,23 +1095,16 @@ public:
    //+------------------------------------------------------------------+
 
    //+------------------------------------------------------------------+
-   //| HIVE-MIND: deletes all blocks of a given type (tie-breaker).   |
-   //| Marks them for cancellation + next-bar removal.                 |
+   //| HIVE-MIND tie-breaker — RETIRED (v5.80 architectural strip).      |
+   //|                                                                  |
+   //| DeleteBlockType() deleted every live zone of one polarity on a    |
+   //| portfolio-wide correlation reading (HiveMind's vote). That is an  |
+   //| EXTERNAL filter deleting zones whose own chart geometry had       |
+   //| already approved them, so its only caller is gone and the helper  |
+   //| is removed with it -- the same reasoning as the v5.52 cluster      |
+   //| sync above. An unreferenced type-deleter is a silent invitation   |
+   //| to re-wire the correlation filter.                                |
    //+------------------------------------------------------------------+
-   void              DeleteBlockType(ENUM_BLOCK_TYPE type)
-     {
-      for(int i = m_blockCount - 1; i >= 0; i--)
-        {
-         if(m_blocks[i].type == type && !m_blocks[i].isVetoed)
-           {
-            m_blocks[i].isVetoed = true;
-            m_blocks[i].vetoReason = VETO_FLIPPED;   // reclaimed by hive-mind
-            m_blocks[i].deleteOnBarTime = iTime(m_symbol, PERIOD_CURRENT, 0);
-            if(m_blocks[i].limitOrderTicket > 0)
-               m_blocks[i].pendingOrderCancel = true;
-           }
-        }
-     }
 
    //+------------------------------------------------------------------+
    //| Statistics getters                                               |

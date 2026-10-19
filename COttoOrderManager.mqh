@@ -4,7 +4,7 @@
 //|              OTTO EA — exact Pine v4.70 execution port           |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.72"
+#property version   "5.80"
 
 #ifndef __OTTO_ORDER_MANAGER__
 #define __OTTO_ORDER_MANAGER__
@@ -690,34 +690,16 @@ private:
 
       if(!IsSpreadAcceptable()) return false;
 
-      // Pine can_place + correlation veto (institutional)
+      // Pine can_place. v5.80 ARCHITECTURAL STRIP: the per-block
+      // IsTradeVetoed() (weighted portfolio veto) and IsConsensusOpposed()
+      // (currency-vector consensus veto) guards that used to run here are
+      // DELETED. Both were external correlation filters sitting BETWEEN an
+      // armed block and its broker order, so they could suppress a setup the
+      // zone geometry had already approved. No correlation reading can reach
+      // an order any more; the only remaining gate is the venue's own
+      // resting-price capability in the strict limit router below.
       if(!CanPlaceForDirection(block)) return false;
       ENUM_TRADE_DIRECTION dir = GetDirectionForBlock(block);
-      if(m_correlationFilter != NULL && m_correlationFilter.IsTradeVetoed(dir))
-        {
-         if(EnableLogging)
-            Print("[Correlation] VETO on ", m_symbol,
-                  (dir == DIR_LONG ? " LONG" : " SHORT"));
-         return false;
-        }
-
-      // v5.26 — ADDITIVE portfolio-consensus layer. The ladder above is a
-      // per-chart geographic check; this one reads the whole book's currency
-      // vectors. Consensus is refreshed by the EA once per cycle, so this is
-      // a pure array read here — no per-block portfolio re-scan.
-      if(m_correlationFilter != NULL &&
-         m_correlationFilter.IsConsensusOpposed(m_symbol, dir))
-        {
-         block.isVetoed   = true;
-         block.vetoReason = VETO_CORRELATION;
-         m_blockManager.SetBlockAt(blockIndex, block);
-         if(EnableLogging)
-            Print("[Correlation] VECTOR VETO on ", m_symbol,
-                  (dir == DIR_LONG ? " LONG" : " SHORT"),
-                  " | consensus = ",
-                  DoubleToString(m_correlationFilter.GetPairConsensus(m_symbol), 1), "%");
-         return false;
-        }
       if(!SentimentPasses(block)) return false;
 
       // --- Pine price computation ---
@@ -2582,17 +2564,15 @@ public:
                   // v5.52: the conversion branch that used to guard this is gone
                   // with TryConvertToReversal(). conversionReason is now permanently
                   // VETO_NONE, so every drop is a plain cancellation.
+                  // v5.80 ARCHITECTURAL STRIP: only the surviving veto reasons
+                  // are named here. Stale / Front-Run / Near-Miss / Momentum /
+                  // FVG / Vector-Consensus no longer exist, so their branches
+                  // are gone rather than left as dead string writes.
                   string cancelReason = "Manual";
-                  if(blocks[i].vetoReason == VETO_FRONTRUN)           cancelReason = "Fired Front-Run 1:4 Veto";
-                  else if(blocks[i].vetoReason == VETO_STALE)         cancelReason = "Stale Veto (45D)";
-                  else if(blocks[i].vetoReason == VETO_NEARMISS)      cancelReason = "Near-Miss Veto (6D)";
-                  else if(blocks[i].vetoReason == VETO_MOMENTUM)      cancelReason = "Momentum Veto";
-                  else if(blocks[i].vetoReason == VETO_FVG)           cancelReason = "FVG Veto";
-                  else if(blocks[i].vetoReason == VETO_SIZING)        cancelReason = "Sizing Veto";
+                  if(blocks[i].vetoReason == VETO_SIZING)             cancelReason = "Sizing Veto";
                   else if(blocks[i].vetoReason == VETO_NO_SEPARATION) cancelReason = "Separation Veto";
                   else if(blocks[i].vetoReason == VETO_BROKEN)        cancelReason = "Block Broken";
                   else if(blocks[i].vetoReason == VETO_FLIPPED)       cancelReason = "Block Flipped";
-                  else if(blocks[i].vetoReason == VETO_CORRELATION)   cancelReason = "Vector Consensus Veto";
                   else if(blocks[i].vetoReason == VETO_LIMIT_MISSED)  cancelReason = "Limit Entry Missed (price through entry)";
                   else if(blocks[i].pendingOrderCancel)               cancelReason = "Manual / Direction Conflict";
                   // v5.43 -- save/restore: a transient setup log must not steal the
@@ -2613,70 +2593,14 @@ public:
          m_blockManager.SetBlockAt(i, mod);
         }
      }
-   //+------------------------------------------------------------------+
-   //| v5.26 — CancelOpposingConsensusOrders                        |
-   //| Strict outlier sweep: cancels any of OUR resting pendings whose    |
-   //| direction fights the portfolio currency-vector consensus beyond    |
-   //| InpConsensusVetoThreshold.                                         |
-   //|                                                                    |
-   //| v5.28: scoped to THIS chart's symbol. The magic filter alone is NOT |
-   //| safe here: every EA instance shares MagicNumber, so a magic-only    |
-   //| sweep made each of the ~28 charts walk the entire shared pending    |
-   //| book and delete every other chart's opposing order -- a cancel      |
-   //| storm across the whole portfolio. The consensus TEST stays global   |
-   //| (IsConsensusOpposed reads the portfolio vector); only the ACTOR is  |
-   //| now local, so each chart prunes only its own resting orders.        |
-   //+------------------------------------------------------------------+
-   void              CancelOpposingConsensusOrders(void)
-     {
-      if(!InpCancelOpposingPendings) return;
-      if(m_correlationFilter == NULL) return;
 
-      // v5.40 — PHYSICAL route sweep: walk the broker's resting pendings for
-      // THIS chart's symbol+magic and delete any whose direction fights the
-      // portfolio consensus. Scoped to m_symbol (v5.28) so every EA instance
-      // prunes only its OWN resting orders — no cancel storm across the book.
-      for(int i = OrdersTotal() - 1; i >= 0; i--)
-        {
-         ulong t = OrderGetTicket(i);
-         if(t <= 0 || !OrderSelect(t)) continue;
-         if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
-         if(OrderGetString(ORDER_SYMBOL) != m_symbol) continue;
-
-         ENUM_ORDER_TYPE ot = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-         ENUM_TRADE_DIRECTION odir = DIR_NONE;
-      if(ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP)   odir = DIR_LONG;
-      else if(ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP) odir = DIR_SHORT;
-      // v5.52: a BUY is a Resistance continuation (a breakout above it) and a
-      // SELL a Support continuation (a breakdown below it) -- the mapping
-      // GetDirectionForBlock() states unconditionally, so this leg's direction
-      // cannot disagree with the block it mirrors.
-      if(odir == DIR_NONE) continue;
-         if(!m_correlationFilter.IsConsensusOpposed(m_symbol, odir)) continue;
-
-         if(EnableLogging)
-            Print("[OrderManager] VECTOR CANCEL (physical): ticket ", t, " ", m_symbol,
-                  (odir == DIR_LONG ? " LONG" : " SHORT"),
-                  " | consensus = ",
-                  DoubleToString(m_correlationFilter.GetPairConsensus(m_symbol), 1), "%");
-         DeleteOrder(t);
-         int bi = m_blockManager.FindBlockIndexByTicket(t);
-         if(bi >= 0)
-           {
-            SSniperBlock mod;
-            if(m_blockManager.GetBlockAt(bi, mod))
-              {
-               mod.limitOrderTicket   = 0;
-               mod.pendingOrderCancel = false;
-               m_blockManager.SetBlockAt(bi, mod);
-              }
-           }
-        }
-
-     }
-
-
-
+   // v5.80 ARCHITECTURAL STRIP: CancelOpposingConsensusOrders() is DELETED.
+   // It walked this chart's resting pendings and deleted any that fought the
+   // portfolio currency-vector consensus -- an external correlation filter
+   // cancelling live, already-accepted broker orders. Nothing in the tree
+   // sweeps the book on a consensus reading any more; the only cancel paths
+   // left are the structural ones (break/flip, direction conflict, invalid
+   // block, prop-firm safety).
 
    //+------------------------------------------------------------------+
    //| Cancels same-direction pending orders when a trade is active    |

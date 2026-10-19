@@ -1,14 +1,15 @@
 //+------------------------------------------------------------------+
 //|                                                       OttoEA.mq5 |
 //|                    OTTO — Goat Funded Trader (GFT) Master Build    |
-//|                    Pine Script Master Build Port (v5.72)            |
+//|                    Pine Script Master Build Port (v5.80)            |
 //|                                    Institutional / Real-Money    |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.72"
+#property version   "5.80"
 #property description "OTTO EA â€” Goat Funded Trader (GFT) Master Build"
-#property description "Separation | Sizing | Front-Run | Near-Miss | Stale vetoes"
-#property description "Modules: News Shield | Risk | Block Manager | Order Mgmt | Trail"
+#property description "Separation + ATR Sizing vetoes (creation time) | structural Break/Flip"
+#property description "NO post-arming vetoes | NO news blackout | NO correlation/consensus filters"
+#property description "Modules: Risk | Block Manager | Order Mgmt | Trail | High Table"
 #property link      "https://github.com/vickygujjar17/OTTO-v5.27"
 
 //+------------------------------------------------------------------+
@@ -180,7 +181,7 @@ int OnInit(void)
    g_symbol = _Symbol;
 
    Print("==============================================================");
-   Print("  OTTO EA v5.72 — 28-Pair Institutional Master Build — INITIALIZING");
+   Print("  OTTO EA v5.80 — 28-Pair Institutional Master Build — INITIALIZING");
    Print("  Symbol: ", g_symbol, " | Magic: ", MagicNumber);
    Print("==============================================================");
 
@@ -560,100 +561,26 @@ void UpdateMarketDay(void)
      }
   }
 
-//+------------------------------------------------------------------+
-//| MAPPED direction of a zone for the portfolio bias vote.         |
-//|                                                                 |
-//| A Support / Resistance zone is DISCOVERED polarity, NOT trade   |
-//| direction. HiveMind publishes a LONG / SHORT consensus into the |
-//| correlation matrix, and the conflict tie-breaker does not merely|
-//| prefer one of two opposing zones -- it DELETES the losing       |
-//| polarity and vetoes its live orders. Reading the raw zone here  |
-//| would therefore publish the EXACT OPPOSITE bias to how every    |
-//| entry is mapped, so the hive mind would systematically veto     |
-//| exactly the setups this build now takes.                        |
-//|                                                                 |
-//| Twin of COttoOrderManager::GetDirectionForBlock() and           |
-//| COttoBlockManager::BlockDirection() (both private). v5.52 PURE  |
-//| CONTINUATION: the mapping is UNCONDITIONAL and reads no phase --|
-//| a RESISTANCE zone trades DIR_LONG (a breakout above it) and a   |
-//| SUPPORT zone trades DIR_SHORT (a breakdown below it), which is  |
-//| exactly Pine's can_place gate. All three copies must stay in    |
-//| lockstep or this vote would oppose the entries it is meant to   |
-//| arbitrate.                                                      |
-//+------------------------------------------------------------------+
-ENUM_TRADE_DIRECTION MappedZoneDirection(const SSniperBlock &b)
-  {
-   return (b.type == BLOCK_SUPPORT) ? DIR_SHORT : DIR_LONG;   // Support -> SHORT, Resistance -> LONG
-  }
+// v5.80 ARCHITECTURAL STRIP: MappedZoneDirection() was DELETED together with
+// HiveMind(), its only caller. The zone -> direction mapping is owned by
+// COttoOrderManager::GetDirectionForBlock() / COttoBlockManager::BlockDirection(),
+// which remain the single source of truth for the entry being placed.
 
 //+------------------------------------------------------------------+
-//| Hive Mind â€” broadcast bias and resolve bidirectional conflicts   |
+//| Hive Mind — RETIRED (v5.80 architectural strip)                  |
 //+------------------------------------------------------------------+
-void HiveMind(void)
-  {
-   if(g_dailyDD_Paused) return;
-
-   SSniperBlock allBlocks[];
-   int total = g_blockManager.GetAllBlocks(allBlocks);
-   int supportVote = 0, resistanceVote = 0;   // raw zone polarity (diagnostics)
-   int mappedVote  = 0;                       // EXPERIMENT: MAPPED direction digest
-   for(int b = 0; b < total; b++)
-     {
-      if(allBlocks[b].isVetoed) continue;
-      if(allBlocks[b].type == BLOCK_SUPPORT)
-         supportVote++;
-      else if(allBlocks[b].type == BLOCK_RESISTANCE)
-         resistanceVote++;
-      // Each live zone votes with the direction it would actually TRADE,
-      // not with the polarity it was discovered as, so the vote uses the
-      // helper rather than the raw type.
-      mappedVote += (MappedZoneDirection(allBlocks[b]) == DIR_LONG) ? 1 : -1;
-     }
-
-   int myBias = 0;
-   // The tie-breaker DELETES the zone whose MAPPED direction LOST the vote.
-   // Under v5.52 an unconditional mapping is in force -- RESISTANCE -> LONG,
-   // SUPPORT -> SHORT -- and the two a-priori branches below read it straight:
-   //   mappedVote > 0 -> peers Long  -> the SHORT-mapped (Support) side goes.
-   //   mappedVote < 0 -> peers Short -> the LONG-mapped (Resistance) side goes.
-   // The else branch is unchanged from the two-phase build.
-   //
-   // PRE-EXISTING, deliberately NOT touched here: the two DeleteBlockType()
-   // arguments inside the ResolveBidirectionalConflict() branches below look
-   // INVERTED against this comment and against their own 'kept Support' /
-   // 'kept Resistance' log lines (they pass BLOCK_RESISTANCE where a Long
-   // resolution implies Support and vice versa). The inversion predates this
-   // pivot -- it is a property of how a zone maps, which is not what changed --
-   // so it is recorded rather than fixed in a continuation-mechanism commit.
-   if(mappedVote > 0 && resistanceVote == 0)
-      myBias = 1;
-   else if(mappedVote < 0 && supportVote == 0)
-      myBias = -1;
-   else if(mappedVote != 0)
-     {
-      int resolution = g_correlationFilter.ResolveBidirectionalConflict();
-      if(resolution == 1)
-        {
-         g_blockManager.DeleteBlockType(supportVote > 0 ? BLOCK_SUPPORT : BLOCK_RESISTANCE);
-         myBias = 1;
-         if(EnableLogging) Print("[HiveMind] CONFLICT: peers Long â†’ kept Support");
-        }
-      else if(resolution == -1)
-        {
-         g_blockManager.DeleteBlockType(supportVote > 0 ? BLOCK_RESISTANCE : BLOCK_SUPPORT);
-         myBias = -1;
-         if(EnableLogging) Print("[HiveMind] CONFLICT: peers Short â†’ kept Resistance");
-        }
-      else
-        {
-         g_blockManager.DeleteBlockType(BLOCK_SUPPORT);
-         g_blockManager.DeleteBlockType(BLOCK_RESISTANCE);
-         myBias = 0;
-         if(EnableLogging) Print("[HiveMind] CONFLICT: no consensus â†’ deleted both");
-        }
-     }
-   g_correlationFilter.BroadcastBias(myBias);
-  }
+// This used to be a per-bar CORRELATION filter on the execution path: it
+// counted each live zone's MAPPED direction, asked the portfolio-wide
+// ResolveBidirectionalConflict() tie-breaker, and then DELETED every zone on
+// the losing side (DeleteBlockType), finally publishing the surviving bias
+// into a terminal Global Variable for the other charts.
+//
+// That is exactly what v5.80 removes: a book-wide correlation reading could
+// delete a zone whose own chart geometry had already approved it. Zones are
+// now owned solely by COttoBlockManager (creation-time separation/sizing and
+// the structural break/flip), and nothing outside this chart can suppress a
+// setup. The function body and its OnTick() call are gone; the correlation
+// module is retained for DIAGNOSTICS ONLY and no longer publishes a bias GV.
 
 
 //+------------------------------------------------------------------+
@@ -723,15 +650,21 @@ void OnTick(void)
      }
 
    // ================================================================
-   // STEP 1: News Filter — DISABLED in v5.00
-   // EnableNewsFilter defaults to false and the calendar update call is
-   // bypassed entirely so no MQL5 economic-calendar queries are made.
+   // STEP 1: News Filter — RETIRED (v5.80)
+   // EnableNewsFilter defaults to false and the calendar update is never
+   // called, so no MQL5 economic-calendar query is made. v5.80 also pins
+   // COttoNewsFilter::IsInNewsBlackout() to a constant false, so even a
+   // future call site cannot resurrect the gate. The filter object is kept
+   // only so OnInit() can print its (always-zero) blackout counter for
+   // diagnostics.
    // ================================================================
    // g_newsFilter.Update();
 
    // ================================================================
-   // STEP 2: NEW BAR â€” block formation + veto funnel (bar-close logic)
-   // Mirrors calc_on_every_tick=false.
+   // STEP 2: NEW BAR — block formation, arming, break/flip (bar-close logic)
+   // Mirrors calc_on_every_tick=false. v5.80: this funnel applies the two
+   // CREATION-time vetoes (separation + ATR sizing) and the structural
+   // break/flip; no post-arming veto exists any more.
    // ================================================================
    if(IsNewBar())
      {
@@ -740,44 +673,46 @@ void OnTick(void)
       // Cancel orders on freshly-invalidated blocks BEFORE the funnel reaps them
       g_orderManager.CancelOrdersForInvalidBlocks();
 
-      // Run the funnel (W1/W2 formation + all v4.70 vetoes)
+      // Run the formation + arming + break/flip funnel. v5.80: it no longer
+      // runs ANY post-arming veto (stale / front-run / near-miss / momentum /
+      // FVG are gone); see COttoBlockManager::ProcessBlocks.
       g_blockManager.Update(g_marketDay);
 
       // Cancel any orders declared invalid during this bar's funnel
       g_orderManager.CancelOrdersForInvalidBlocks();
-
-      // Hive Mind (correlation tie-breaker)
-      HiveMind();
      }
 
 
    // ================================================================
-   // STEP 3: INTRA-BAR TARGET CHECKS (inside OnTick)
-   // Front-Run 1:4 target + 6-day near-miss expiry, live.
+   // STEP 3: INTRA-BAR RE-VALIDATION
+   // v5.80 ARCHITECTURAL STRIP: g_blockManager.CheckVetoesInTick() is GONE.
+   // It existed only to re-check the Front-Run target and the 6-day
+   // near-miss expiry on the forming bar. With both vetoes retired there is
+   // nothing left to re-check between bars, so the call and its whole
+   // intra-bar pass (UpdateIntraBar) were deleted. The per-tick cancel below
+   // stays: it acts on invalidations the EAs own state machine produced.
    // ================================================================
-   g_blockManager.CheckVetoesInTick(g_marketDay);
    g_orderManager.CancelOrdersForInvalidBlocks();
 
    // ================================================================
-   // STEP 3b: v5.26 CURRENCY-VECTOR CONSENSUS REFRESH
-   // Rebuilds the 8-currency vectors from the portfolio book and
-   // re-normalizes the 28-pair consensus. Must run BEFORE order
-   // placement so the consensus veto reads fresh state, and before the
-   // opposing-pending sweep so cancellations use the same snapshot.
-   // Cheap: one pass over positions + pendings, no history reads except
-   // the two cached anchor symbols.
+   // STEP 3b: v5.26 CURRENCY-VECTOR CONSENSUS — DIAGNOSTICS ONLY (v5.80)
+   // Rebuilds the 8-currency vectors and the 28-pair consensus so the
+   // operator/auditor can READ the portfolio bias. It no longer gates
+   // anything: the per-block IsTradeVetoed / IsConsensusOpposed guards and
+   // the CancelOpposingConsensusOrders() sweep are deleted, so a new
+   // consensus value cannot suppress or cancel a single order.
    // ================================================================
    g_correlationFilter.RefreshVectorState();
 
-   // Strict outlier cancellation: drop our own pendings that now fight
-   // the refreshed consensus.
-   g_orderManager.CancelOpposingConsensusOrders();
-
    // ================================================================
-   // STEP 4: ORDER PLACEMENT â€” Pine-gated limit orders for armed blocks
-   // Gated further by news blackout + daily-DD pause.
+   // STEP 4: ORDER PLACEMENT — Pine-gated limit orders for armed blocks
+   // Gated ONLY by the prop-firm daily-DD pause. v5.80 removed the news
+   // blackout gate: an external calendar feed may not veto a setup the
+   // zone geometry approved. The sim shields (InpSimNewsShield /
+   // InpSimMacroVeto) are a separate, operator-driven manual lockdown and
+   // are still honoured inside the order manager.
    // ================================================================
-   if(!g_newsFilter.IsInNewsBlackout() && !g_dailyDD_Paused)
+   if(!g_dailyDD_Paused)
      {
       // Every armed block routes through the single LIMIT engine:
       // PlaceOrdersForArmedBlocks() either RESTS a broker limit at the deep
@@ -825,7 +760,6 @@ void LogStatus(void)
    string statusLine;
    StringConcatenate(statusLine,
                      "[STATUS] Day=", g_marketDay,
-                     " | News: ", g_newsFilter.IsInNewsBlackout() ? "BLACKOUT" : "CLEAR",
                      " | Blocks: ", g_blockManager.GetBlockCount(),
                      " | ActiveTrade: ", g_orderManager.HasActiveTrade() ? "YES" : "NO",
                      " | Pending: ", g_orderManager.CountMyPending(),

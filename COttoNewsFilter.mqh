@@ -4,7 +4,7 @@
 //|              OTTO EA — Institutional news blackout filter        |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.72"
+#property version   "5.80"
 
 #ifndef __OTTO_NEWS_FILTER__
 #define __OTTO_NEWS_FILTER__
@@ -281,10 +281,24 @@ public:
 
    //+------------------------------------------------------------------+
    //| Returns true if we are currently in a news blackout window      |
+   //|                                                                 |
+   //| RETIRED (v5.80 architectural strip). This ALWAYS returns false.  |
+   //| The news/calendar gate was an EXTERNAL filter on the execution   |
+   //| path: a third-party event feed could suppress an entry the zone  |
+   //| geometry had already approved. v5.80 removes every such filter,  |
+   //| so the predicate is pinned false at the source -- not merely      |
+   //| un-called -- which makes it impossible for a future call site to  |
+   //| resurrect the gate by accident.                                   |
+   //|                                                                 |
+   //| The detector below (Update() and its blackout window maths) is    |
+   //| untouched and still feeds the blackout counter for DIAGNOSTICS.   |
+   //| Note also that Update() has not been called from OnTick since     |
+   //| v5.00 (STEP 1 is commented out), so this predicate was already    |
+   //| inert in the shipped build.                                      |
    //+------------------------------------------------------------------+
    bool              IsInNewsBlackout(void) const
      {
-      return m_inBlackout;
+      return false;   // v5.80: news blackout can no longer gate a trade
      }
 
    //+------------------------------------------------------------------+

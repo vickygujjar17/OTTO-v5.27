@@ -1,19 +1,19 @@
 # OTTO EA
 
 MetaTrader 5 Expert Advisor — MQL5 port of the Pine Script `prop_guard_tester.pine`
-master build. **Current base: v5.72**
+master build. **Current base: v5.80**
 
 ## Layout
 
 | File | Role |
 |---|---|
 | `OttoDefines.mqh` | Central enums, structs and `input` parameters |
-| `COttoNewsFilter.mqh` | News shield |
+| `COttoNewsFilter.mqh` | News calendar reader — RETIRED as a gate (v5.80), diagnostics only |
 | `COttoRiskManager.mqh` | Position sizing / risk |
 | `COttoMarketStructure.mqh` | Market-day counter, structure helpers |
-| `COttoBlockManager.mqh` | Wick1+Wick2 S/R block lifecycle and vetoes |
+| `COttoBlockManager.mqh` | Wick1+Wick2 S/R block lifecycle: creation-time Separation + ATR Sizing vetoes, arming, structural break/flip |
 | `COttoOrderManager.mqh` | Order placement, pyramiding basket, journal hooks |
-| `COttoCorrelationFilter.mqh` | Cross-symbol correlation veto |
+| `COttoCorrelationFilter.mqh` | Currency-vector consensus — DIAGNOSTICS ONLY since v5.80 (no path to an order) |
 | `COttoTradeManager.mqh` | Cut / cost-BE / lock3 / ATR trail / pyramiding |
 | `COttoJournal.mqh` | Human-readable trade journal |
 | `CHighTableAuditor.mqh` | "High Table" decoupled watchdog: CSV audit trail + latched email alerts |
@@ -57,6 +57,38 @@ old-release literal is left behind, so a partial bump cannot be committed.
 
 > `#property link` names the GitHub *repository*, not the release, so it is
 > intentionally excluded from the bump.
+
+## v5.80 — architectural strip
+
+v5.80 removes **every post-arming execution-path veto** and **every external
+correlation / news filter**. What remains is the strategy itself:
+
+| Stage | Behaviour |
+|---|---|
+| Creation | W1/W2 zone formation, **Separation** and **ATR Sizing** vetoes |
+| Arming | close clears the NEAR edge (plus the stacked-primary lockout) |
+| Structural | **Break / Flip** on the physical FAR edge (`VETO_BROKEN` / `VETO_FLIPPED`) |
+| Routing | strict limit router — a setup either rests at the broker or is `VETO_LIMIT_MISSED` |
+
+Removed: Stale (45D), Front-Run, Near-Miss (6D), Momentum, FVG, the
+`UpdateIntraBar` / `CheckVetoesInTick` intra-bar pass, the per-block
+correlation guards (`IsTradeVetoed` / `IsConsensusOpposed`), the
+`CancelOpposingConsensusOrders` sweep, the `HiveMind()` correlation
+tie-breaker that deleted live zones, and the news-blackout gate.
+
+**The shipped near-edge pullback geometry is byte-identical to v5.72**:
+entry gap `2.0*blockHeight + 1.5*ATR` (`ENTRY_FRONT_EDGE`, as a resting
+limit), `slDist = blockHeight + 0.5*ATR`, far-edge TP anchored by
+`InpMaxRR` (realized `InpMaxRR + 3.0`), and the break/flip block itself.
+`_probe\test_v580_strip.py` diffs each of those against the `HEAD` blob and
+fails if any character moves.
+
+The retired veto inputs (`InpUseStaleVeto`, `InpStaleDays`,
+`InpUseFrontRunVeto`, `InpUseNearMissVeto`, `InpUseMomVeto`, `InpUseFvgVeto`,
+`InpConsensusVetoThreshold`, `InpCancelOpposingPendings`) are **kept as
+declared no-ops**, so an existing `.set` file still loads. `InpMaxRR` is
+*not* retired — it is still the take-profit multiple.
+
 
 Release steps, in order:
 

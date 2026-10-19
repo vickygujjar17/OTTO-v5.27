@@ -11,8 +11,13 @@ Pins the behaviour that cannot be exercised by the MQL5 compiler gate:
   6. maxAbsMovement == 0 guard exists (flat portfolio never divides by zero).
   7. Suffix sanitization resolves broker variants to canonical roots.
   8. Veto threshold semantics: long opposes at <= -t, short opposes at >= +t.
-  9. VETO_CORRELATION defined and wired into the journal reason map.
- 10. v5.25 ladder + TS_Bias_ hive-mind path are untouched.
+  9. v5.80 ARCHITECTURAL STRIP: the consensus reading NO LONGER REACHES AN
+     ORDER. VETO_CORRELATION is gone from the enum, the journal no longer
+     names a "Vector Consensus Veto", the per-block IsTradeVetoed /
+     IsConsensusOpposed guards are deleted, and CancelOpposingConsensusOrders()
+     is deleted with them. The checks below are INVERTED to enforce that.
+ 10. v5.25 ladder + TS_Bias_ hive path are untouched, and the vector maths
+     still runs -- for DIAGNOSTICS, not for gating.
 
 Pure static analysis of the shipped sources — no MT5 required.
 """
@@ -31,6 +36,50 @@ MAIN = os.path.join(ROOT, "otto.mq5")
 
 def read(p):
     return io.open(p, encoding="utf-8", errors="replace", newline="").read()
+
+
+def strip_comments(code):
+    """Drop // comments and /* */ blocks, respecting string literals.
+
+    v5.80 tombstones every retired call site in a comment ("... was DELETED"),
+    so an absence check run against the RAW text would read that note as the
+    thing still being present. Only executable text may be searched.
+    """
+    out, i, n = [], 0, len(code)
+    in_block = False
+    in_str = False
+    while i < n:
+        if in_block:
+            if code.startswith("*/", i):
+                in_block = False
+                i += 2
+            else:
+                i += 1
+            continue
+        ch = code[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(code[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if code.startswith("/*", i):
+            in_block = True
+            i += 2
+            continue
+        if code.startswith("//", i):
+            while i < n and code[i] != "\n":
+                i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 CORR_T = read(CORR)
@@ -172,44 +221,54 @@ check("InpEnableVectorEngine defaults true",
       re.search(r"InpEnableVectorEngine\s*=\s*true", DEFS_T) is not None)
 check("InpUseExternalAnchors defaults true",
       re.search(r"InpUseExternalAnchors\s*=\s*true", DEFS_T) is not None)
-check("InpCancelOpposingPendings defaults true",
-      re.search(r"InpCancelOpposingPendings\s*=\s*true", DEFS_T) is not None)
+# v5.80 ARCHITECTURAL STRIP: the engine keeps computing consensus -- so the
+# maths above is still worth pinning -- but nothing may act on it. The two
+# knobs that used to gate ACTION are now declared no-ops defaulting FALSE, so a
+# stale .set file cannot switch a deleted filter back on.
+check("InpCancelOpposingPendings is retired OFF (no-op)",
+      re.search(r"InpCancelOpposingPendings\s*=\s*false", DEFS_T) is not None and
+      re.search(r"InpCancelOpposingPendings[^\n]*RETIRED \(v5\.80\)",
+                DEFS_T) is not None)
+check("InpConsensusVetoThreshold is retired as a no-op",
+      re.search(r"InpConsensusVetoThreshold[^\n]*RETIRED \(v5\.80\)",
+                DEFS_T) is not None)
 
 
 # ----------------------------------------------------------------------
-# 9. Enum + journal wiring
+# 9. Enum + journal wiring — RETIRED in v5.80
 # ----------------------------------------------------------------------
-check("VETO_CORRELATION defined", "VETO_CORRELATION" in DEFS_T)
-check("journal maps VETO_CORRELATION to a reason", "Vector Consensus Veto" in OM_T)
-check("order manager vetoes on consensus",
-      "m_correlationFilter.IsConsensusOpposed(m_symbol, dir)" in OM_T)
-check("veto is recorded on the block",
-      "block.vetoReason = VETO_CORRELATION;" in OM_T)
-check("cancellation sweep exists",
-      "CancelOpposingConsensusOrders(void)" in OM_T)
-check("sweep respects its enable flag",
-      "if(!InpCancelOpposingPendings) return;" in OM_T)
-check("sweep filters by magic",
-      "OrderGetInteger(ORDER_MAGIC) != MagicNumber" in OM_T)
-check("sweep covers all four pending types",
-      all(t in OM_T for t in ("ORDER_TYPE_BUY_LIMIT", "ORDER_TYPE_BUY_STOP",
-                              "ORDER_TYPE_SELL_LIMIT", "ORDER_TYPE_SELL_STOP")))
-# v5.72: pinned as a BEHAVIOUR, not a column. The retired virtual
-# consensus walk happened to be the only site writing
-# `mod.limitOrderTicket = 0;` with single spaces, so the old literal was
-# silently tracking column alignment rather than the release. The
-# property is that the sweep clears the ticket on the block.
-check("sweep releases the block ticket",
-      re.search(r"mod\.limitOrderTicket\s*=\s*0\s*;", OM_T) is not None)
+# The consensus reading no longer reaches an order, so the enum member, the
+# journal caption, the per-block guard and the cancellation sweep are all gone.
+# These checks are INVERTED on purpose: they now fail if any of that machinery
+# is reintroduced, which is the property v5.80 actually promises.
+check("VETO_CORRELATION is gone from the enum", "VETO_CORRELATION" not in DEFS_T)
+check("the journal no longer names a Vector Consensus Veto",
+      "Vector Consensus Veto" not in OM_T)
+check("order manager no longer vetoes on consensus",
+      "m_correlationFilter.IsConsensusOpposed(m_symbol, dir)" not in OM_T)
+check("no block is marked with a correlation reason",
+      "block.vetoReason = VETO_CORRELATION;" not in OM_T)
+check("the cancellation sweep is deleted",
+      "CancelOpposingConsensusOrders" not in strip_comments(OM_T))
+# The weighted portfolio veto (MODULE 2) was the OTHER per-block correlation
+# guard in the same function; it must be gone from the call site too.
+check("the weighted IsTradeVetoed guard is gone from the order path",
+      "m_correlationFilter.IsTradeVetoed(dir)" not in OM_T)
 
 # ----------------------------------------------------------------------
 # 10. Integration order in otto.mq5
 # ----------------------------------------------------------------------
+# v5.80 tombstones the retired call sites in COMMENTS, so the absence checks
+# below read the comment-stripped source -- otherwise a note explaining what
+# was removed would read as the thing being present.
+MAIN_C = strip_comments(MAIN_T)
 ri = MAIN_T.find("g_correlationFilter.RefreshVectorState();")
-ci = MAIN_T.find("g_orderManager.CancelOpposingConsensusOrders();")
-check("otto.mq5 calls RefreshVectorState", ri > 0)
-check("otto.mq5 calls CancelOpposingConsensusOrders", ci > 0)
-check("refresh runs before the cancel sweep", 0 < ri < ci)
+check("otto.mq5 still refreshes the vectors for DIAGNOSTICS", ri > 0)
+check("otto.mq5 no longer sweeps the book on consensus",
+      "CancelOpposingConsensusOrders" not in MAIN_C)
+check("HiveMind no longer deletes zones on a portfolio vote",
+      "DeleteBlockType" not in MAIN_C)
+check("the HiveMind call is gone from OnTick", "HiveMind()" not in MAIN_C)
 
 # ----------------------------------------------------------------------
 # 11. Regression guards — v5.25 layer must be untouched
