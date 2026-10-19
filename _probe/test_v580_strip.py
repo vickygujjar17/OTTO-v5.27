@@ -32,9 +32,9 @@ WHAT MUST SURVIVE
 WHAT MUST BE BYTE-IDENTICAL TO v5.72
   The geometry. The entry gap (2.0*blockHeight + 1.5*ATR), slDist
   (blockHeight + 0.5*ATR), the far-edge TP anchor and the whole break/flip
-  block are compared against the HEAD blob character for character. A strip
-  that quietly re-priced the strategy would be a different EA, not a smaller
-  one, so this is asserted rather than reviewed.
+  block are compared against the v5.72 commit (pinned as V572) character for
+  character. A strip that quietly re-priced the strategy would be a different
+  EA, not a smaller one, so this is asserted rather than reviewed.
 
 Pure static analysis of the shipped sources -- no MT5 required.
 """
@@ -54,6 +54,14 @@ NEWS = "COttoNewsFilter.mqh"
 DEFS = "OttoDefines.mqh"
 MAIN = "otto.mq5"
 
+# The v5.72 commit, pinned. This probe compares the shipped geometry against
+# the v5.72 blob, so the reference MUST be that commit -- never HEAD. Reading
+# HEAD was correct only while v5.72 was still the tip; once v5.80 landed, HEAD
+# held the stripped sources, the HEAD-side slice terminators no longer existed,
+# and the comparison silently degraded into a false failure. A pinned SHA keeps
+# the reference honest no matter how far the branch advances.
+V572 = "3337fab"
+
 ALL_FILES = [MAIN, OM, "COttoTradeManager.mqh", "COttoRiskManager.mqh", BM,
              "COttoJournal.mqh", "CHighTableAuditor.mqh", CORR,
              "COttoMarketStructure.mqh", NEWS, DEFS]
@@ -66,7 +74,7 @@ def read(name):
 
 def head_blob(name):
     """The v5.72 blob straight from git -- the geometry reference."""
-    out = subprocess.run(["git", "show", "HEAD:" + name], cwd=ROOT,
+    out = subprocess.run(["git", "show", V572 + ":" + name], cwd=ROOT,
                          capture_output=True)
     if out.returncode != 0:
         return None
@@ -328,15 +336,19 @@ print("\n-- 7. Version stamps --")
 stamps = re.findall(r'#property version\s+"(\d+\.\d+)"', DEFS_T)
 check("OttoDefines.mqh carries exactly one stamp", len(set(stamps)) == 1,
       "found %s" % sorted(set(stamps)))
-check("the release is v5.80", set(stamps) == {"5.80"},
-      "found %s" % sorted(set(stamps)))
+# Derived from the live stamp rather than pinned: this probe asserts the strip's
+# geometry and the retirement inventory, not the release number, so hardcoding
+# a version here would go red on every bump for no reason. Coherence is what
+# matters -- one stamp, echoed everywhere.
+REL = stamps[0] if stamps else "?"
+check("the release is a 5.x stamp", REL.startswith("5."), "found %r" % REL)
 missing = [f for f in ALL_FILES
-           if not re.search(r'#property version\s+"5\.80"', read(f))]
-check("all %d shipped sources carry 5.80" % len(ALL_FILES),
+           if not re.search(r'#property version\s+"%s"' % re.escape(REL), read(f))]
+check("all %d shipped sources carry %s" % (len(ALL_FILES), REL),
       not missing, "missing: %s" % ", ".join(missing))
 check("no 5.72 stamp survives anywhere",
       all('"5.72"' not in read(f) for f in ALL_FILES))
-check("the startup banner names v5.80", "OTTO EA v5.80" in MAIN_T)
+check("the startup banner names v%s" % REL, "OTTO EA v" + REL in MAIN_T)
 
 
 def main():

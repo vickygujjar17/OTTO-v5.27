@@ -22,8 +22,8 @@ A. InpTrailStartRR 2.0 -> 1.0.
    produces it, not just the values, because the ordering is what makes the
    label correct.
 
-B. CHighTableAuditor gains AuditTrailingHealth() plus an aggregate
-   basket-risk leg inside AuditRiskExposure().
+B. CHighTableAuditor gains AuditTrailingHealth(). v5.63 also added an
+   aggregate basket-risk leg inside AuditRiskExposure(); v5.81 REMOVES it.
 
    The trail check exists because a trail that silently arms and then never
    writes is indistinguishable from a healthy one on any single tick. The
@@ -33,12 +33,13 @@ B. CHighTableAuditor gains AuditTrailingHealth() plus an aggregate
    circular: a fully frozen stop reads NEGATIVE R and would sail through the
    very test meant to catch it.
 
-   The aggregate leg exists because peakRiskPct is blind to what the WHOLE
-   basket puts at risk: one leg can sit inside its own budget while the total
-   does not. v5.71 bounds that total by the LARGEST rung plus tolerance, not
-   by the sum of the ladder: the shared ratchet absorbs every older leg, so
-   the nominal sum is unreachable through the live geometry. RiskPercent still
-   participates in the max, so a zeroed ladder cannot under-read.
+   Why the aggregate leg is gone (v5.81): under the shared one-way ratchet an
+   older leg already sits at or beyond the live stop, so its loss-side distance
+   is <= 0, the guard skips it, and a healthy ladder summed to roughly its
+   newest rung. The ceiling could not fire on the stacking it was written to
+   catch, while the per-leg check had already reported any sizing error that
+   could reach it. Section C below now asserts the ABSENCE of the bound and the
+   survival of the per-leg audit, so a silent reintroduction goes red.
 
 Pure static analysis of the shipped sources - no MT5 required.
 """
@@ -350,7 +351,6 @@ check("NoteExcursion only ever raises the peak",
 
 # Member declarations + constructor init, following the existing latch pattern.
 for member, decl in (("m_alertSent_StaleTrail", r"bool\s+m_alertSent_StaleTrail\s*;"),
-                     ("m_alertSent_AggRiskBreach", r"bool\s+m_alertSent_AggRiskBreach\s*;"),
                      ("m_haveGeometry", r"bool\s+m_haveGeometry\s*;"),
                      ("m_trackedEntry", r"double\s+m_trackedEntry\s*;"),
                      ("m_trackedRRUnit", r"double\s+m_trackedRRUnit\s*;"),
@@ -447,51 +447,44 @@ check("v5.46: the per-leg breach still dispatches as WARN through its own latch"
 check("v5.46: a clean cycle still re-arms the per-leg latch",
       re.search(r"ClearLatch\(m_alertSent_RiskBreach\)", RISK_C) is not None)
 
-# --- The new leg ------------------------------------------------------
-check("the sum accumulates each leg's loss-side percentage",
-      re.search(r"sumRiskPct\s*\+=\s*posRiskPct\s*;", RISK_C) is not None)
-check("the sum starts at zero before the loop",
-      re.search(r"double\s+sumRiskPct\s*=\s*0\.0\s*;", RISK_C) is not None)
-# v5.71: the bound is keyed to the LARGEST rung, not the sum of the ladder.
-# The shared ratchet puts every older leg at or beyond the live stop, so the
-# nominal sum (2.75%) is unreachable and could not fire on the stacking it was
-# documented to catch. maxRungRiskPct folds in RiskPercent, which preserves the
-# v5.70 property: a zeroed or inverted ladder cannot resolve the ceiling below
-# the primary rung.
-check("the aggregate bound is the largest rung, not the summed ladder",
-      re.search(r"maxRungRiskPct\s*=\s*MathMax\(\s*InpRiskT2Pct\s*,"
-                r"\s*InpRiskT3Pct\s*\)", RISK_C) is not None and
-      re.search(r"maxRungRiskPct\s*=\s*MathMax\(\s*maxRungRiskPct\s*,"
-                r"\s*InpRiskT4Pct\s*\)", RISK_C) is not None)
-check("the unreachable nominal sum is retired from the leg",
-      "nominalStackPct" not in RISK_C)
-check("RiskPercent still participates, so a zeroed ladder cannot under-read",
-      re.search(r"maxRungRiskPct\s*=\s*MathMax\(\s*maxRungRiskPct\s*,"
-                r"\s*RiskPercent\s*\)", RISK_C) is not None)
-check("the worst-rung allowance keeps the same 50% tolerance",
-      re.search(r"maxAllowedAggPct\s*=\s*maxRungRiskPct\s*\*\s*1\.50", RISK_C)
+# --- The aggregate leg is RETIRED (v5.81) ------------------------------
+# v5.81 removes the basket-summed ceiling: under the shared one-way ratchet an
+# older leg already sits at or beyond the live stop, its loss-side distance is
+# <= 0, the guard skips it, and a healthy ladder summed to roughly its newest
+# rung. The ceiling could not fire on the stacking it was written to catch,
+# while the per-leg check had already reported any sizing error that reached
+# it. These assertions therefore pin the ABSENCE of every piece of it, so a
+# silent reintroduction fails here rather than shipping untested.
+for _gone, _what in (
+        ("sumRiskPct", "the basket accumulator"),
+        ("maxRungRiskPct", "the largest-rung bound"),
+        ("maxAllowedAggPct", "the aggregate allowance"),
+        ("m_aggRiskSeen", "the two-cycle confirm flag"),
+        ("m_alertSent_AggRiskBreach", "the aggregate latch"),
+        ("aggregate basket risk breach", "the aggregate alert text"),
+        ("nominalStackPct", "the retired nominal stack")):
+    check("v5.81: %s is gone from the risk audit" % _what, _gone not in RISK_C)
+
+check("v5.81: no MathMax ladder remains in the risk audit",
+      "MathMax" not in RISK_C)
+check("v5.81: the aggregate latch is not declared anywhere in the class",
+      "m_alertSent_AggRiskBreach" not in AUD_T
+      and "m_aggRiskSeen" not in AUD_T)
+
+# The per-leg audit is the retained guarantee, so its arithmetic must survive
+# verbatim -- this is the same shape v5.46/v5.71 shipped, now the ONLY risk leg.
+check("v5.81: the per-leg peak is still computed and dispatched",
+      re.search(r"peakRiskPct\s*=\s*posRiskPct\s*;", RISK_C) is not None
+      and "DispatchAlertOnce(m_alertSent_RiskBreach" in RISK_C)
+check("v5.81: the per-leg tolerance is still 50% of the target",
+      re.search(r"maxAllowedRiskPct\s*=\s*RiskPercent\s*\*\s*1\.50", RISK_C)
       is not None)
-check("the aggregate test is strictly greater-than, like the per-leg one",
-      re.search(r"if\s*\(\s*sumRiskPct\s*>\s*maxAllowedAggPct\s*\)", RISK_C)
-      is not None)
-check("the aggregate breach dispatches through its OWN latch",
-      "DispatchAlertOnce(m_alertSent_AggRiskBreach" in RISK_C)
-check("the aggregate alert is WARN",
-      RISK_C.count("HT_SEV_WARN") >= 2)
-check("the aggregate alert distinguishes itself from the per-leg one",
-      "aggregate basket risk breach" in RISK_C)
-check("the aggregate breach is confirmed across two cycles",
-      re.search(r"if\s*\(\s*m_aggRiskSeen\s*\)", RISK_C) is not None)
-check("the second-cycle flag is set on the first sighting",
-      re.search(r"m_aggRiskSeen\s*=\s*true\s*;", RISK_C) is not None)
-check("a healthy basket re-arms the aggregate latch AND clears the flag",
-      re.search(r"ClearLatch\(m_alertSent_AggRiskBreach\)\s*;\s*\n\s*"
-                r"m_aggRiskSeen\s*=\s*false\s*;", RISK_C) is not None)
-check("the aggregate latch lifecycle pairing holds",
-      latch_lifecycle_ok(RISK_C, "AggRiskBreach"))
-check("the two legs share ONE loop and ONE loss-side guard",
+check("v5.81: the risk audit still walks the book exactly once",
       RISK_C.count("for(int idx = PositionsTotal() - 1; idx >= 0; idx--)") == 1
       and RISK_C.count("if(lossDist <= 0.0) continue;") == 1)
+check("v5.81: the removal is documented in the body",
+      "v5.81" in (RISK or "") and "REMOVED" in (RISK or ""))
+
 
 
 

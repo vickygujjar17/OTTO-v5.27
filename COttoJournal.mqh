@@ -4,7 +4,7 @@
 //|            OTTO EA — dynamic file editing, cancellation, email       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.80"
+#property version   "5.81"
 
 #ifndef __OTTO_JOURNAL__
 #define __OTTO_JOURNAL__

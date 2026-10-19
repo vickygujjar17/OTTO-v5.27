@@ -1,7 +1,7 @@
 # OTTO EA
 
 MetaTrader 5 Expert Advisor — MQL5 port of the Pine Script `prop_guard_tester.pine`
-master build. **Current base: v5.80**
+master build. **Current base: v5.81**
 
 ## Layout
 
@@ -16,7 +16,7 @@ master build. **Current base: v5.80**
 | `COttoCorrelationFilter.mqh` | Currency-vector consensus — DIAGNOSTICS ONLY since v5.80 (no path to an order) |
 | `COttoTradeManager.mqh` | Cut / cost-BE / lock3 / ATR trail / pyramiding |
 | `COttoJournal.mqh` | Human-readable trade journal |
-| `CHighTableAuditor.mqh` | "High Table" decoupled watchdog: CSV audit trail + latched email alerts |
+| `CHighTableAuditor.mqh` | "High Table" decoupled watchdog: CSV audit trail + latched email alerts; per-leg risk audit (the aggregate basket ceiling was removed in v5.81) |
 | `otto.mq5` | EA entry point and event handlers |
 
 ## Build (strict gate)
@@ -80,8 +80,10 @@ tie-breaker that deleted live zones, and the news-blackout gate.
 entry gap `2.0*blockHeight + 1.5*ATR` (`ENTRY_FRONT_EDGE`, as a resting
 limit), `slDist = blockHeight + 0.5*ATR`, far-edge TP anchored by
 `InpMaxRR` (realized `InpMaxRR + 3.0`), and the break/flip block itself.
-`_probe\test_v580_strip.py` diffs each of those against the `HEAD` blob and
-fails if any character moves.
+`_probe\test_v580_strip.py` diffs each of those against the v5.72 commit
+(pinned as `V572`) and fails if any character moves. The anchor is a SHA, not
+`HEAD`: reading `HEAD` only worked while v5.72 was the tip, and once v5.80
+landed the reference silently degraded into a false failure.
 
 The retired veto inputs (`InpUseStaleVeto`, `InpStaleDays`,
 `InpUseFrontRunVeto`, `InpUseNearMissVeto`, `InpUseMomVeto`, `InpUseFvgVeto`,
@@ -89,6 +91,49 @@ The retired veto inputs (`InpUseStaleVeto`, `InpStaleDays`,
 declared no-ops**, so an existing `.set` file still loads. `InpMaxRR` is
 *not* retired — it is still the take-profit multiple.
 
+
+## v5.81 — High Table aggregate ceiling removed
+
+v5.81 removes the **aggregate (basket-summed) risk ceiling** that
+`AuditRiskExposure()` gained in v5.63 and re-keyed in v5.71. It could not fire
+on the stacking it was written to catch, and it duplicated a check that already
+works.
+
+The reasoning is the ratchet. Every rung of the ladder is opened about 1R from
+ONE shared stop, and `ApplyUnifiedSL()` only ever ratchets that stop forward:
+
+| Event | Stop moves to |
+|---|---|
+| T2 at +1.0R | breakeven |
+| T3 at +2.0R | primary +1.0R |
+| T4 at +3.0R | primary +2.0R |
+
+So an OLDER leg is already behind the live stop. Its loss-side distance is
+`<= 0`, the `lossDist <= 0.0` guard skips it, and it contributes nothing to the
+sum. A healthy ladder therefore summed to roughly its **newest** rung — ~1.0% at
+T2, ~0.5% at T3, ~0.25% at T4 — never the 2.75% nominal ladder or the 1.50%
+worst-rung allowance. The ceiling was unreachable through the shipped geometry,
+and the only path that could reach it was a sizing error the per-leg check had
+already reported.
+
+**Removed:** the `sumRiskPct` accumulator, the `maxRungRiskPct` /
+`maxAllowedAggPct` bound, the `sumRiskPct > maxAllowedAggPct` test, the
+`m_aggRiskSeen` two-cycle confirmation flag, the `m_alertSent_AggRiskBreach`
+latch, and the `HighTable: aggregate basket risk breach` alert.
+
+**Retained, unchanged:** the per-leg audit — `lossDist` read from `entry` to the
+live broker stop, the `lossDist <= 0.0` profit-side skip, the 50%
+(`RiskPercent * 1.50`) tolerance, the `peakRiskPct` / `peakTicket` worst-leg
+tracking, the `HT_SEV_WARN` dispatch through `m_alertSent_RiskBreach`, its
+clean-cycle re-arm — plus the whole orphan-leg sweep. A single oversized leg is
+the failure mode that actually reaches this body, and it is still caught.
+
+`InpRiskT2Pct` / `InpRiskT3Pct` / `InpRiskT4Pct` remain **live inputs**: the
+order manager and trade manager still read them for sizing. Only the auditor's
+use of them as a ceiling constant is gone.
+
+**The shipped geometry is untouched** — no entry, stop, target or trail value
+changed, and `_probe\test_v580_strip.py` still proves it byte-for-byte.
 
 Release steps, in order:
 

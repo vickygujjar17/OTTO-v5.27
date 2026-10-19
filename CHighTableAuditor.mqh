@@ -5,7 +5,7 @@
 //|        Runs on its own timer cadence, independent of OnTick       |
 //+------------------------------------------------------------------+
 #property copyright "OTTO EA - Goat Funded Trader (GFT) Master Build"
-#property version   "5.80"
+#property version   "5.81"
 
 #ifndef __OTTO_HIGH_TABLE_AUDITOR__
 #define __OTTO_HIGH_TABLE_AUDITOR__
@@ -107,7 +107,6 @@ private:
    bool              m_alertSent_StateInconsistency; // book vs tracked state
    bool              m_alertSent_RiskBreach;        // position risk exceeded allowance
    bool              m_alertSent_StaleTrail;        // price ran past the trail's arm R:R, stop never followed (v5.63)
-   bool              m_alertSent_AggRiskBreach;     // SUMMED basket risk over the stacked budget (v5.63)
    bool              m_alertSent_LaggingFloor;      // stop sits below the milestone floor its peak has earned (v5.68)
    bool              m_alertSent_OrphanLeg;         // a magic-scoped leg carries no stop at all (v5.68)
 
@@ -157,7 +156,6 @@ private:
    bool              m_trackedAdopted;       // primary is an ADOPTED magic-0 manual leg (v5.33)
    bool              m_stateSkewSeen;        // divergence seen once, awaiting confirm
    bool              m_adoptionSeen;         // adoption INFO already dispatched (v5.33)
-   bool              m_aggRiskSeen;          // summed-risk breach seen once, awaiting confirm (v5.63)
    bool              m_lagFloorSeen;        // lagging-floor sighting seen once, awaiting confirm (v5.68)
    bool              m_orphanSeen;          // orphan-leg sighting seen once, awaiting confirm (v5.68)
 
@@ -416,7 +414,6 @@ public:
       m_trackedAdopted         = false;
       m_stateSkewSeen          = false;
       m_adoptionSeen           = false;
-      m_aggRiskSeen            = false;
       m_lagFloorSeen           = false;
       m_orphanSeen             = false;
       m_dailyResetBalance      = 0.0;
@@ -431,7 +428,6 @@ public:
       m_alertSent_StateInconsistency = false;
       m_alertSent_RiskBreach         = false;
       m_alertSent_StaleTrail         = false;
-      m_alertSent_AggRiskBreach      = false;
       m_alertSent_LaggingFloor       = false;
       m_alertSent_OrphanLeg          = false;
       m_haveGeometry                 = false;
@@ -927,7 +923,7 @@ public:
          // Either the book is clean (re-arm, the next incident emails again) or
          // this is the FIRST sighting of an orphan -- in which case nothing has
          // been raised yet, so re-arming is a no-op and only the confirm flag
-         // advances. Same else-shape the aggregate-risk leg uses.
+         // advances. Same else-shape the phantom-leg test uses.
          ClearLatch(m_alertSent_OrphanLeg);
          m_orphanSeen = (orphans > 0);
         }
@@ -1244,8 +1240,8 @@ public:
         }
 
       // First sighting: remember it and wait one cycle, exactly as the phantom
-      // and aggregate-risk tests do -- a tranche landing just before its stop
-      // is pushed is the normal shape of a fill, not an incident.
+      // test does -- a tranche landing just before its stop is pushed is the
+      // normal shape of a fill, not an incident.
       if(!m_lagFloorSeen)
         {
          m_lagFloorSeen = true;
@@ -1327,48 +1323,16 @@ public:
    //|      unrelated manual or foreign-EA magic-0 leg still cannot be    |
    //|      counted -- the blast radius stays one position.              |
    //|                                                                    |
-   //| v5.63 adds a SECOND, independent leg to this body: the loss-side   |
-   //| risk AGGREGATED across the basket, measured against the largest    |
-   //| single rung plus the same 50% tolerance. The per-leg peak above    |
-   //| cannot see it: one leg can be comfortably inside its own budget    |
-   //| while the total the basket puts at risk is not. The two checks     |
-   //| share the loop and the loss-side guard, and each owns its own      |
-   //| latch, so a basket can report either, both, or neither.            |
-   //|                                                                    |
-   //| v5.71 RE-KEYS THE BOUND TO THE LARGEST RUNG. v5.63/v5.70 measured  |
-   //| the SUM of the four nominal rung risks (1.0 + 1.0 + 0.5 + 0.25 =   |
-   //| 2.75%, 4.125% with tolerance) and called that the design ceiling.  |
-   //| The shipped geometry cannot reach it. Every rung is opened about 1R|
-   //| from ONE shared stop, and ApplyUnifiedSL() ratchets that stop      |
-   //| forward only:                                                      |
-   //|                                                                    |
-   //|     T2 at +1.0R  ->  stop at breakeven     (primary entry +/- fric)|
-   //|     T3 at +2.0R  ->  stop at primary +1.0R                         |
-   //|     T4 at +3.0R  ->  stop at primary +2.0R                         |
-   //|                                                                    |
-   //| so an OLDER leg is already behind the stop and its loss-side       |
-   //| distance is <= 0. The guard skips it, and it adds nothing to the   |
-   //| sum. A healthy ladder therefore reads roughly its NEWEST rung:     |
-   //| ~1.0% at T2, ~0.5% at T3, ~0.25% at T4 -- never 2.75%. The 4.125%  |
-   //| bound could not fire on the stacking it was documented to catch,   |
-   //| and the only way to reach it was a sizing error the per-leg check  |
-   //| had already reported.                                              |
-   //|                                                                    |
-   //| The bound is now max(rungs, RiskPercent) * 1.50, i.e. 1.50% on the |
-   //| shipped 1.0% ladder. A correctly-sized T1+T2 basket reads ~1.0%    |
-   //| against 1.50%, so it keeps 33% headroom and still never alerts. The|
-   //| RiskPercent term preserves the v5.70 property: a zeroed or inverted|
-   //| InpRiskT2Pct/T3/T4 cannot resolve the ceiling below the primary    |
-   //| rung, so a plain single-leg basket cannot trip this leg. A breach  |
-   //| now means the ratchet is NOT absorbing the older legs, which is the|
-   //| failure this leg exists to report.                                 |
-   //|                                                                    |
-   //| Note that the DEEP ENTRY GAP cannot inflate either measure: both   |
-   //| read the distance from entry to the LIVE broker stop, and that leg |
-   //| starts as m_basketRRUnit (bh + 0.5*ATR), which is 1R by            |
-   //| construction and independent of how wide the entry gap is. A       |
-   //| correctly-sized scale-in therefore reads at its nominal rung and   |
-   //| can never false-alarm here, while a real sizing bug still does.    |
+   //| v5.81 TOMBSTONE: v5.63 added a SECOND, basket-summed leg here and  |
+   //| v5.71 re-keyed its bound to the largest rung. Both are REMOVED.    |
+   //| Under the shared one-way ratchet an older leg already sits at or   |
+   //| beyond the live stop, its loss-side distance is <= 0, the guard    |
+   //| skips it, and a healthy ladder summed to roughly its NEWEST rung   |
+   //| (~1.0% at T2, ~0.5% at T3, ~0.25% at T4). The ceiling was therefore|
+   //| unreachable through the shipped geometry and could not fire on the |
+   //| stacking it was written to catch, while the per-leg test above had |
+   //| already reported any sizing error that could reach it. The per-leg |
+   //| audit is the retained guarantee; the aggregate ceiling is gone.    |
    //+------------------------------------------------------------------+
    void              AuditRiskExposure(void)
      {
@@ -1383,13 +1347,6 @@ public:
       double maxAllowedRiskPct = RiskPercent * 1.50;
       double peakRiskPct = 0.0;
       ulong  peakTicket  = 0;
-      // v5.63: the SUMMED loss-side exposure of the basket. peakRiskPct above
-      // measures the worst SINGLE leg and is deliberately blind to how many
-      // legs are stacked behind the shared stop; this accumulates them. Both
-      // are needed because they fail differently -- a single oversized leg is
-      // a sizing bug, while four correctly-sized legs summing past the design
-      // budget is a pyramid bug, and only the sum can see the second one.
-      double sumRiskPct = 0.0;
 
       for(int idx = PositionsTotal() - 1; idx >= 0; idx--)
         {
@@ -1428,11 +1385,6 @@ public:
             peakRiskPct = posRiskPct;
             peakTicket  = ticket;
            }
-
-         // v5.63: accumulate the same loss-side percentage into the basket sum.
-         // Only legs already past the lossDist > 0 guard above reach here, so a
-         // stop on the profit side contributes nothing on either measure.
-         sumRiskPct += posRiskPct;
         }
 
       if(peakRiskPct > maxAllowedRiskPct)
@@ -1450,58 +1402,15 @@ public:
         {
          ClearLatch(m_alertSent_RiskBreach);
         }
-
-      // ---- v5.63: the AGGREGATE leg --------------------------------------
-      // The per-leg test above is blind to what the whole basket carries: one
-      // leg can sit inside its own budget while the total does not.
-      //
-      // v5.71 keys the bound to the LARGEST rung, not to the sum of the
-      // ladder. Under the shared one-way ratchet every older leg sits at or
-      // beyond the live stop, so its loss-side distance is <= 0, the guard
-      // above skips it, and a healthy ladder sums to roughly its newest rung
-      // (~1.0% at T2, ~0.5% at T3, ~0.25% at T4). The 2.75% sum was therefore
-      // unreachable and could not fire on the stacking it was written to
-      // catch. Still confirmed across two cycles for the same reason as the
-      // trail check: a tranche landing just before its stop is pushed reads
-      // high for one cycle, which is the normal shape of a fill rather than
-      // an incident.
-      // v5.71: measure the LARGEST rung, not the sum. The sum is unreachable
-      // through the live ratchet (see the doc box above), so it could not fire
-      // on the stacking it claimed to catch. RiskPercent is folded into the
-      // max so the v5.70 property survives: a zeroed or inverted tranche
-      // config can never resolve the ceiling below the primary rung.
-      double maxRungRiskPct   = MathMax(InpRiskT2Pct, InpRiskT3Pct);
-      maxRungRiskPct          = MathMax(maxRungRiskPct, InpRiskT4Pct);
-      maxRungRiskPct          = MathMax(maxRungRiskPct, RiskPercent);
-      double maxAllowedAggPct = maxRungRiskPct * 1.50;
-      if(sumRiskPct > maxAllowedAggPct)
-        {
-         if(m_aggRiskSeen)
-           {
-            DispatchAlertOnce(m_alertSent_AggRiskBreach,
-                              "HighTable: aggregate basket risk breach",
-                              "Summed loss-side risk across the basket is " +
-                              DoubleToString(sumRiskPct, 2) +
-                              "% of equity, above the worst-rung allowance " +
-                              DoubleToString(maxAllowedAggPct, 2) + "% (" +
-                              DoubleToString(maxRungRiskPct, 2) +
-                              "% largest rung + 50% tolerance). The worst single" +
-                              " leg is " + DoubleToString(peakRiskPct, 2) +
-                              "%, so every leg may be individually in budget - the" +
-                              " problem is that the shared ratchet is NOT absorbing" +
-                              " the legs behind the newest one.",
-                              HT_SEV_WARN);
-           }
-         else
-           {
-            m_aggRiskSeen = true;
-           }
-        }
-      else
-        {
-         ClearLatch(m_alertSent_AggRiskBreach);
-         m_aggRiskSeen = false;
-        }
+      // v5.81: the AGGREGATE (basket-summed) ceiling is REMOVED. It measured
+      // the summed loss-side risk of the basket against max(largest rung,
+      // RiskPercent) * 1.50. Under the shared one-way ratchet every older leg
+      // already sits at or beyond the live stop, so its loss-side distance is
+      // <= 0, the guard above skips it, and a healthy ladder read roughly its
+      // newest rung -- the ceiling could not fire on the stacking it was
+      // written to catch, while the per-leg check above had already reported
+      // any sizing error that could reach it. The per-leg audit, its latch and
+      // the orphan sweep are the retained exposure guarantee.
      }
   };
 #endif  // __OTTO_HIGH_TABLE_AUDITOR__

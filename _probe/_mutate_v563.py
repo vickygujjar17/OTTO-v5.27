@@ -17,11 +17,14 @@ while "simplifying" the release, not as arbitrary corruption:
   * forgetting to reset the peak when the tracked ticket changes
   * accepting a zero 1R instead of clearing the geometry
   * losing a healthy-path re-arm on either new latch
-  * dropping the two-cycle confirmation on the aggregate leg
   * widening the per-leg sum to include profit-side legs
-  * reverting the bound to the summed ladder (unreachable, so inert)
-  * dropping the RiskPercent term so a zeroed ladder under-reads
   * dropping the geometry push, or gating it on the wrong branch
+
+The eight aggregate-leg mutations v5.63 shipped (accumulation, largest-rung
+bound, 50% tolerance, RiskPercent floor, two-cycle confirm, re-arm, latch
+routing) were RETIRED in v5.81 with the block they anchored to. Their subject
+is gone rather than unreachable, and the probe now asserts that absence, so
+there is nothing left for them to corrupt.
 
 Anchors are written with plain \\n and applied CRLF-tolerantly, so this table
 does not silently rot if the working tree is normalised to a different line
@@ -180,65 +183,14 @@ MUTATIONS = [
 
 
 MUTATIONS += [
-    # ---- C. the aggregate leg -----------------------------------------
-    ("the profit-side guard is dropped, so the sum counts profit-side legs", AUD,
-     "         double lossDist = isLong ? (entry - sl) : (sl - entry);\n"
-     "         if(lossDist <= 0.0) continue;\n"
-     "\n"
-     "         double distPts     = lossDist / tickSize;\n"
-     "         double moneyAtRisk = distPts * tickValue * vol;\n"
-     "         double posRiskPct  = (moneyAtRisk / equity) * 100.0;\n"
-     "\n"
-     "         if(posRiskPct > peakRiskPct)",
-     "         double lossDist = isLong ? (entry - sl) : (sl - entry);\n"
-     "\n"
-     "         double distPts     = lossDist / tickSize;\n"
-     "         double moneyAtRisk = distPts * tickValue * vol;\n"
-     "         double posRiskPct  = (moneyAtRisk / equity) * 100.0;\n"
-     "\n"
-     "         if(posRiskPct > peakRiskPct)"),
-
-    ("the sum is never accumulated, so the aggregate leg is dead", AUD,
-     "         sumRiskPct += posRiskPct;",
-     "         ;"),
-
-    # v5.71 retarget: the bound is the largest rung. "Simplifying" it back to the
-    # summed ladder is the most plausible regression, and it is exactly the
-    # unreachable form v5.71 removed -- so it must be caught.
-    ("the aggregate bound reverts to summing the ladder", AUD,
-     "      double maxRungRiskPct   = MathMax(InpRiskT2Pct, InpRiskT3Pct);",
-     "      double maxRungRiskPct   = RiskPercent + InpRiskT2Pct + InpRiskT3Pct + InpRiskT4Pct;"),
-
-    ("the aggregate allowance loses the 50% tolerance", AUD,
-     "      double maxAllowedAggPct = maxRungRiskPct * 1.50;",
-     "      double maxAllowedAggPct = maxRungRiskPct;"),
-
-    ("the aggregate allowance drops the RiskPercent term", AUD,
-     "      maxRungRiskPct          = MathMax(maxRungRiskPct, RiskPercent);\n",
-     ""),
-
-    ("the aggregate two-cycle confirmation is dropped", AUD,
-     "         if(m_aggRiskSeen)\n"
-     "           {\n"
-     "            DispatchAlertOnce(m_alertSent_AggRiskBreach,",
-     "         if(true)\n"
-     "           {\n"
-     "            DispatchAlertOnce(m_alertSent_AggRiskBreach,"),
-
-    ("the aggregate latch never re-arms on the healthy path", AUD,
-     "      else\n"
-     "        {\n"
-     "         ClearLatch(m_alertSent_AggRiskBreach);\n"
-     "         m_aggRiskSeen = false;\n"
-     "        }",
-     "      else\n"
-     "        {\n"
-     "         m_aggRiskSeen = false;\n"
-     "        }"),
-
-    ("the aggregate alert is routed through the per-leg latch", AUD,
-     "            DispatchAlertOnce(m_alertSent_AggRiskBreach,",
-     "            DispatchAlertOnce(m_alertSent_RiskBreach,"),
+    # ---- C. the aggregate leg -- RETIRED v5.81 -------------------------
+    # v5.81 removes the basket-summed ceiling outright, so the eight
+    # mutations that pinned its shape (accumulation, largest-rung bound,
+    # 50% tolerance, RiskPercent floor, two-cycle confirm, re-arm, latch
+    # routing) no longer have an anchor to corrupt. Their subject is gone,
+    # not merely unreachable -- the probe now asserts the ABSENCE of the
+    # bound instead. The per-leg mutations above still cover the audit that
+    # remains.
 
     # ---- C2. the push -------------------------------------------------
     ("the geometry is never pushed from otto.mq5", MAIN,
