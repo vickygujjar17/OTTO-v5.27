@@ -30,11 +30,15 @@ WHAT MUST SURVIVE
   * the vector engine's MATHS, as diagnostics only
 
 WHAT MUST BE BYTE-IDENTICAL TO v5.72
-  The geometry. The entry gap (2.0*blockHeight + 1.5*ATR), slDist
-  (blockHeight + 0.5*ATR), the far-edge TP anchor and the whole break/flip
-  block are compared against the v5.72 commit (pinned as V572) character for
-  character. A strip that quietly re-priced the strategy would be a different
-  EA, not a smaller one, so this is asserted rather than reviewed.
+  The stripping itself must not have re-priced the strategy, so the whole
+  break/flip block, slDist and the far-edge TP anchor are compared against the
+  v5.72 commit (pinned as V572) character for character. v5.81 later
+  RE-SPECIFIED the entry offset on purpose (one slDist, the Near-Edge Pullback
+  Trap, instead of v5.72's 2.0*H + 1.5*ATR), so the two entry twins are
+  compared with exactly that one gap line exempted and every other line of
+  them still checked against v5.72. A strip that quietly re-priced anything
+  else would be a different EA, not a smaller one, so this is asserted rather
+  than reviewed.
 
 Pure static analysis of the shipped sources -- no MT5 required.
 """
@@ -270,6 +274,30 @@ def same(label, a, b):
     check(label, ok)
 
 
+def same_except_gap(label, a, b):
+    """Compare a function body to its v5.72 blob with ONLY the gap line exempt.
+
+    v5.81 deliberately re-specified the entry offset (one slDist instead of the
+    v5.72 2.0*H + 1.5*ATR), so the entry twins cannot be byte-identical to the
+    v5.72 commit any more. Everything ELSE in them -- the midpoint branch, the
+    signed near-edge expression, the direction dispatch -- must still be
+    untouched, or this strip would have silently re-priced the strategy. The
+    exemption is one exact line, not a fuzzy tolerance.
+    """
+    gap72 = re.compile(r"double gap = \(2\.0 \* \w+\.blockHeight\) \+ \(1\.5 \* atr\);")
+    gap81 = re.compile(r"double gap = \w+\.blockHeight \+ \(0\.5 \* atr\);")
+    # Comments are prose and v5.81 legitimately rewrote the geometry rationale
+    # inside both function bodies; the CODE is what must not have moved.
+    _a = [ln for ln in flat(strip_comments(a)).split("\n") if not gap72.search(ln)]
+    _b = [ln for ln in flat(strip_comments(b)).split("\n") if not gap81.search(ln)]
+    _a = [ln for ln in _a if ln.strip()]
+    _b = [ln for ln in _b if ln.strip()]
+    ok = ("\n".join(_a).rstrip() == "\n".join(_b).rstrip()
+          and gap81.search(flat(strip_comments(b))) is not None
+          and bool("\n".join(_a).strip()))
+    check(label, ok)
+
+
 if BM_H and OM_H:
     _h = BM_H[BM_H.find("double breakLevel"):
              BM_H.find("// --- MOMENTUM & FVG VETO")]
@@ -278,28 +306,36 @@ if BM_H and OM_H:
     same("break/flip block is byte-identical to v5.72", _h, _w)
 
     for label, src_h, src_w, decl in (
+            ("COttoOrderManager::CalcSLDistance", OM_H, OM_T,
+             r"double\s+CalcSLDistance\s*\("),):
+        same("%s is byte-identical to v5.72" % label,
+             func_body(src_h, decl), func_body(src_w, decl))
+    # v5.81 re-specified ONLY the entry offset, so these two are compared with
+    # that single line exempted -- every other line must still match v5.72.
+    for label, src_h, src_w, decl in (
             ("COttoBlockManager::BlockEntryPrice", BM_H, BM_T,
              r"double\s+BlockEntryPrice\s*\("),
             ("COttoOrderManager::CalcEntryPrice", OM_H, OM_T,
-             r"double\s+CalcEntryPrice\s*\("),
-            ("COttoOrderManager::CalcSLDistance", OM_H, OM_T,
-             r"double\s+CalcSLDistance\s*\(")):
-        same("%s is byte-identical to v5.72" % label,
-             func_body(src_h, decl), func_body(src_w, decl))
+             r"double\s+CalcEntryPrice\s*\(")):
+        same_except_gap("%s is identical to v5.72 apart from the v5.81 gap line"
+                        % label, func_body(src_h, decl), func_body(src_w, decl))
 
 # Numeric identities on the shipped formulas. Both twins spell the block field
 # qualified (b.blockHeight / block.blockHeight), so the anchor names it.
-check("the entry gap is still 2.0*blockHeight + 1.5*ATR",
-      "double gap = (2.0 * block.blockHeight) + (1.5 * atr);" in OM_C and
-      "double gap = (2.0 * b.blockHeight) + (1.5 * atr);" in BM_C)
+# v5.81 RE-SPECIFIED the geometry narrow: the entry gap is now exactly one
+# slDist (Near-Edge Pullback Trap), superseding the v5.72 2.0*H + 1.5*ATR deep
+# offset. The identity that matters -- gap == slDist -- is what is pinned here.
+check("the entry gap is one slDist: blockHeight + 0.5*ATR",
+      "double gap = block.blockHeight + (0.5 * atr);" in OM_C and
+      "double gap = b.blockHeight + (0.5 * atr);" in BM_C)
 check("slDist is still blockHeight + 0.5*ATR",
       "blockHeight + (0.5 * atr)" in OM_C)
 check("the TP is still projected from the far edge by InpMaxRR",
       re.search(r"takeProfit\s*=\s*isLong\s*\?\s*farEdge\s*\+\s*tpRR\s*\*\s*slDist"
                 r"\s*\n\s*:\s*farEdge\s*-\s*tpRR\s*\*\s*slDist;", flat(OM_C))
       is not None)
-check("the realized multiple is still documented as InpMaxRR + 3.0",
-      "rr + 3.0" in OM_T or "(3.0 + rr)" in OM_T or "(3 + rr)" in OM_T)
+check("the realized multiple is documented as (1 + InpMaxRR) + bh/slDist",
+      "(1.0 + InpMaxRR) + bh/slDist" in flat(OM_T))
 check("the break barrier still sits ATRBufferBreak*ATR past the far edge",
       "close1 > breakLevel + ATRBufferBreak * atrNow" in BM_C and
       "close1 < breakLevel - ATRBufferBreak * atrNow" in BM_C)

@@ -217,8 +217,8 @@ check("LogSetupArmed located (LogVirtualOrderArmed is gone)",
 # v5.71: the phase label moved onto the model's canonical vocabulary. The pin
 # keeps its purpose -- the arm journal still stamps one CONSTANT logic string,
 # not a per-setup value -- but names the string that now ships.
-check("arm journal stamps the constant continuation logic (v5.71)",
-      ARM_J is not None and "C (Deep Front-Edge Anticipation)" in ARM_J and
+check("arm journal stamps the constant continuation logic (v5.81)",
+      ARM_J is not None and "C (Near-Edge Pullback Trap)" in ARM_J and
       "Pure Trend Continuation" not in ARM_J)
 check("arm journal stamps the ONE execution mode (v5.72)",
       ARM_J is not None and "PHYSICAL (Broker Limit Order)" in ARM_J and

@@ -140,67 +140,71 @@ private:
    //+------------------------------------------------------------------+
    //| BlockEntryPrice — Pine entry price for a block, honouring        |
    //| InpEntryStyle.                                                   |
-   // TRUE DEEP FRONT-EDGE (v5.69). The entry is measured OUT from the NEAR
-   // edge -- the edge the arming close clears: b.bottom for a RESISTANCE
-   // arm, b.top for a SUPPORT arm -- by two block heights plus one and a half
-   // ATRs (gap, below), and it lands on the OPPOSITE side of the zone from
-   // the target:
+   // NEAR-EDGE PULLBACK TRAP (v5.81). The entry is measured OUT from the NEAR
+   // edge -- the edge the arming close clears: b.bottom for a RESISTANCE arm,
+   // b.top for a SUPPORT arm -- by exactly one slDist (gap, below), and it
+   // lands on the OPPOSITE side of the zone from the target:
    //   LONG  (RESISTANCE): near = b.bottom, entry = b.bottom - gap
    //   SHORT (SUPPORT)   : near = b.top,    entry = b.top    + gap
-   // With the near edge pinned at 0.0 and the far edge at +blockHeight:
-   //   LONG : entry = -(2.0*bh + 1.5*a)    far edge = +bh
-   //   SHORT: entry = +(2.0*bh + 1.5*a)    far edge = -bh
+   // with gap == slDist == blockHeight + 0.5*ATR. With the near edge pinned at
+   // 0.0 and the far edge at +blockHeight:
+   //   LONG : entry = -(bh + 0.5*a)        far edge = +bh
+   //   SHORT: entry = +(bh + 0.5*a)        far edge = -bh
    // At arm time the close has only just cleared the NEAR edge, so the entry
    // sits BELOW the market for a LONG and ABOVE it for a SHORT. That is a
    // legal BUY_LIMIT / SELL_LIMIT (see GetOrderTypeForBlock), so the order
    // RESTS AT THE BROKER: the fakeout-pullback fill, not a breakout chase.
    // Resting is the normal route by construction, not a lucky coincidence;
-   // see the v5.69 note in PlaceOrArmOrder's router.
+   // see the v5.72 note in PlaceOrArmOrder's router.
    //
-   // slDist is UNCHANGED at blockHeight + 0.5*ATR, so the stop lands
-   //   LONG : entry - slDist = -(3.0*bh + 2.0*a)   (below the near edge)
-   //   SHORT: entry + slDist = +(3.0*bh + 2.0*a)   (above the near edge)
-   // -- a full slDist behind the entry in both directions. The offset is
-   // carried by the ENTRY alone, never by a wider stop, so entry<->SL stays
-   // exactly slDist and every rung that reads 1R (pyramid ladder, breakeven,
-   // trail) is untouched by this geometry.
+   // The stop sits a further slDist beyond the entry, so entry<->SL stays
+   // exactly 1R in both directions:
+   //   LONG : entry - slDist = -(2.0*bh + 1.0*a)   (below the near edge)
+   //   SHORT: entry + slDist = +(2.0*bh + 1.0*a)   (above the near edge)
+   // The offset is carried by the ENTRY alone, never by a wider stop, so
+   // every rung that reads 1R (pyramid ladder, breakeven, trail) is untouched
+   // by this geometry.
    //
    // THE BREAK VETO IS DECOUPLED FROM THE ENTRY (v5.69). v5.66 anchored the
    // break on the entry, which was workable only because the entry sat on the
    // far side of the zone. That anchor is now actively wrong: InpArmATR is
    // 0.0, so a RESISTANCE arms the instant close1 < b.bottom, while entry is
    // a further `gap` BELOW b.bottom. A break test of close1 > entry +
-   // ATRBufferBreak*atr therefore evaluates close1 > b.bottom - 2.0*bh -
-   // 1.0*a, which is TRUE on the arming bar itself -- the block would arm and
+   // ATRBufferBreak*atr therefore evaluates close1 > b.bottom - bh - 0.5*a,
+   // which is TRUE on the arming bar itself -- the block would arm and
    // veto itself VETO_BROKEN in one pass, and CancelOrdersForInvalidBlocks()
    // would drop the pending. ProcessBlocks() hence anchors the break on the
-   // PHYSICAL far edge again: SUPPORT breaks DOWN through b.bottom,
-   // RESISTANCE breaks UP through b.top a further ATRBufferBreak*ATR. Near
-   // edge = arm, far edge = invalidate, opposite sides, never the same close.
+   // PHYSICAL far edge: SUPPORT breaks DOWN through b.bottom, RESISTANCE
+   // breaks UP through b.top a further ATRBufferBreak*ATR. Near edge = arm,
+   // far edge = invalidate, opposite sides, never the same close.
    //
    // TARGET ANCHOR (FIX v5.57, deliberately unchanged). The target is still
    // projected from the FAR edge, never from this entry: a LONG target =
    // b.top + tpRR*slDist, a SHORT target = b.bottom - tpRR*slDist. With the
-   // entry now on the NEAR side, the reward from the ENTRY is
-   //   3.0*bh + 1.5*a + tpRR*slDist = (3.0 + tpRR) * slDist
-   // so the realized multiple is EXACTLY InpMaxRR + 3.0 at every zone height
-   // and every ATR -- 7.0R on the shipped 4.0, and it can never fall behind
-   // the entry for any positive InpMaxRR. The pre-v5.69 "InpMaxRR must stay
-   // above 3.0" floor is therefore GONE: it was an artifact of an entry that
-   // sat past the far edge, and it no longer constrains the configuration.
+   // entry one slDist on the NEAR side, the reward from the ENTRY is
+   //   bh + slDist + tpRR*slDist = bh + (1.0 + tpRR) * slDist
+   // so the realized multiple is
+   //   (1.0 + tpRR) + bh/slDist
+   // i.e. between 1.0 + tpRR and 2.0 + tpRR depending on how tall the zone is
+   // relative to its ATR -- 5.0R..6.0R on the shipped InpMaxRR 4.0 (5.5R on a
+   // 1.0-high zone with ATR 2.0). It is no longer independent of bh and ATR:
+   // the flat InpMaxRR + 3.0 of the retired v5.69 2.0*bh + 1.5*a entry died
+   // with that offset. The multiple still exceeds 1.0 + InpMaxRR for every
+   // positive zone height, so the target always sits ahead of the entry.
    // Derivation in full in the front-run block of ProcessBlocks().
    //
    // This is the exact twin of COttoOrderManager::CalcEntryPrice(); the two
-   // must stay identical or the Front-Run veto would judge a different price
-   // from the order's.
+   // must stay identical or the order and the block would price differently.
    double                  BlockEntryPrice(const SSniperBlock &b, double atr) const
      {
       if(InpEntryStyle == ENTRY_MIDPOINT) return b.midpoint;
-      // True deep front-edge: 2.0 block heights + 1.5 ATR out from the NEAR
-      // edge, landing on the OPPOSITE side of the zone from the target so the
-      // order can rest as a limit. slDist is untouched, so the stop keeps
-      // exactly one slDist of separation from the entry.
-      double gap = (2.0 * b.blockHeight) + (1.5 * atr);
+      // Near-Edge Pullback Trap (v5.81): the entry sits exactly ONE slDist
+      // (blockHeight + 0.5*ATR) out from the NEAR edge, on the OPPOSITE side
+      // of the zone from the target, so the order can rest as a limit and
+      // fill on the pullback back through the edge. Because the offset IS
+      // slDist, the stop lands a further slDist beyond the entry, keeping
+      // entry<->SL at exactly 1R.
+      double gap = b.blockHeight + (0.5 * atr);
       return (BlockDirection(b) == DIR_LONG) ? (b.bottom - gap) : (b.top + gap);
      }
 

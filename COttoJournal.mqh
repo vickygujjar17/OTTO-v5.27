@@ -168,7 +168,7 @@ public:
       // v5.52: constant. A block has exactly one entry -- the continuation
       // (a breakout above Resistance or a breakdown below Support) -- so the
       // header names that and never a phase.
-      string phase    = "C (Deep Front-Edge Anticipation)";
+      string phase    = "C (Near-Edge Pullback Trap)";
       // v5.72: constant. A setup reaches this writer only after the broker
       // accepted its resting limit, so there is no second copy to print.
       string execMode = "PHYSICAL (Broker Limit Order)";
@@ -178,14 +178,14 @@ public:
       W("  Setup ID          : " + tradeId);
       W("  Logic             : " + phase);
       W("  Execution Mode    : " + execMode);
-      W("  Trigger Price     : " + FmtPrice(entryPrice) + " (Deep Front-Edge: near edge +/- 2.0*H +/- 1.5*ATR)");
+      W("  Trigger Price     : " + FmtPrice(entryPrice) + " (Near-Edge Pullback: near edge +/- 1.0*H +/- 0.5*ATR)");
       W("  Initial SL        : " + FmtPrice(slPrice) + " | 1R = " + FmtPrice(blk.rrUnit));
       W("  Volume            : " + DoubleToString(lotSize,2));
       string actionDesc = "";
       if(btype == BLOCK_SUPPORT)
-         actionDesc = "SUPPORT (Deep Front-Edge Anticipation / Sell from Near Edge + 2.0*H + 1.5*ATR | SL 1R above entry)";
+         actionDesc = "SUPPORT (Near-Edge Pullback / Sell from Near Edge + 1.0*H + 0.5*ATR | SL 1R above entry)";
       else
-         actionDesc = "RESISTANCE (Deep Front-Edge Anticipation / Buy from Near Edge - 2.0*H - 1.5*ATR | SL 1R below entry)";
+         actionDesc = "RESISTANCE (Near-Edge Pullback / Buy from Near Edge - 1.0*H - 0.5*ATR | SL 1R below entry)";
       W("  Trade             : " + actionDesc);
       W("  Block Top/Bottom  : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom) + " | Mid=" + FmtPrice(blk.midpoint) + " | Height=" + FmtPrice(blk.blockHeight));
       W("  Projected Target  : " + FmtPrice(blk.localTP) + " (Front-Run veto anchor, far edge +/- InpMaxRR*1R)");
@@ -224,9 +224,9 @@ public:
       W("  S/R Block:");
       string actionDesc = "";
       if(blk.type == BLOCK_SUPPORT)
-         actionDesc = "SUPPORT (Deep Front-Edge Anticipation / Sell from Near Edge + 2.0*H + 1.5*ATR | SL 1R above entry)";
+         actionDesc = "SUPPORT (Near-Edge Pullback / Sell from Near Edge + 1.0*H + 0.5*ATR | SL 1R above entry)";
       else
-         actionDesc = "RESISTANCE (Deep Front-Edge Anticipation / Buy from Near Edge - 2.0*H - 1.5*ATR | SL 1R below entry)";
+         actionDesc = "RESISTANCE (Near-Edge Pullback / Buy from Near Edge - 1.0*H - 0.5*ATR | SL 1R below entry)";
       W("    - Logic     : " + actionDesc);
       W("    - Zone      : Top=" + FmtPrice(blk.top) + " | Bottom=" + FmtPrice(blk.bottom) + " | Mid=" + FmtPrice(blk.midpoint) + " | Height=" + FmtPrice(blk.blockHeight));
       if(blk.wick1Time > 0 && blk.wick2Time > 0)

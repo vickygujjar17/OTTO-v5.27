@@ -78,10 +78,10 @@ enum ENUM_VETO_REASON
 enum ENUM_ENTRY_STYLE
   {
    ENTRY_MIDPOINT  = 0,     // entry = (top+bottom)/2
-   ENTRY_FRONT_EDGE = 1     // TRUE DEEP FRONT-EDGE (v5.69). The entry is
-                            //   measured OUT from the NEAR edge by
-                            //   2.0*blockHeight + 1.5*ATR, on the OPPOSITE
-                            //   side of the zone from the target:
+   ENTRY_FRONT_EDGE = 1     // NEAR-EDGE PULLBACK TRAP (v5.81). The entry is
+                            //   measured OUT from the NEAR edge by exactly
+                            //   one slDist = blockHeight + 0.5*ATR, on the
+                            //   OPPOSITE side of the zone from the target:
                             //     Resistance LONG : b.bottom - gap
                             //     Support    SHORT: b.top    + gap
                             //   At arm time the close has only just cleared the
@@ -92,12 +92,15 @@ enum ENUM_ENTRY_STYLE
                             //   the ONLY route (v5.72): an entry that cannot
                             //   rest is vetoed VETO_LIMIT_MISSED, never chased
                             //   at market.
-                            //   slDist is unchanged at blockHeight + 0.5*ATR, so
-                            //   entry<->SL stays exactly slDist -- the offset is
+                            //   The stop sits a further slDist beyond the entry,
+                            //   so entry<->SL stays exactly 1R -- the offset is
                             //   carried by the entry alone, never a wider stop.
                             //   The target stays anchored on the FAR edge, so
-                            //   the realized multiple is exactly InpMaxRR + 3.0
-                            //   (7.0R on the shipped 4.0). The BREAK veto is
+                            //   the realized multiple is
+                            //   (1.0 + InpMaxRR) + bh/slDist -- 5.0R..6.0R on
+                            //   the shipped 4.0, NOT a flat InpMaxRR + 3.0 (that
+                            //   belonged to the retired 2.0*H + 1.5*ATR offset).
+                            //   The BREAK veto is
                             //   anchored on the physical FAR edge, NOT on this
                             //   entry (v5.69 decoupled them): anchored on the
                             //   entry it would fire on the arming close itself

@@ -76,12 +76,12 @@ correlation guards (`IsTradeVetoed` / `IsConsensusOpposed`), the
 `CancelOpposingConsensusOrders` sweep, the `HiveMind()` correlation
 tie-breaker that deleted live zones, and the news-blackout gate.
 
-**The shipped near-edge pullback geometry is byte-identical to v5.72**:
-entry gap `2.0*blockHeight + 1.5*ATR` (`ENTRY_FRONT_EDGE`, as a resting
-limit), `slDist = blockHeight + 0.5*ATR`, far-edge TP anchored by
-`InpMaxRR` (realized `InpMaxRR + 3.0`), and the break/flip block itself.
-`_probe\test_v580_strip.py` diffs each of those against the v5.72 commit
-(pinned as `V572`) and fails if any character moves. The anchor is a SHA, not
+**The strip did not re-price the strategy.** Through the v5.80 release the
+entry geometry was byte-identical to v5.72; v5.81 then re-specified it
+deliberately (see below). What `_probe\test_v580_strip.py` still pins against
+the v5.72 commit (as the SHA `V572`, never `HEAD`) is the whole break/flip
+block, `slDist = blockHeight + 0.5*ATR`, the far-edge TP anchor, and — with
+exactly one line exempted — the two entry twins. The anchor is a SHA, not
 `HEAD`: reading `HEAD` only worked while v5.72 was the tip, and once v5.80
 landed the reference silently degraded into a false failure.
 
@@ -92,7 +92,58 @@ declared no-ops**, so an existing `.set` file still loads. `InpMaxRR` is
 *not* retired — it is still the take-profit multiple.
 
 
-## v5.81 — High Table aggregate ceiling removed
+## v5.81 — High Table aggregate ceiling removed, entry geometry re-specified
+
+v5.81 ships two independent changes to the same release.
+
+### 1. Entry geometry: Near-Edge Pullback Trap
+
+The entry is now measured from the near edge — the edge the arming close
+clears — by **exactly one `slDist`**, instead of the v5.69 deep offset:
+
+| | v5.72 … v5.80 | v5.81 |
+|---|---|---|
+| gap from near edge | `2.0*blockHeight + 1.5*ATR` | `blockHeight + 0.5*ATR` = `slDist` |
+| LONG entry (RESISTANCE) | `b.bottom - gap` | `b.bottom - gap` |
+| SHORT entry (SUPPORT) | `b.top + gap` | `b.top + gap` |
+| `slDist` | `blockHeight + 0.5*ATR` | unchanged |
+| entry↔SL | exactly 1R | exactly 1R |
+
+The offset is still on the **opposite side of the zone from the target**, so at
+arm time the entry sits below the market for a LONG and above it for a SHORT:
+a legal `BUY_LIMIT` / `SELL_LIMIT` that rests at the broker and fills on the
+pullback back through the near edge. The router is unchanged — an entry that
+cannot rest is `VETO_LIMIT_MISSED`, never chased at market.
+
+Because the offset *is* `slDist`, nothing about the 1R rungs moved: the stop is
+a further `slDist` beyond the entry, so breakeven, the pyramid ladder and the
+trail all read the same 1R they always did.
+
+The **target is still anchored on the far edge** (v5.57), so the realized
+multiple did change, and it is no longer a constant:
+
+```
+reward = bh + slDist + tpRR*slDist = bh + (1 + tpRR)*slDist
+realized = (1 + tpRR) + bh/slDist        -- between 1+tpRR and 2+tpRR
+```
+
+On the shipped `InpMaxRR = 4.0` that is **5.0R … 6.0R** depending on how tall
+the zone is relative to its ATR (5.5R on a 1.0-high zone with ATR 2.0; 5.8R on
+a 2.0-high zone with ATR 1.0). The old flat `InpMaxRR + 3.0` (7.0R at 4.0) was
+an artifact of the `2.0*H + 1.5*ATR` offset and retired with it. The floor is
+still clear: `bh/slDist > 0` for any positive zone height, so the target always
+sits ahead of the entry without needing `InpMaxRR` to stay above any threshold.
+
+The break veto is untouched and still anchored on the **physical far edge**,
+not on the entry — anchoring it on the entry would fire on the very close that
+armed the block.
+
+`_probe\test_v557_frontrun.py` transcribes this arithmetic and pins the
+`(1 + tpRR) + bh/slDist` band, the fact that the multiple now *depends* on
+`bh`/ATR, and the absence of the retired deep offset, so a re-anchor has to be
+a deliberate act.
+
+### 2. High Table aggregate ceiling removed
 
 v5.81 removes the **aggregate (basket-summed) risk ceiling** that
 `AuditRiskExposure()` gained in v5.63 and re-keyed in v5.71. It could not fire

@@ -602,16 +602,16 @@ private:
 
    //+------------------------------------------------------------------+
    //| Entry price per Pine entry_style (Midpoint / Front Edge)        |
-   //| ENTRY_FRONT_EDGE: TRUE DEEP FRONT-EDGE (v5.69). The entry is    |
+   //| ENTRY_FRONT_EDGE: NEAR-EDGE PULLBACK TRAP (v5.81). The entry is |
    //| measured OUT from the NEAR edge -- the edge the arming close    |
    //| clears: block.bottom for a RESISTANCE arm, block.top for a      |
-   //| SUPPORT arm -- by 2.0 block heights + 1.5 ATRs (gap, below),    |
-   //| landing on the OPPOSITE side of the zone from the target:       |
+   //| SUPPORT arm -- by exactly one slDist (gap, below), landing on   |
+   //| the OPPOSITE side of the zone from the target:                  |
    //|   LONG  (RESISTANCE): entry = block.bottom - gap                 |
    //|   SHORT (SUPPORT)   : entry = block.top    + gap                 |
    //| Near edge pinned at 0.0, far edge at +blockHeight:               |
-   //|   LONG : entry = -(2.0*bh + 1.5*a), far edge = +bh               |
-   //|   SHORT: entry = +(2.0*bh + 1.5*a), far edge = -bh               |
+   //|   LONG : entry = -(bh + 0.5*a), far edge = +bh                   |
+   //|   SHORT: entry = +(bh + 0.5*a), far edge = -bh                   |
    //| At arm time the close has only just cleared the NEAR edge, so    |
    //| the entry sits BELOW the market for a LONG and ABOVE it for a    |
    //| SHORT. That is a legal BUY_LIMIT / SELL_LIMIT (see              |
@@ -619,35 +619,36 @@ private:
    //| fakeout-pullback fill. Resting is the normal route by           |
    //| construction; see the router note in PlaceOrArmOrder.            |
    //|                                                                 |
-   //| slDist is UNCHANGED at blockHeight + 0.5*ATR, so the stop       |
-   //| lands a full slDist behind the entry in both directions:        |
-   //|   LONG : entry - slDist = -(3.0*bh + 2.0*a)                      |
-   //|   SHORT: entry + slDist = +(3.0*bh + 2.0*a)                      |
+   //| slDist stays blockHeight + 0.5*ATR -- the SAME value as gap --   |
+   //| so the stop lands a further slDist beyond the entry:            |
+   //|   LONG : entry - slDist = -(2.0*bh + 1.0*a)                      |
+   //|   SHORT: entry + slDist = +(2.0*bh + 1.0*a)                      |
    //| entry<->SL therefore stays exactly slDist, so every 1R rung     |
    //| (pyramid ladder, breakeven, trail) is untouched: the offset is  |
    //| carried by the ENTRY alone, never by a wider stop.              |
    //| FIX (v5.57): the TP PROJECTION does NOT follow the entry; it    |
-   //| is anchored on the FAR edge (see PlaceOrArmOrder) so the        |
-   //| Front-Run veto keeps the strictness of every pre-anticipation   |
-   //| build. With the entry on the NEAR side the reward from the      |
-   //| ENTRY is (3.0 + InpMaxRR) * slDist, so the realized multiple is |
-   //| exactly InpMaxRR + 3.0 at every zone height and ATR -- 7.0R on  |
-   //| the shipped 4.0. The pre-v5.69 "InpMaxRR must stay above 3.0"   |
-   //| floor is GONE: it was an artifact of an entry past the far      |
-   //| edge. Twin of COttoBlockManager::BlockEntryPrice(); any drift   |
-   //| and the Front-Run veto would judge a different price            |
-   //| from the order's.                                               |
+   //| is anchored on the FAR edge (see PlaceOrArmOrder). With the     |
+   //| entry one slDist on the NEAR side the reward from the ENTRY is  |
+   //|   bh + (1.0 + InpMaxRR) * slDist                                |
+   //| so the realized multiple is (1.0 + InpMaxRR) + bh/slDist --      |
+   //| between 1+InpMaxRR and 2+InpMaxRR, i.e. 5.0R..6.0R on the      |
+   //| shipped 4.0. It is NOT independent of bh and ATR; the flat      |
+   //| InpMaxRR + 3.0 belonged to the retired 2.0*bh + 1.5*a offset.   |
+   //| It still clears 1+InpMaxRR for any positive zone height, so the |
+   //| target always sits ahead of the entry. This is the exact twin of  |
+   //| COttoBlockManager::BlockEntryPrice(); the two must stay           |
+   //| identical or the order and the block would price differently.    |
    //+------------------------------------------------------------------+
    double                  CalcEntryPrice(const SSniperBlock &block, double atr)
      {
       if(InpEntryStyle == ENTRY_MIDPOINT)
          return block.midpoint;
-      // True deep front-edge, twin of COttoBlockManager::BlockEntryPrice():
-      // 2.0 block heights + 1.5 ATR out from the NEAR edge, landing on the
-      // OPPOSITE side of the zone from the target so the order can rest as a
-      // limit. slDist is untouched, so the stop keeps exactly one slDist of
-      // separation from the entry.
-      double gap = (2.0 * block.blockHeight) + (1.5 * atr);
+      // Near-Edge Pullback Trap (v5.81), twin of COttoBlockManager::
+      // BlockEntryPrice(): exactly one slDist (blockHeight + 0.5*ATR) out
+      // from the NEAR edge, landing on the OPPOSITE side of the zone from the
+      // target so the order can rest as a limit. The same offset makes the
+      // stop exactly 1R behind the entry.
+      double gap = block.blockHeight + (0.5 * atr);
       return (GetDirectionForBlock(block) == DIR_LONG) ? (block.bottom - gap)
                                                        : (block.top + gap);
      }
@@ -673,9 +674,9 @@ private:
    //| on the block only for the Front-Run veto). A fill is caught by     |
    //| CheckPendingOrderFills().                                          |
    // FIX (v5.57) FRONT-RUNNING ANTICIPATION: with InpEntryStyle = ENTRY_FRONT_EDGE
-   // the entry sits on the NEAR side of the zone, 2.0*blockHeight + 1.5*ATR out
-   // from the edge the arming close clears (v5.69: below the market for a LONG,
-   // above it for a SHORT). That is a legal BUY_LIMIT / SELL_LIMIT, so the
+   // the entry sits on the NEAR side of the zone, one slDist (blockHeight +
+   // 0.5*ATR) out from the edge the arming close clears (below the market for a
+   // LONG, above it for a SHORT). That is a legal BUY_LIMIT / SELL_LIMIT, so the
    // PHYSICAL rest is the ordinary path - and, since v5.72, the only one.
    bool                    PlaceOrArmOrder(int blockIndex, SSniperBlock &block)
      {
@@ -752,25 +753,22 @@ private:
       double tpRR       = (InpMaxRR > 0.0) ? InpMaxRR : 1.0;
       // FIX (v5.57) — FAR-EDGE ANCHOR. The target is measured from the edge the
       // breakout crosses (block.top LONG / block.bottom SHORT), NOT from the
-      // deep anticipation `entryPrice`, which sits a full blockHeight +
-      // 1.5*ATR beyond that edge. Projecting from the entry pushed the target
-      // just as far out -- harsher than every pre-anticipation build -- so the
-      // Front-Run veto would miss setups it used to catch. COttoBlockManager::
-      // ProcessBlocks projects identically.
-      // REALIZED RR (true deep front-edge entry): with the near edge at 0, the
+      // near-edge `entryPrice`, which sits one slDist on the other side of that
+      // edge. Projecting from the entry would fold the entry offset into the
+      // target and make the reward depend on where the limit happened to rest.
+      // COttoBlockManager::ProcessBlocks projects identically.
+      // REALIZED RR (near-edge pullback entry): with the near edge at 0, the
       // far edge at bh, slDist = bh + 0.5*a and the LONG entry at
-      // -(2*bh + 1.5*a), the reward from the ENTRY to the far-edge-anchored
-      // target is
-      //     3.0*bh + 1.5*a + rr*slDist  =  (3.0 + rr) * slDist
-      // so the realized multiple is EXACTLY rr + 3.0 at every zone height and
-      // every ATR -- 7.0R on the shipped InpMaxRR 4.0, and independent of both
-      // bh and a. It therefore cannot fall behind the entry for any positive
-      // InpMaxRR, and the pre-v5.69 "InpMaxRR must stay above 3.0" floor is
-      // retired: it was an artifact of an entry anchored PAST the far edge,
-      // where the reward carried a (0.5*rr - 1.5) coefficient on the ATR term.
-      // Intentional: the target reproduces the pre-anticipation projection and
-      // keeps the veto strict. Do NOT "fix" it by anchoring the target on the
-      // entry.
+      // -(bh + 0.5*a) = -slDist, the reward from the ENTRY to the far-edge
+      // anchored target is
+      //     bh + slDist + rr*slDist  =  bh + (1.0 + rr) * slDist
+      // so the realized multiple is (1.0 + rr) + bh/slDist -- between 1+rr and
+      // 2+rr, i.e. 5.0R..6.0R on the shipped InpMaxRR 4.0. It is NOT
+      // independent of bh and a: the flat rr + 3.0 belonged to the retired
+      // v5.69 2.0*bh + 1.5*a offset. It still clears 1.0 + InpMaxRR for every
+      // positive zone height, so the target always sits ahead of the entry.
+      // Intentional: the target reproduces the pre-anticipation projection.
+      // Do NOT "fix" it by anchoring the target on the entry.
       double farEdge    = isLong ? MathMax(block.top, block.bottom)
                                  : MathMin(block.top, block.bottom);
       double takeProfit = isLong ? farEdge + tpRR * slDist
@@ -819,23 +817,24 @@ private:
       // sent -- v5.72 removed the in-memory fallback that used to fire a MARKET
       // deal on the cross.
       //
-      // DEEP FRONT-EDGE NOTE (v5.69). With InpEntryStyle = ENTRY_FRONT_EDGE the
-      // entry is measured out from the NEAR edge by 2.0*blockHeight + 1.5*ATR
-      // and lands on the OPPOSITE side of the zone from the target: a Resistance
-      // LONG at b.bottom-gap (= b.top - bh - 1.5*ATR), a Support SHORT at
-      // b.top+gap (= b.bottom + bh + 1.5*ATR). At arm time the close has only
-      // just cleared the NEAR edge, so a LONG entry sits BELOW the market and a
-      // SHORT entry ABOVE it -- exactly the side a BUY_LIMIT / SELL_LIMIT must
-      // sit on. The test below is therefore TRUE in the ordinary case and the
-      // setup RESTS PHYSICALLY at the broker, filling on the pullback back
-      // through the near edge.
+      // NEAR-EDGE PULLBACK NOTE (v5.81). With InpEntryStyle = ENTRY_FRONT_EDGE
+      // the entry is measured out from the NEAR edge by exactly one slDist
+      // (blockHeight + 0.5*ATR) and lands on the OPPOSITE side of the zone from
+      // the target: a Resistance LONG at b.bottom-gap (= b.top - 2*slDist), a
+      // Support SHORT at b.top+gap (= b.bottom + 2*slDist). At arm time the
+      // close has only just cleared the NEAR edge, so a LONG entry sits BELOW
+      // the market and a SHORT entry ABOVE it -- exactly the side a BUY_LIMIT /
+      // SELL_LIMIT must sit on. The test below is therefore TRUE in the
+      // ordinary case and the setup RESTS PHYSICALLY at the broker, filling on
+      // the pullback back through the near edge.
       //
-      // The SL sits a full slDist behind the entry, and because the target is
-      // still anchored on the FAR edge the realized multiple is exactly
-      // InpMaxRR + 3.0 (see CalcEntryPrice). The break veto is deliberately NOT
-      // anchored on this price: it stays on the physical far edge so the pending
-      // cannot be cancelled on the very close that armed it (v5.69 decoupling,
-      // derived in ProcessBlocks).
+      // The SL sits a further slDist behind the entry, and because the target
+      // is still anchored on the FAR edge the realized multiple is
+      // (1.0 + InpMaxRR) + bh/slDist, i.e. 5.0R..6.0R on the shipped 4.0 (see
+      // CalcEntryPrice). The break veto is deliberately NOT anchored on this
+      // price: it stays on the physical far edge so the pending cannot be
+      // cancelled on the very close that armed it (v5.69 decoupling, derived
+      // in ProcessBlocks).
       double boundary = GetPriceBoundaryBuffer();
       bool   priceValid;
       if(isLong)

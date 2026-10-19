@@ -1,5 +1,5 @@
 """
-Front-run / true deep front-edge entry - static verification probe.
+Front-run / near-edge pullback entry - static verification probe.
 
 Originally written for v5.57, which moved the entry, the stop and the
 take-profit onto an EXTREME FRONT-RUNNING ANTICIPATION model and moved the
@@ -10,6 +10,9 @@ both of those incoherent and corrected them: the gap is now measured to the
 OPPOSITE side of the zone (a Resistance LONG buys BELOW b.bottom, a Support
 SHORT sells ABOVE b.top), which makes the order a legal resting limit, and the
 BREAK veto is decoupled from the entry and put back on the physical FAR edge.
+v5.81 then RE-SPECIFIED the offset itself: the entry is now exactly ONE
+slDist (blockHeight + 0.5*ATR) out from the near edge -- the Near-Edge
+Pullback Trap -- instead of the retired 2.0*H + 1.5*ATR deep offset.
 The properties below carry that change and NOT ONE of them is visible to the
 MQL5 compiler, because each is a runtime relationship between two files:
 
@@ -35,18 +38,20 @@ MQL5 compiler, because each is a runtime relationship between two files:
      the block still arms either way.
 
   3. THE FAR-EDGE TARGET ANCHOR. slDist = blockHeight + 0.5*ATR, and the
-     entry is 2.0*blockHeight + 1.5*ATR out from the near edge on the OPPOSITE
-     side of the zone. The target is deliberately measured from the FAR EDGE
+     entry is exactly ONE slDist out from the near edge on the OPPOSITE side of
+     the zone (v5.81). The target is deliberately measured from the FAR EDGE
      (block.top LONG / block.bottom SHORT), not from the entry, so the
      projection reproduces what every pre-anticipation build projected and the
      veto keeps its strictness. Anchoring it on the entry instead would pull
      the target INSIDE the zone and veto setups that were never front-runs.
      The consequence, pinned in section 7, is that the reward from the ENTRY is
-     (3.0 + InpMaxRR) * slDist, i.e. the realized multiple is EXACTLY
-     InpMaxRR + 3.0 at every zone height and ATR -- 7.0R on the shipped 4.0.
-     The pre-v5.69 "InpMaxRR must stay above 3.0" floor is RETIRED: it was an
-     artifact of an entry anchored PAST the far edge. Intended, not a defect,
-     and asserted so a future re-anchor has to be a deliberate act.
+     bh + (1.0 + InpMaxRR) * slDist, i.e. the realized multiple is
+     (1.0 + InpMaxRR) + bh/slDist -- between 1+InpMaxRR and 2+InpMaxRR, which
+     is 5.0R..6.0R on the shipped 4.0. It is NOT any longer a flat
+     InpMaxRR + 3.0: that constant belonged to the retired 2.0*H + 1.5*ATR
+     offset, and a probe that still asserts it would pin dead geometry.
+     Intended, not a defect, and asserted so a future re-anchor has to be a
+     deliberate act.
 
   4. THE BREAK VETO ANCHOR (v5.69, decoupled). v5.66 hung the break test on
      BlockEntryPrice(), which only worked while the fill sat past the far
@@ -329,15 +334,20 @@ check("the two entry twins are arithmetically identical",
 check("both twins honour ENTRY_MIDPOINT before the front-edge maths",
       "if(InpEntryStyle == ENTRY_MIDPOINT) return midpoint;" in BEP_BODY and
       "if(InpEntryStyle == ENTRY_MIDPOINT) return midpoint;" in CALC_BODY)
-check("the front-edge entry sits 2.0 heights + 1.5 ATR from the near edge, on "
+check("the front-edge entry sits exactly ONE slDist from the near edge, on "
       "the OPPOSITE side of the zone",
-      "double gap = (2.0 * blockHeight) + (1.5 * atr);" in BEP_BODY and
+      "double gap = blockHeight + (0.5 * atr);" in BEP_BODY and
       "return (Dir(x) == DIR_LONG) ? (bottom - gap) : (top + gap);" in BEP_BODY,
       BEP_BODY)
 check("the OrderManager twin uses the identical gap expression",
-      "double gap = (2.0 * blockHeight) + (1.5 * atr);" in CALC_BODY and
+      "double gap = blockHeight + (0.5 * atr);" in CALC_BODY and
       "return (Dir(x) == DIR_LONG) ? (bottom - gap) : (top + gap);" in CALC_BODY,
       CALC_BODY)
+# v5.69/v5.81: the deep offset is RETIRED. Neither twin may still carry it, and
+# the offset must BE the stop distance -- that identity is the whole strategy.
+for _label, _blob in (("BlockEntryPrice", BEP_BODY), ("CalcEntryPrice", CALC_BODY)):
+    check("%s no longer carries the retired 2.0*H + 1.5*ATR deep offset" % _label,
+          "(2.0 * blockHeight)" not in _blob and "(1.5 * atr)" not in _blob)
 # v5.66 shipped the inverted signs -- (bottom + gap) for a LONG, which put the
 # entry ABOVE the market and made the BUY_LIMIT illegal. Both twins are pinned
 # above, so this is belt-and-braces against a partial revert of one of them.
@@ -507,28 +517,30 @@ print("\n-- 7. Geometry identity --")
 
 
 def realized(bh, atr, rr):
-    """Transcribe the shipped TRUE deep front-edge geometry, near edge at 0.0.
+    """Transcribe the shipped NEAR-EDGE PULLBACK geometry, near edge at 0.0.
 
     LONG is the whole story: DIR_SHORT is the mirror image, so one side
     proves both. nearEdge = 0, farEdge = +bh. The gap is measured OUT from the
-    NEAR edge and lands on the OPPOSITE side of the zone (v5.69), so
-    entry = -(2.0*bh + 1.5*atr) -- i.e. 2.0*bh + 1.5*atr BELOW the near edge,
-    which is BELOW the market at arm time and therefore a legal BUY_LIMIT.
-    slDist is untouched at bh + 0.5*atr, and the target stays anchored on the
-    FAR edge: tp = farEdge + rr*slDist.
+    NEAR edge and lands on the OPPOSITE side of the zone, and since v5.81 it is
+    exactly ONE slDist: entry = -(bh + 0.5*atr) -- i.e. bh + 0.5*atr BELOW the
+    near edge, which is BELOW the market at arm time and therefore a legal
+    BUY_LIMIT. slDist is the same bh + 0.5*atr, and the target stays anchored
+    on the FAR edge: tp = farEdge + rr*slDist.
     """
     sl = bh + 0.5 * atr
-    entry = -(2.0 * bh + 1.5 * atr)
+    entry = -sl                     # gap == slDist
     return (entry, entry - sl, bh + rr * sl, sl)   # entry, stop, tp, slDist
 
 
 def realized_rr(bh, atr, rr):
     """The closed form of the reward-to-risk the ENTRY actually realizes.
 
-    reward = tp - entry = 3*bh + 1.5*atr + rr*(bh + 0.5*atr) = (3 + rr)*slDist,
-    risk = slDist, so x = rr + 3.0 EXACTLY -- independent of bh and of atr.
-    That is why the retired 3.0 floor cannot apply: x > 3 for every positive
-    rr, so the far-edge target can never land behind the entry.
+    reward = tp - entry = bh + rr*slDist + slDist = bh + (1 + rr)*slDist,
+    risk = slDist, so x = (1 + rr) + bh/slDist. Since 0 < bh < slDist for any
+    positive ATR, x is confined to the open band (1 + rr, 2 + rr): 5.0R..6.0R
+    on the shipped InpMaxRR 4.0. The old flat rr + 3.0 died with the retired
+    2.0*H + 1.5*ATR offset; x is now bh- and ATR-DEPENDENT, which is asserted
+    below rather than papered over.
     """
     entry, stop, tp, sl = realized(bh, atr, rr)
     return (tp - entry) / abs(entry - stop)
@@ -545,60 +557,79 @@ def break_level(bh, atr, buffer):
 
 # The first three are inside the shipped configuration space (rr = 4.0); the
 # fourth is `InpMaxRR = 2.0`, deliberately INCLUDED as the negative control that
-# proves the retired 3.0 floor no longer binds. Under the v5.69 geometry it must
-# realize a healthy 5.0R rather than a negative number.
+# proves the retired 3.0 floor no longer binds. Under the v5.81 near-edge
+# geometry it must realize a healthy multiple above 1 + rr rather than a
+# negative number.
 CASES = [(1.0, 2.0, 4.0), (2.0, 1.0, 4.0), (0.5, 4.0, 4.0), (1.0, 1.0, 2.0)]
 SHIPPED = CASES[:3]
-risk_ok = anchor_ok = side_ok = bound_ok = True
+risk_ok = gap_ok = anchor_ok = side_ok = band_ok = True
 for bh, atr, rr in CASES:
     entry, stop, tp, sl = realized(bh, atr, rr)
     if abs(abs(entry - stop) - sl) > 1e-12:
         risk_ok = False                      # risk must never drift
-    # reward = (3 + rr) * slDist -- the far-edge identity.
-    if abs((tp - entry) - (3.0 + rr) * sl) > 1e-12:
+    # The offset from the near edge IS the stop distance (v5.81).
+    if abs(abs(entry) - sl) > 1e-12:
+        gap_ok = False
+    # reward = bh + (1 + rr) * slDist -- the far-edge identity.
+    if abs((tp - entry) - (bh + (1.0 + rr) * sl)) > 1e-12:
         anchor_ok = False
-    # The entry sits 2.0*bh + 1.5*atr on the NEAR side (negative), the stop a
-    # further slDist out, and BOTH are below the near edge at 0.0.
-    if (abs(entry + (2.0 * bh + 1.5 * atr)) > 1e-12
-            or abs(stop + (3.0 * bh + 2.0 * atr)) > 1e-12
+    # The entry sits one slDist on the NEAR side (negative), the stop a further
+    # slDist out, and BOTH are below the near edge at 0.0.
+    if (abs(entry + sl) > 1e-12
+            or abs(stop + 2.0 * sl) > 1e-12
             or not (entry < 0.0 and stop < entry)):
         side_ok = False
-    # x = rr + 3.0 exactly, so it sits above 3.0 and never depends on bh/atr.
-    if abs(realized_rr(bh, atr, rr) - (rr + 3.0)) > 1e-12:
-        bound_ok = False
-    if not realized_rr(bh, atr, rr) > 3.0:
-        bound_ok = False
+    # x = (1 + rr) + bh/slDist, strictly inside (1 + rr, 2 + rr).
+    x = realized_rr(bh, atr, rr)
+    if abs(x - ((1.0 + rr) + bh / sl)) > 1e-12:
+        band_ok = False
+    if not (1.0 + rr < x < 2.0 + rr):
+        band_ok = False
 
 check("the stop always sits exactly one slDist from the entry", risk_ok)
-check("reward from the ENTRY == (3 + InpMaxRR) * slDist", anchor_ok)
+check("the near-edge offset IS slDist in every case", gap_ok)
+check("reward from the ENTRY == bh + (1 + InpMaxRR) * slDist", anchor_ok)
 check("the entry and stop both sit on the NEAR (limit) side of the zone",
       side_ok)
-check("realized RR == InpMaxRR + 3.0 exactly, always above 3.0", bound_ok)
+check("realized RR == (1 + InpMaxRR) + bh/slDist, inside (1+rr, 2+rr)",
+      band_ok)
 
 entry, stop, tp, sl = realized(1.0, 2.0, 4.0)
 HEAD = (tp - entry) / abs(entry - stop)
-check("the documented 1.0-high / ATR 2.0 / RR 4.0 zone realizes 7.0R",
-      abs(HEAD - 7.0) < 1e-12, "%.4fR" % HEAD)
-check("the documented 2.0-high / ATR 1.0 / RR 4.0 zone realizes 7.0R",
-      abs(realized_rr(2.0, 1.0, 4.0) - 7.0) < 1e-12)
-check("the documented 0.5-high / ATR 4.0 / RR 4.0 zone realizes 7.0R",
-      abs(realized_rr(0.5, 4.0, 4.0) - 7.0) < 1e-12)
-check("the realized multiple is independent of zone height and ATR",
-      abs(realized_rr(1e-9, 1.0, 4.0) - realized_rr(50.0, 0.01, 4.0)) < 1e-12)
+# bh=1.0, atr=2.0 -> slDist=2.0, bh/slDist=0.5, so x = 5.0 + 0.5 = 5.5.
+check("the documented 1.0-high / ATR 2.0 / RR 4.0 zone realizes 5.5R",
+      abs(HEAD - 5.5) < 1e-12, "%.4fR" % HEAD)
+# bh=2.0, atr=1.0 -> slDist=2.5, bh/slDist=0.8, so x = 5.0 + 0.8 = 5.8.
+check("the documented 2.0-high / ATR 1.0 / RR 4.0 zone realizes 5.8R",
+      abs(realized_rr(2.0, 1.0, 4.0) - 5.8) < 1e-12)
+# bh=0.5, atr=4.0 -> slDist=2.5, bh/slDist=0.2, so x = 5.0 + 0.2 = 5.2.
+check("the documented 0.5-high / ATR 4.0 / RR 4.0 zone realizes 5.2R",
+      abs(realized_rr(0.5, 4.0, 4.0) - 5.2) < 1e-12)
+# The FLAT rr + 3.0 of the retired deep offset is gone: the multiple now DEPENDS
+# on the zone's height relative to its ATR. Asserting the dependence keeps a
+# silent revert to the old offset from passing as "still 7.0R everywhere".
+check("the realized multiple DEPENDS on zone height and ATR (the flat "
+      "rr + 3.0 of the retired deep offset is gone)",
+      abs(realized_rr(1e-9, 1.0, 4.0) - 5.0) < 1e-6
+      and 5.999 < realized_rr(50.0, 0.01, 4.0) < 6.0
+      and (realized_rr(50.0, 0.01, 4.0) - realized_rr(1e-9, 1.0, 4.0)) > 0.99,
+      "thin=%.6f thick=%.6f" % (realized_rr(1e-9, 1.0, 4.0),
+                                realized_rr(50.0, 0.01, 4.0)))
 
 # The retired 3.0 floor was an artifact of an entry anchored PAST the far edge,
 # where the reward carried a (0.5*rr - 1.5) coefficient on the ATR term and went
-# negative for rr < 3. The v5.69 entry removes that term entirely, so the floor
-# no longer binds -- and must NOT be reintroduced. This is the negative control:
-# InpMaxRR = 2.0, which the old geometry could not survive on a thin zone.
+# negative for rr < 3. The near-edge entry keeps a full bh + (1+rr)*slDist of
+# reward, so the floor still does not bind -- and must NOT be reintroduced. This
+# is the negative control: InpMaxRR = 2.0, which the old geometry could not
+# survive on a thin zone.
 FLOOR = 3.0
 check("every shipped case keeps the far-edge target ahead of the entry",
       all(realized_rr(bh, atr, rr) > 0 for bh, atr, rr in SHIPPED))
 check("the retired floor no longer binds: a thin zone at InpMaxRR = 2.0 is "
-      "still 5.0R ahead, not behind the entry",
-      abs(realized_rr(1e-9, 1.0, 2.0) - 5.0) < 1e-12)
+      "still 3.0R ahead, not behind the entry",
+      abs(realized_rr(5e-9, 1.0, 2.0) - 3.0) < 1e-7)
 check("even an absurd InpMaxRR keeps the target ahead of the entry",
-      realized_rr(1e-9, 1.0, 0.01) > 3.0)
+      realized_rr(1e-9, 1.0, 0.01) > 1.0)
 MMAXX = re.search(r"InpMaxRR\s*=\s*([0-9.]+)", DEFS_T)
 check("the shipped InpMaxRR is the documented 4.0",
       MMAXX is not None and abs(float(MMAXX.group(1)) - 4.0) < 1e-12,
@@ -635,9 +666,11 @@ check("the entry sits strictly below the near edge in every case, so the "
 # ----------------------------------------------------------------------
 print("\n-- 8. Configuration --")
 
-check("ENTRY_FRONT_EDGE is declared as the true deep front-edge style",
+check("ENTRY_FRONT_EDGE is declared as the near-edge pullback style",
       "ENTRY_FRONT_EDGE" in DEFS_T and
-      "TRUE DEEP FRONT-EDGE" in DEFS_T)
+      "NEAR-EDGE PULLBACK TRAP" in DEFS_T)
+check("the retired deep front-edge wording is gone from the enum banner",
+      "TRUE DEEP FRONT-EDGE" not in DEFS_T)
 check("the retired anticipation wording is gone from the enum banner",
       "EXTREME FRONT-RUNNING ANTICIPATION" not in DEFS_T)
 check("InpEntryStyle defaults to the front-edge entry",
@@ -689,11 +722,23 @@ missing = [f for f in ALL_FILES
                             read(os.path.join(ROOT, f)))]
 check("all %d shipped sources carry one common stamp" % len(ALL_FILES),
       not missing, "missing: %s" % ", ".join(missing))
-check("the common stamp is v5.80 or later", rel_parts(STAMPS) >= (5, 80),
+def prose(src):
+    """Collapse comment chrome and whitespace so wrapped prose compares whole.
+
+    The two-twin invariant is stated in a doubled box comment in one file and a
+    plain `//` block in the other, and both wrap mid-phrase -- so a contiguous
+    substring test would silently fail on formatting rather than on wording.
+    """
+    s = re.sub(r"^\s*//\|?", "", src, flags=re.M)
+    s = s.replace("|", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+check("the common stamp is v5.81 or later", rel_parts(STAMPS) >= (5, 81),
       "stamps=%s" % sorted(set(STAMPS)))
 check("the two-twin invariant is justified in BOTH files",
-      "the Front-Run veto would judge a different price" in BM_RAW and
-      "the Front-Run veto would judge a different price" in OM_RAW,
+      "must stay identical" in prose(BM_RAW) and
+      "must stay identical" in prose(OM_RAW),
       "the 'must stay identical' rationale is missing")
 check("the source states WHY the shift had to reach the OrderManager",
       "GetATRAtShift(1) -- the LAST CLOSED bar" in BM_RAW)
@@ -702,21 +747,22 @@ check("the startup banner names the current release",
 
 
 # ----------------------------------------------------------------------
-# 10. v5.69: journal geometry synced to the true deep front-edge model
+# 10. v5.81: journal geometry synced to the near-edge pullback model
 # ----------------------------------------------------------------------
 # The journal's per-direction captions are printed strings: nothing ties them to
 # BlockEntryPrice() or CalcSLDistance(), so they drift in silence. v5.57..v5.68
 # described the entry as sitting BEYOND the far edge and the SL as "at Far Edge
-# +/- 1.0*ATR"; v5.69 puts the entry on the near side, 2.0*H + 1.5*ATR out, with
+# +/- 1.0*ATR"; v5.69 put the entry on the near side, 2.0*H + 1.5*ATR out; and
+# v5.81 re-specified that offset to exactly ONE slDist (1.0*H + 0.5*ATR), with
 # the SL a full 1R behind it. The wick H/L fields are pinned here too because
 # nothing reads them -- a regression there is invisible at runtime.
 print("\n-- 10. Journal & wick geometry sync --")
 
-check("the journal names the true deep front-edge geometry per direction",
-      JRN_RAW.count("SUPPORT (Deep Front-Edge Anticipation / Sell from Near Edge + 2.0*H + 1.5*ATR | SL 1R above entry)") == 2 and
-      JRN_RAW.count("RESISTANCE (Deep Front-Edge Anticipation / Buy from Near Edge - 2.0*H - 1.5*ATR | SL 1R below entry)") == 2,
-      "S=%d R=%d" % (JRN_RAW.count("Sell from Near Edge + 2.0*H + 1.5*ATR"),
-                     JRN_RAW.count("Buy from Near Edge - 2.0*H - 1.5*ATR")))
+check("the journal names the near-edge pullback geometry per direction",
+      JRN_RAW.count("SUPPORT (Near-Edge Pullback / Sell from Near Edge + 1.0*H + 0.5*ATR | SL 1R above entry)") == 2 and
+      JRN_RAW.count("RESISTANCE (Near-Edge Pullback / Buy from Near Edge - 1.0*H - 0.5*ATR | SL 1R below entry)") == 2,
+      "S=%d R=%d" % (JRN_RAW.count("Sell from Near Edge + 1.0*H + 0.5*ATR"),
+                     JRN_RAW.count("Buy from Near Edge - 1.0*H - 0.5*ATR")))
 # v5.71: the entry captions moved onto the model's canonical vocabulary. The
 # retired "Front-Run Breakdown/Breakout" phrasing described an entry that has
 # not shipped since v5.66, so it must not survive -- while "Front-Run veto"
@@ -733,27 +779,29 @@ check("the retired far-edge SL captions are gone",
 check("the retired inverted near-edge signs are gone",
       "Sell at Near Edge - 2.0*H" not in JRN_RAW and
       "Buy at Near Edge + 2.0*H" not in JRN_RAW)
-check("the armed header prints the deep gap, not the retired 0.5*ATR offset",
-      JRN_RAW.count("(Deep Front-Edge: near edge +/- 2.0*H +/- 1.5*ATR)") == 1 and
-      "near edge +/- 0.5*ATR" not in JRN_RAW)
+check("the armed header prints the near-edge offset, not the retired deep gap",
+      JRN_RAW.count("(Near-Edge Pullback: near edge +/- 1.0*H +/- 0.5*ATR)") == 1 and
+      "2.0*H +/- 1.5*ATR" not in JRN_RAW)
 check("the retired 'Aggressive' block wording is gone",
       "Aggressive" not in JRN_RAW)
 
 # The printed geometry is a DERIVED fact, not a caption. Derive BOTH sides from
 # the shipped arithmetic so a future re-anchor has to update the strings too.
 def geometry(bh, atr, rr, is_long):
-    """Signed geometry, far edge pinned at 0.0, v5.69 signs.
+    """Signed geometry, far edge pinned at 0.0, v5.81 signs.
 
     LONG  (RESISTANCE): far edge block.top = 0.0, near edge block.bottom = -bh.
-                       entry = near - gap = -bh - 2.0*bh - 1.5*atr
+                       entry = near - gap = -bh - bh - 0.5*atr
                        stop  = entry - slDist
     SHORT (SUPPORT)   : far edge block.bottom = 0.0, near edge block.top = +bh.
-                       entry = near + gap = +bh + 2.0*bh + 1.5*atr
+                       entry = near + gap = +bh + bh + 0.5*atr
                        stop  = entry + slDist
+    gap == slDist == bh + 0.5*atr (v5.81), so the entry sits exactly one slDist
+    outside the near edge and the stop one more slDist beyond it.
     Returns (entry, stop, target, slDist); entry-stop is always exactly slDist
     and both sit on the NEAR side, the mirror of the target on the far side.
     """
-    gap = 2.0 * bh + 1.5 * atr
+    gap = bh + 0.5 * atr
     sl = bh + 0.5 * atr
     near = -bh if is_long else bh
     entry = (near - gap) if is_long else (near + gap)
@@ -766,6 +814,10 @@ def geometry(bh, atr, rr, is_long):
 check("entry<->SL is exactly 1R in both directions, both on the NEAR side, "
       "the target on the FAR side",
       all(abs(abs(g[0] - g[1]) - g[3]) <= 1e-12
+          # The offset from the near edge is the stop distance itself, so the
+          # entry sits exactly 2*bh + 0.5*atr from the far edge in both
+          # directions -- the v5.81 identity, checked signed below.
+          and abs(abs(g[0]) - (2.0 * bh + 0.5 * atr)) <= 1e-12
           # LONG works below a far edge pinned at 0.0, SHORT above it, so the
           # whole geometry mirrors: the entry/stop sit OUTSIDE the near edge and
           # the target on the opposite side of the entry.
@@ -776,7 +828,7 @@ check("entry<->SL is exactly 1R in both directions, both on the NEAR side, "
           for bh, atr, rr in CASES
           for g in [geometry(bh, atr, rr, side)]))
 check("the journal's per-direction offsets match that arithmetic",
-      "+ 2.0*H + 1.5*ATR" in JRN_RAW and "- 2.0*H - 1.5*ATR" in JRN_RAW and
+      "+ 1.0*H + 0.5*ATR" in JRN_RAW and "- 1.0*H - 0.5*ATR" in JRN_RAW and
       JRN_RAW.count("SL 1R above entry") == 2 and
       JRN_RAW.count("SL 1R below entry") == 2)
 
